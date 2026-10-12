@@ -64,17 +64,34 @@ def pick_asset(rel: dict) -> dict | None:
     return None
 
 
-def extract(archive: str, dest: str) -> int:
-    """把压缩包里的 JSON 解到 dest（扁平化：只取文件名）。返回写入数量。"""
+def extract(archive: str, dest: str, scenario_dest: str | None = None) -> int:
+    """把压缩包里的 JSON 解出来。返回写入数量。
+
+    兼容两种布局：
+    - ``fixtures/<name>.json`` + ``scenario/<name>.json``（新，推荐）
+    - 全部平铺在一层（旧）
+
+    未知路径按文件名落到 ``dest``（夹具目录）。
+    """
     os.makedirs(dest, exist_ok=True)
+    if scenario_dest:
+        os.makedirs(scenario_dest, exist_ok=True)
     count = 0
+
+    def target_for(name: str) -> str:
+        parts = [p for p in name.replace("\\", "/").split("/") if p and p != "."]
+        base = parts[-1]
+        # 含 scenario/ 段的走剧本目录，其余走夹具目录
+        if scenario_dest and any(p.lower() == "scenario" for p in parts[:-1]):
+            return os.path.join(scenario_dest, base)
+        return os.path.join(dest, base)
+
     if zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as z:
             for info in z.infolist():
                 if info.is_dir() or not info.filename.endswith(".json"):
                     continue
-                target = os.path.join(dest, os.path.basename(info.filename))
-                with z.open(info) as src, open(target, "wb") as dst:
+                with z.open(info) as src, open(target_for(info.filename), "wb") as dst:
                     shutil.copyfileobj(src, dst)
                 count += 1
     elif tarfile.is_tarfile(archive):
@@ -85,8 +102,7 @@ def extract(archive: str, dest: str) -> int:
                 src = t.extractfile(member)
                 if src is None:
                     continue
-                target = os.path.join(dest, os.path.basename(member.name))
-                with src, open(target, "wb") as dst:
+                with src, open(target_for(member.name), "wb") as dst:
                     shutil.copyfileobj(src, dst)
                 count += 1
     else:
@@ -112,8 +128,10 @@ def main(argv: list[str] | None = None) -> int:
 
     root = os.path.abspath(args.root) if args.root else default_root()
     dest = os.path.join(root, "data", "fixture")
+    scen = os.path.join(root, "data", "scenario")
     print(f"数据根   : {root}")
-    print(f"目标目录 : {dest}")
+    print(f"夹具目录 : {dest}")
+    print(f"剧本目录 : {scen}")
     print()
 
     try:
@@ -154,10 +172,11 @@ def main(argv: list[str] | None = None) -> int:
                 fh.write(blob)
                 archive = fh.name
             try:
-                n = extract(archive, dest)
+                n = extract(archive, dest, scen)
             finally:
                 os.unlink(archive)
-            print(f"✅ 解出 {n} 个 JSON 到 {dest}")
+            n_scen = len([f for f in os.listdir(scen)]) if os.path.isdir(scen) else 0
+            print(f"✅ 解出 {n} 个 JSON（夹具 {n - n_scen if n_scen else n} / 剧本 {n_scen}）")
             if n:
                 return 0
             print("⚠️ 压缩包里没有 JSON")

@@ -672,6 +672,7 @@ def test_C_factor_uses_prev_period_from_chain():
     此前该链在 20241231 断掉 → 加速判定只能走「上季增速不可得」的退化分支。
     """
     cfg = make_cfg()
+    require_fixtures()
     scorer = CanslimScorer(cfg, DataSource(cfg, offline=True), offline=True)
     factor = scorer.score(STRONG, "2025-04-30").factor("C")
     assert factor.value["period"] == "20250331"
@@ -1156,6 +1157,7 @@ def test_l_note_distinguishes_etf_from_missing_industry():
     只改文案：**分值规则与审计字段不变**（仍走绝对 RS 分档、``path="absolute_rs"``）。
     """
     cfg = make_cfg()
+    require_fixtures()
     scorer = CanslimScorer(cfg, DataSource(cfg, offline=True), offline=True)
 
     etf_factor = scorer.score("588000", ASOF).factor("L")
@@ -1416,6 +1418,7 @@ def test_abs_rs_fail_closed_end_to_end_when_index_missing():
 def test_verifier_counterexample_real_600519_high_l_is_blocked():
     """verifier 反例：真实 600519 @2026-10-09 绝对 RS=−6.8% 却曾拿 L=100；修复后 L=40 且不得 buy。"""
     cfg = make_cfg()
+    require_fixtures()
     scorer = CanslimScorer(cfg, DataSource(cfg, offline=True), offline=True)
     result = scorer.score(STRONG, "2026-10-09")
     factor = result.factor("L")
@@ -1584,6 +1587,7 @@ def test_score_many_sorts_by_total_desc():
 def test_score_unknown_code_raises_strategy_data_error():
     """无任何行情数据的标的 → ``StrategyDataError``（score_many 会兜底）。"""
     cfg = make_cfg()
+    require_fixtures()
     scorer = CanslimScorer(cfg, DataSource(cfg, offline=True), offline=True)
     with pytest.raises(StrategyDataError):
         scorer.score(UNKNOWN, ASOF)
@@ -1760,8 +1764,12 @@ def test_recommend_entry_comes_from_scored_close():
 # ---------------------------------------------------------------------------
 
 
+from tests._guards import require_fixtures, require_scenario  # noqa: E402
+
+
 @pytest.fixture(scope="module")
 def fixture_scorer():
+    require_fixtures()
     cfg = make_cfg()
     ds = DataSource(cfg, offline=True)
     return CanslimScorer(cfg, ds, offline=True)
@@ -1770,6 +1778,7 @@ def fixture_scorer():
 @pytest.fixture(scope="module")
 def fixture_pool_scorer():
     """真实夹具通道（scenario=False）—— 用于池级扫描，证明默认通道不读剧本。"""
+    require_fixtures()
     cfg = make_cfg()
     ds = DataSource(cfg, offline=True)
     return CanslimScorer(cfg, ds, offline=True)
@@ -1861,7 +1870,12 @@ def test_tc_s22a_real_pool_buy_branch_is_reachable_but_rare(fixture_pool_scorer)
 
 @pytest.fixture(scope="module")
 def scenario_scorer():
-    """剧本通道：``scenario=True`` 显式叠加 ``data/scenario``（默认 DataSource 绝不读它）。"""
+    """剧本通道：``scenario=True`` 显式叠加 ``data/scenario``（默认 DataSource 绝不读它）。
+
+    剧本缺失时**跳过**而不是退回真实数据 —— 那些断言标定的是剧本形态，
+    在真实数据上跑只会得到无意义的成败（见 conftest.require_scenario）。
+    """
+    require_scenario()
     cfg = make_cfg()
     ds = DataSource(cfg, offline=True, scenario=True)
     return CanslimScorer(cfg, ds, offline=True)
@@ -1904,7 +1918,12 @@ def test_tc_s22b_scenario_ranking_and_recommendation(scenario_scorer):
 
 
 def test_scenario_data_never_leaks_into_default_channel(fixture_pool_scorer):
-    """隔离保证：默认 DataSource 绝不读 data/scenario（否则用户 --offline 会看到伪造的 buy）。"""
+    """隔离保证：默认 DataSource 绝不读 data/scenario（否则用户 --offline 会看到伪造的 buy）。
+
+    这个用例在函数体内**另建** scenario 通道做对比，所以不能只靠 fixture 守卫 ——
+    剧本缺失时它会把两个通道都当真实数据，得到 ``51.34 > 51.34`` 这种误导性失败。
+    """
+    require_scenario()
     cfg = make_cfg()
     real = fixture_pool_scorer.score(STRONG, SCENARIO_ASOF)
     assert real.signal != "buy"
