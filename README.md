@@ -1,60 +1,11 @@
 # ptrade —— A 股 CANSLIM 模拟盘
 
 一个**离线可复现**的 A 股模拟交易系统：真实 akshare 数据 + 本地缓存/夹具 + T+1 与融资融券记账 +
-CANSLIM 七因子打分 + 单文件 K 线图。接口契约见 [`INTERFACES.md`](INTERFACES.md)（**v3.5**，唯一真源）。
+CANSLIM 七因子打分 + 单文件 K 线图。接口契约见 [`INTERFACES.md`](INTERFACES.md)（**v3.2**，唯一真源）。
 
 > 仅供研究与模拟教学，**不构成任何投资建议**。
 
 ---
-
-## 安装
-
-```sh
-pip install ptrade                      # 从 PyPI（若已发布）
-pip install git+https://github.com/hatsuyuki0103/ptrade   # 直接从仓库
-pip install -e .                        # 源码检出（开发）
-```
-
-或者从 [Releases](https://github.com/hatsuyuki0103/ptrade/releases) 下载 wheel / sdist：
-
-```sh
-pip install ptrade-1.1.0-py3-none-any.whl
-```
-
-依赖：Python ≥ 3.11、`pandas`、`akshare`；测试另需 `pytest`（**无其他第三方依赖**）。
-
-> `ptrade/vendor/echarts.min.js`（ECharts 5.5.1，约 1 MB）随包分发，用于让 `chart` 生成
-> **离线单文件 HTML**（零外链、双击即看）。它只是静态资源，不是 Python 依赖。
-
-## 数据根（data root）
-
-所有运行时数据（缓存 / 夹具 / 账户状态 / 台账 / 图表产物）都在一个**数据根目录**下，
-按以下顺序解析：
-
-| 优先级 | 来源 | 说明 |
-|---|---|---|
-| 1 | `--root <path>` | 每次命令显式指定，最高优先 |
-| 2 | 环境变量 `PTRADE_HOME` | 适合固定一个工作目录 |
-| 3 | 源码检出根 | 若 `ptrade/` 上一级存在 `data/`，沿用它（`git clone` 即用） |
-| 4 | `~/.ptrade` | **pip 安装后的默认**，安装位置不可写时用这里 |
-
-```sh
-export PTRADE_HOME=/path/to/my-trading        # Linux/macOS
-$env:PTRADE_HOME = 'D:\my-trading'            # Windows PowerShell
-ptrade --root /path/to/my-trading status      # 或每次显式指定
-```
-
-目录结构（首次使用可让 `ptrade init` 自动创建）：
-
-```
-<root>/
-  config.json          可选：覆盖默认阈值（缺失字段用默认值）
-  data/cache/          akshare 拉取结果的缓存
-  data/fixture/        离线夹具（测试与 --offline 用）
-  data/state.json      账户状态
-  data/ledger.jsonl    逐笔成交流水
-  reports/             K 线图 HTML 产物
-```
 
 ## 快速开始
 
@@ -68,22 +19,7 @@ python -m ptrade chart --code 588000 --offline      # 生成 K 线图 HTML
 python -m pytest tests -q
 ```
 
-> **`--codes` 多代码在 PowerShell 下必须加引号**：裸写 `--codes 000001,601398` 会被 PowerShell
-> 当数组运算符解析，前导零丢失（实收 `1,601398`），表现为该票 `score=0` 且 `name` 等于代码。
-> 用 `--codes "000001,601398"` 或 Linux/macOS/cmd 即可。
-
-## 离线夹具与测试
-
-`data/fixture/` **不入 git**（90 个 JSON / 约 6.6 MB，机器生成，每次重生成都是整文件 diff），
-按需三选一获取后即可跑全部测试与 `--offline` 命令：
-
-```sh
-python tools/fetch-fixtures.py     # 从 GitHub Release 下载（推荐，最快）
-python tools/build_fixtures.py     # 用 akshare 现拉重建（需联网，约 15 分钟）
-```
-
-`data/scenario/` 是**人为构造**的行情剧本（用于算法标定，与真实夹具物理隔离），
-每个文件带 `"_synthetic": true` 标记，由 `tools/build_scenario.py` 确定性生成。
+依赖：Python ≥ 3.11、`pandas`、`akshare`、`pytest`（**无其他第三方依赖**）。
 
 ## 命令一览
 
@@ -101,50 +37,9 @@ python tools/build_fixtures.py     # 用 akshare 现拉重建（需联网，约 
 | `close --code [--ratio]` | 平仓（先买券还券，再卖券还款/卖出） |
 | `ledger [--limit N]` | 成交流水（`data/ledger.jsonl`） |
 | `chart --code [--period daily\|weekly\|monthly] [--out]` | 离线单文件 K 线图 HTML |
-| `search <代码或名称> [--limit N] [--offline]` | 搜索股票（代码前缀 / 中文名子串） |
-| `watchlist --action add\|remove\|list [code] [--name] [--note]` | 自选池增删查（幂等） |
-| `serve [--host] [--port] [--offline]` | **启动本地网页端**（默认 `127.0.0.1:8765`） |
 
 全局 `--root <path>` 覆盖数据根目录；`--json` 输出 `{"ok","command","data","error"}`，**退出码 0/1**
 （业务拒单不算错误：`ok=true` 且 `data.orders[].status == "rejected"`）。
-
-## 网页端
-
-```powershell
-python -m ptrade serve            # 浏览器打开 http://127.0.0.1:8765
-```
-
-在浏览器里可以看账户 / 持仓 / 风险 / 七因子打分数表 / K 线图，并能**下单、平仓、结算**。
-前端是**单个自包含页面**（内联 CSS/JS，**零外链**）；K 线图由 `/api/chart` 返回完整 HTML 内嵌显示。
-
-> ⚠️ **网页端没有鉴权**。默认只绑 `127.0.0.1`，这是**唯一的边界**。
-> `--host 0.0.0.0` 会让同网段任何人都能对你的模拟盘下单 —— 启动横幅会就此警告。
-
-**写者互斥**：网页端与 CLI 会写**同一份** `data/state.json` 与 `data/ledger.jsonl`，
-因此两者共用一把跨进程写锁（`data/.ptrade.lock`）：任一时刻只有一个写者在「读 → 改 → 写」临界区内。
-并发写会排队；锁超时（默认 10s）时网页端返回 **HTTP 503**（`error_code=STATE_LOCK_TIMEOUT`），
-CLI 返回退出码 1 —— **都不会静默写坏状态**。
-
-**账实一致性**：`status` 与 `/api/state` 都会给出 `ledger_consistency`
-（`{"consistent","ledger_lines","recorded","diverged"}`）。写一单的时序是「先落 ledger，再原子写 state」，
-若 state 落盘失败就会出现「ledger 有单、state 无单」的分叉 —— 这个字段让它**可被检出**
-（`diverged=true`），而不是悄悄留下不一致。`diverged=null` 表示**无法判定**（例如有写事务正在进行），
-此时 `consistent=false`：**不把「不知道」当成「没问题」**。
-
-## 搜索与自选池
-
-```powershell
-python -m ptrade search "茅台" --offline              # 按中文名
-python -m ptrade search "600519" --offline            # 按代码
-python -m ptrade watchlist --action add 600519 --name 贵州茅台
-python -m ptrade watchlist --action list
-```
-
-`search` 的全市场名称表缓存在 `data/cache/stock_list.json`（TTL 7 天）。
-**`--offline` 只读缓存**：没有缓存会**明确报错并给出获取方式**，而不是静默返回空；
-**无命中**则返回 `ok=true` 且 `count=0` —— 两者被严格区分。
-自选池 `add` 是**幂等**的（重复添加不产生重复项、不报错）。
-
 
 ## 账户数学（v3.2 口径）
 

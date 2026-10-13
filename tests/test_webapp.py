@@ -985,3 +985,54 @@ def test_v1_process_online_allows_request_to_tighten(web_cfg):
     status, payload = _call(app, "GET", "/api/search", {"q": ["600"], "offline": ["true"]}, None)
     assert status == 200
     assert payload["data"]["offline"] is True, "进程在线时请求级 ?offline=true 未生效"
+
+
+# --------------------------------------------------------------------------- #
+# INV-43（独立复核 N1）：网页**写端点**也必须在锁外预热
+#
+# 第一版 BLOCK-1 修复只做了 CLI 侧，网页三个写端点零预热。复核者实测：
+# `POST /api/order` 冷缓存下锁内取数 3 次，注入 0.6s/次延迟后并发写者
+# `StateLockTimeout`，而 CLI 侧同一实验 0.02s 拿到锁 —— 即 BLOCK-1 只修了一半。
+# --------------------------------------------------------------------------- #
+def test_inv43_web_write_endpoints_prewarm_before_lock():
+    """**机制断言**：三个网页写端点都必须调用 `prewarm_before_write`。
+
+    用 AST 取函数源码段再查字符串 —— 与 `test_cli.py::test_block1_write_commands_prewarm_before_lock`
+    同一手法。行为证据（锁内取数 2~3 → 0、持锁 1.27s → 0.06s、503 2 → 0）在
+    `.omx/probe/verify_block1_web2.py`。
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(REPO_ROOT, "ptrade", "webapp.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    found: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in ("api_order", "api_close", "api_settle"):
+            found[node.name] = "prewarm_before_write(" in (ast.get_source_segment(src, node) or "")
+    assert set(found) == {"api_order", "api_close", "api_settle"}, f"未找到全部写端点：{sorted(found)}"
+    missing = [name for name, ok in found.items() if not ok]
+    assert not missing, (
+        f"这些网页写端点没有在锁外预热：{missing} —— INV-43 复发"
+        f"（在线冷缓存会在锁内联网，饿死并发写者）"
+    )
+
+
+def test_inv43_order_prewarm_receives_side_for_margin():
+    """**N2 断言**：下单端点的预热必须把 `side` 传下去。
+
+    融资/融券要在锁内查两融标的白名单（`margin_targets`，两个 akshare 接口，
+    最坏 ~4.9s/个）；不传 `side` 就不会预热它，等于没修。
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(REPO_ROOT, "ptrade", "webapp.py").read_text(encoding="utf-8")
+    seg = None
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.FunctionDef) and node.name == "api_order":
+            seg = ast.get_source_segment(src, node) or ""
+    assert seg, "未找到 api_order"
+    assert "side=side" in seg, (
+        "api_order 的预热没有传 side= —— 融资/融券不会预热 margin_targets（N2 复发）"
+    )

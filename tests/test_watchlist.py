@@ -28,12 +28,23 @@ def find_no_data_code(cfg) -> str:
     为什么不硬编码：`data/fixture/spot.json` 是**全市场快照**且会被扩充 —— 今天"没数据"的代码
     明天可能就有行情了（实测 `688981` 中芯国际 已随 spot 夹具获得 108.42 的真实报价）。
     这里从候选里挑第一个 `quote()` 取不到正价格的代码；一个都挑不到则显式 skip，绝不静默降级。
+
+    **两处必须注意（时间炸弹 N4，2026-10-13 独立复核发现）**：
+
+    1. asof 用 :func:`tests._guards.price_asof`（**有日线**的最近交易日），
+       不能用 ``latest_trade_date()`` —— 后者读交易日历（覆盖到 2026-12-31），
+       日期一推进就没有行情，会让本文件在 **2026-12-10 起必然变红**；
+    2. **`suspended=True` 也算「取不到」**：缺数据的代码 ``quote()`` 会返回
+       ``suspended=True`` 而**不抛异常**，只 catch 异常会把无效代码误当有效候选返回，
+       于是 INV-38 用例失去前提（复核者实测症状正是 `_today=2026-12-10 → 2 failed`）。
     """
+    from tests._guards import price_asof
+
     from ptrade.datasource import DataSource
 
     ds = DataSource(cfg, offline=True)
     try:
-        asof = ds.latest_trade_date()
+        asof = price_asof(ds)
     except Exception:  # noqa: BLE001
         asof = None
     for candidate in ("430047", "839999", "430001", "999999"):
@@ -41,6 +52,8 @@ def find_no_data_code(cfg) -> str:
             quote = ds.quote(candidate, asof) if asof else None
         except Exception:  # noqa: BLE001 - 取不到即符合条件
             return candidate
+        if isinstance(quote, dict) and quote.get("suspended") is True:
+            return candidate        # 缺数据时 quote() 标 suspended 而**不抛异常**（N4）
         last = quote.get("last") if isinstance(quote, dict) else None
         try:
             if last is None or float(last) <= 0:

@@ -515,6 +515,13 @@ class WebApp:
             holder["state"] = engine.state
             return engine.state
 
+        # BLOCK-1：**必须在进锁前**把锁内要用的数据预热进缓存。
+        # 引擎在临界区内会取数（实测锁内键：trade_dates / spot，融资融券还含
+        # margin_targets —— 后者是两个 akshare 接口，冷缓存最坏 ~4.9s/个）。
+        # 在线 + 冷缓存时不预热会把锁持有到几十秒，而 DEFAULT_LOCK_TIMEOUT 是 10s
+        # → 并发写者全部 503 / StateLockTimeout，而账户本身毫无问题。
+        _svc().prewarm_before_write(self.cfg, ds, trade_date,
+                                    extra_codes=(code,), side=side)
         new_state = self._locked_update(_mutate, "order")
         state = holder.get("state") or new_state
         return Response(200, _envelope("order", {
@@ -550,6 +557,9 @@ class WebApp:
             holder["state"] = engine.state
             return engine.state
 
+        # BLOCK-1：锁外预热（见 api_order 的说明）。平仓会遍历持仓并盯市。
+        _svc().prewarm_before_write(self.cfg, ds, trade_date,
+                                    extra_codes=(code,), side="close")
         new_state = self._locked_update(_mutate, "close")
         state = holder.get("state") or new_state
         return Response(200, _envelope("close", {
@@ -574,6 +584,8 @@ class WebApp:
             holder["state"] = rolled
             return rolled
 
+        # BLOCK-1：锁外预热（见 api_order 的说明）。结算会滚动交易日并盯市。
+        _svc().prewarm_before_write(self.cfg, ds, trade_date)
         new_state = self._locked_update(_mutate, "settle")
         state = holder.get("state") or new_state
         return Response(200, _envelope("settle", {

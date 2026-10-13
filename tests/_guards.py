@@ -51,13 +51,23 @@ def price_asof(ds, code: str = "600519") -> str:
     因此探测不出「当天无数据」（第一版就栽在这里，返回了无数据的 2026-10-12）。
 
     本函数放在 ``_guards.py`` 而非 ``conftest.py``，是为了**可被测试模块导入**。
+
+    **预算不能 fail-open**（独立复核 N5）：第一版跑满 60 步后 ``return ds.latest_trade_date()``
+    —— 那恰好是**已知无数据**的日期（就是时间炸弹本身），等于「找不到就退回炸弹」，
+    而调用方无从分辨。实测：截短夹具（末日 2026-09-15）+ 时钟跳 2027-06-30 →
+    它返回 ``2026-12-31``、``suspended=True``。
+    改成**响亮失败**：夹具应有 420 天日线，最多回溯 400 步足够覆盖；
+    真跑满说明夹具异常或日历与数据严重脱节，此时宁可直接报错，不要静默给出坏日期。
     """
     day = ds.latest_trade_date()
-    for _ in range(60):                             # 夹具窗口内足够
+    for _ in range(400):                            # 夹具含 420 天日线，400 步足够
         if not ds.quote(code, day)["suspended"]:
             return day
         day = ds.prev_trade_date(day)
-    return ds.latest_trade_date()                   # 兜底：保持旧行为，由调用方报错
+    raise AssertionError(
+        f"price_asof 在 400 个交易日里都没找到有数据的日期（起始 {ds.latest_trade_date()}）—— "
+        f"夹具缺失或交易日历与日线严重脱节。**不得**退回无数据的日期（那正是时间炸弹）。"
+    )
 
 
 def require_fixtures() -> None:

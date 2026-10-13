@@ -24,7 +24,7 @@ import json
 import math
 import os
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterable
 
 from . import core, store
 from .config import AppConfig
@@ -40,6 +40,9 @@ __all__ = [
     "resolve_asof",
     "consistency",
     "risk_from_core",
+    "prewarm_for_write",
+    "prewarm_before_write",
+    "MARGIN_SIDES",
 ]
 
 
@@ -189,6 +192,107 @@ def consistency(cfg: AppConfig) -> dict[str, Any]:
     （M4），因此在事务进行中会返回 ``diverged=None``（不可判定）而**不会误报**。
     """
     return store.check_ledger_state_consistency(cfg)
+
+
+# --------------------------------------------------------------------------- #
+# 锁外预热（架构评审 BLOCK-1）
+#
+# 放在 service 而不是 cli：**网页端与 CLI 都需要**。第一版只修了 CLI，
+# 独立复核实测 `POST /api/order` 仍会在锁内取数 3 次、并饿死并发写者
+# （注入 0.6s/次延迟 + timeout=1.0 → StateLockTimeout），而 CLI 侧同一实验 0.02s 拿到锁。
+# --------------------------------------------------------------------------- #
+MARGIN_SIDES = frozenset({"margin_buy", "short_sell", "buy_to_cover", "repay_margin"})
+
+
+def prewarm_for_write(
+    ds: DataSource,
+    state: AccountState | None,
+    trade_date: str | None,
+    extra_codes: Iterable[str] = (),
+    *,
+    side: str | None = None,
+) -> list[str]:
+    """在**进入写锁之前**把写路径会用到的数据预热进缓存（BLOCK-1）。
+
+    为什么必须这么做：写命令把「读 → 改 → 写」整体放进 ``store.locked_update``，
+    而引擎在这个临界区内会取数。**离线**时是本地夹具读（锁持有 ≈0.12s，无害）；
+    但**在线 + 冷缓存**时是网络取数 —— 架构评审实测单段持锁 **24.97s**（另一次 >180s），
+    而网页端 ``DEFAULT_LOCK_TIMEOUT`` 是 **10s** → 网页下单稳定 503，而账户毫无问题。
+
+    ``DataSource`` 缓存落在磁盘（``_read_entry`` 先读盘），所以锁外预热一次后，
+    锁内同类调用会命中新鲜缓存而**不再联网**。
+
+    **预热键来自实测**（``.omx/probe/discover_lock_keys.py`` 记录锁内真实请求）：
+    ``trade_dates`` 恒需；``spot`` 与 ``margin_targets`` 按需。
+    不要凭想象加键 —— 第一版预热过 ``daily(c, None, asof)``，而引擎从不请求这个键
+    （缓存键含实际的起止日期），于是那是**空预热**、还写出垃圾缓存文件，
+    却被计进返回值让「预热有效」的断言空过（独立复核 N8）。
+
+    参数：
+      * ``state``：取**全部持仓**代码 —— 引擎的盯市会遍历所有持仓，不只本次下单那只；
+      * ``extra_codes``：本次操作涉及的代码，与持仓代码合并去重；
+      * ``trade_date``：**必须在锁外算好**。传 ``None`` 时几乎预不到东西
+        （第一版就栽在这里：``init`` 后 ``state.trade_date`` 为空，交易日由锁内的
+        ``resolve_asof`` 才确定 → 预热全被跳过，锁内仍是 6 次取数）；
+      * ``side``：融资/融券方向需要额外预热 ``margin_targets``（2 个 akshare 接口，
+        最坏 ~4.9s/个 —— 架构评审 S-1 点名过）。
+
+    本函数**幂等**、**不抛**（best-effort）：真正的失败仍由锁内路径按原语义报错。
+    返回**成功预热**的键列表（供测试与非空守卫断言「确实做了事」）。
+    """
+    warmed: list[str] = []
+    codes = [str(c) for c in (getattr(state, "positions", {}) or {})]
+    all_codes = list(dict.fromkeys([*codes, *(str(c) for c in extra_codes)]))
+
+    def _try(label: str, fn) -> None:
+        try:
+            fn()
+            warmed.append(label)
+        except Exception:  # noqa: BLE001 - 预热尽力而为，失败留给锁内按原语义报错
+            pass
+
+    _try("trade_dates", lambda: ds.trade_dates())
+    _try("spot", lambda: ds.spot())
+    # 融资/融券方向：锁内会查两融标的白名单（两个独立接口，冷缓存时很慢）
+    if side and str(side) in MARGIN_SIDES:
+        _try("margin_targets", lambda: ds.margin_targets())
+    if trade_date:
+        _try("next_trade_date", lambda: ds.next_trade_date(trade_date))
+        _try("is_trade_date", lambda: ds.is_trade_date(trade_date))
+        for code in all_codes:
+            _try(f"quote:{code}", lambda c=code: ds.quote(c, trade_date))
+            _try(f"last_close:{code}", lambda c=code: ds.last_close(c, trade_date))
+    return warmed
+
+
+def prewarm_before_write(
+    cfg: AppConfig,
+    ds: DataSource,
+    explicit_date: str | None,
+    extra_codes: Iterable[str] = (),
+    *,
+    side: str | None = None,
+) -> list[str]:
+    """锁外预热助手：用**与锁内完全相同的逻辑**解析交易日，再预热。
+
+    为什么必须「相同逻辑」：第一版预热直接用请求里的 ``trade_date``，而 ``init`` 后
+    ``state.trade_date`` 为空、交易日是锁内 ``resolve_asof`` 才定下来的
+    → 预热时 ``trade_date=None`` → 几乎什么都没预到，锁内取数不变（实测修复无效）。
+
+    读 state 用的是**不取锁**的 ``store.read_state``：这里只做「看一眼决定预热什么」，
+    真正的一致性仍由锁内的 RMW 保证。
+    """
+    try:
+        peek = store.read_state(cfg)
+    except Exception:  # noqa: BLE001 - 读不到就让锁内按原语义报错
+        peek = None
+    date = (explicit_date or "").strip() or (peek.trade_date if peek else "") or None
+    if not date:
+        try:
+            date = resolve_asof(ds, None)
+        except Exception:  # noqa: BLE001 - 失败留给锁内按原语义报错
+            date = None
+    return prewarm_for_write(ds, peek, date, extra_codes=extra_codes, side=side)
 
 
 def risk_from_core(state: AccountState, cfg: AppConfig) -> dict[str, Any]:

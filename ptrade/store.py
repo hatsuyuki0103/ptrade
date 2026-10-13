@@ -362,15 +362,38 @@ def _locked_file(lock_file: str, timeout: float) -> Iterator[None]:
         lock.thread_lock.release()
 
 
+_LOCK_DEPTH = threading.local()
+
+
+def in_critical_section() -> bool:
+    """当前线程是否正处在 :func:`state_lock` 的临界区内（**锁内禁网开关**用）。
+
+    架构评审 S-1 第 2 条：BLOCK-1 的「锁外预热」只是把**已知**的取数挪出去；
+    万一还有漏网的取数，它仍会**悄悄持锁联网**（fail-slow）。有了这个标记，
+    :meth:`ptrade.datasource.DataSource._ak` 就能在锁内**响亮拒绝**联网，
+    把「悄悄慢」变成「明确错」——漏网会被立刻发现，而不是变成偶发的 503。
+    """
+    return getattr(_LOCK_DEPTH, "n", 0) > 0
+
+
 @contextmanager
 def state_lock(root: str | os.PathLike[str] | Any, timeout: float = 10.0) -> Iterator[None]:
     """跨进程写锁（**同进程同线程可重入**；跨线程/跨进程互斥）。
 
     :param root: 数据根目录（锁文件 ``<root>/data/.ptrade.lock``）；也接受 ``cfg``（W-1）。
     :param timeout: 获取锁的总预算（秒）。超时抛 :class:`StateLockTimeout`，**绝不继续写**。
+
+    临界区内会把本线程标记为「持锁中」（:func:`in_critical_section`），
+    以便 ``DataSource._ak`` 拒绝在锁内联网（锁内禁网开关）。
+    标记按**线程**记录并保存/恢复嵌套前的取值 —— 重入时不会提前清除。
     """
     with _locked_file(lock_path(root), timeout):
-        yield
+        previous = getattr(_LOCK_DEPTH, "n", 0)
+        _LOCK_DEPTH.n = previous + 1
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH.n = previous
 
 
 # --------------------------------------------------------------------------- #

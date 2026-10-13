@@ -25,6 +25,7 @@ from typing import Any, Callable, Iterable
 
 import pandas as pd
 
+from . import store
 from .config import AppConfig
 
 __all__ = ["DataSource", "DataUnavailable"]
@@ -244,6 +245,22 @@ class DataSource:
         if self.offline:
             raise DataUnavailable(
                 "offline=True：禁止访问 akshare（离线模式只读 data/cache 与 data/fixture）"
+            )
+        # **锁内禁网**（架构评审 S-1 第 2 条；2026-10-13 落地）。
+        #
+        # BLOCK-1 的「锁外预热」只把**已知**的取数挪出了临界区；万一还有漏网的取数，
+        # 它仍会在持有写锁的情况下联网 —— 那是 **fail-slow**：写者互相饿死、
+        # 网页端返回 503，而账户本身毫无问题，排查起来极其困难。
+        # 这里把它变成 **fail-fast**：在锁内一旦真的要联网，就**响亮报错**并指明修法。
+        #
+        # 为什么判据是「进 _ak()」而不是「进 _cached()」：
+        # `_cached` 的新鲜缓存命中 / 离线夹具读都**不需要** akshare，
+        # 只有真正要联网时才走到这里 —— 所以这个位置既严格又不误伤缓存命中。
+        if store.in_critical_section():
+            raise DataUnavailable(
+                "写锁临界区内禁止联网取数：请把该数据的获取移到锁外"
+                "（用 service.prewarm_before_write 预热），或改用 --offline。"
+                "详见 INTERFACES.md INV-42。"
             )
         if self._ak_module is None:
             import akshare as ak  # 惰性导入

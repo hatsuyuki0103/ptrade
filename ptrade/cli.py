@@ -261,51 +261,12 @@ def prewarm_for_write(
     trade_date: str | None,
     extra_codes: Iterable[str] = (),
 ) -> list[str]:
-    """在**进入写锁之前**把写路径会用到的数据预热进缓存（架构评审 BLOCK-1）。
+    """锁外预热 —— 转发到 :func:`ptrade.service.prewarm_for_write`。
 
-    为什么必须这么做：写命令把「读 → 改 → 写」整体放进 ``store.locked_update``，
-    而引擎在这个临界区内会调 ``trade_dates`` / ``next_trade_date`` / ``quote`` /
-    ``last_close`` / ``daily`` / ``spot``（实测 **6 次**）。**离线**时这些是本地夹具读
-    （锁持有 ≈0.12s，无害）；但**在线 + 冷缓存**时它们是网络取数 —— 架构评审实测
-    单段持锁 **24.97s**（另一次 >180s），而网页端 ``DEFAULT_LOCK_TIMEOUT`` 是 **10s**
-    → 网页下单稳定 503，且**账户本身没有任何问题**。
-
-    ``DataSource`` 的缓存落在磁盘（``_read_entry`` 先读盘），所以这里预热一次之后，
-    锁内的同类调用会命中新鲜缓存而**不再联网**。
-
-    参数：
-      * ``state``：用于取出**全部持仓**代码 —— 引擎的 mark-to-market 会遍历所有持仓，
-        不只本次下单的那只；
-      * ``extra_codes``：本次操作涉及的代码（下单标的等），与持仓代码合并去重；
-      * ``trade_date``：**必须在锁外算好**。若传 ``None``，几乎预不到东西（第一版就栽在这里：
-        ``init`` 后 ``state.trade_date`` 为空 → 交易日由锁内的 ``_resolve_asof`` 才确定 →
-        预热全被跳过，锁内仍是 6 次数据访问）。
-
-    本函数**幂等**且**不抛**（best-effort）：真正的失败仍由锁内路径按原语义报错，
-    这里只负责尽量让锁内不联网。返回成功预热的键列表（供测试与非空守卫断言「确实做了事」）。
+    真源已上移到 ``service``：**网页端与 CLI 都需要它**，而第一版只修了 CLI，
+    独立复核实测网页写端点仍会在锁内取数并饿死并发写者（BLOCK-1 只修一半）。
     """
-    warmed: list[str] = []
-    codes = [str(c) for c in (getattr(state, "positions", {}) or {})]
-    all_codes = list(dict.fromkeys([*codes, *(str(c) for c in extra_codes)]))
-
-    def _try(label: str, fn) -> None:
-        try:
-            fn()
-            warmed.append(label)
-        except Exception:  # noqa: BLE001 - 预热尽力而为，失败留给锁内按原语义报错
-            pass
-
-    _try("trade_dates", lambda: ds.trade_dates())
-    if trade_date:
-        _try("next_trade_date", lambda: ds.next_trade_date(trade_date))
-        _try("is_trade_date", lambda: ds.is_trade_date(trade_date))
-        for code in all_codes:
-            _try(f"quote:{code}", lambda c=code: ds.quote(c, trade_date))
-            _try(f"last_close:{code}", lambda c=code: ds.last_close(c, trade_date))
-            _try(f"daily:{code}", lambda c=code: ds.daily(c, None, trade_date))
-        if all_codes:
-            _try("spot", lambda: ds.spot())
-    return warmed
+    return service.prewarm_for_write(ds, state, trade_date, extra_codes)
 
 
 def _prewarm_before_write(
@@ -313,22 +274,12 @@ def _prewarm_before_write(
     ds: DataSource,
     explicit_date: str | None,
     extra_codes: Iterable[str] = (),
+    *,
+    side: str | None = None,
 ) -> list[str]:
-    """锁外预热助手：用**与锁内完全相同的逻辑**解析交易日，再预热。
+    """锁外预热助手 —— 转发到 :func:`ptrade.service.prewarm_before_write`。"""
+    return service.prewarm_before_write(cfg, ds, explicit_date, extra_codes, side=side)
 
-    为什么必须「相同逻辑」：第一版预热直接用 ``args.trade_date``，而 ``init`` 后
-    ``state.trade_date`` 为空、交易日是锁内 ``_resolve_asof`` 才定下来的 →
-    预热时 ``trade_date=None`` → ``quote``/``last_close``/``daily`` 全被跳过，
-    锁内仍是 6 次数据访问（实测：修复尝试无效）。这里改成先按锁内同款规则算出日期。
-    """
-    peek = store.read_state(cfg)
-    date = explicit_date or (peek.trade_date if peek else "") or None
-    if not date:
-        try:
-            date = _resolve_asof(ds, None)
-        except Exception:  # noqa: BLE001 - 失败留给锁内按原语义报错
-            date = None
-    return prewarm_for_write(ds, peek, date, extra_codes=extra_codes)
 
 
 def _resolve_asof(ds: DataSource, asof: str | None, notes: list[str] | None = None) -> str:
@@ -363,6 +314,27 @@ def cmd_init(args: argparse.Namespace, cfg: AppConfig) -> int:
     os.makedirs(os.path.join(cfg.root, STATE_DIR), exist_ok=True)
     started: dict[str, Any] = {}
 
+    # **N3 修复（独立复核）**：`--trade-date` 的交易日校验必须在**进锁前**做完。
+    # 它要读 `is_trade_date` → 交易日历；在线 + 冷缓存时那是网络取数，
+    # 放进临界区就等于「为了校验一个日期而持锁联网」（架构评审 line 163 要求外移）。
+    #
+    # 保持原有**错误优先级**：账户已存在时，「账户已存在」优先于「不是交易日」
+    # （原本两条检查都在锁内，存在性在前）。所以这里先做一次**不取锁**的存在性预判：
+    # 若会走「账户已存在」分支，就不做日期校验、直接交给锁内报那个错。
+    start_date = getattr(args, "trade_date", None)
+    _will_report_exists = os.path.isfile(path) and not args.reset
+    if start_date and not _will_report_exists:
+        start_date = str(start_date)[:10]
+        try:
+            _ds = _make_ds(_cfg_with_cash(cfg, args.cash), bool(getattr(args, "offline", False)))
+            if not _ds.is_trade_date(start_date):
+                return _emit(args, "init", {"path": path},
+                             error=f"{start_date} 不是交易日（可用 --offline 读本地日历校验）")
+        except Exception:  # noqa: BLE001 - 日历不可用时不阻塞建账
+            pass
+    elif start_date:
+        start_date = str(start_date)[:10]
+
     def _mutate(_existing: AccountState | None) -> Any:
         # 存在性检查必须在锁内：否则两个并发 init 可能都通过检查后互相覆盖
         if os.path.isfile(path) and not args.reset:
@@ -375,17 +347,8 @@ def cmd_init(args: argparse.Namespace, cfg: AppConfig) -> int:
         # trade_date 缺省**留空**（账户"未落定"）：首笔 order/settle 的 --trade-date 决定起点，
         # 因此既能从最近交易日开跑，也能从任意历史交易日复盘。
         # 若显式给了 --trade-date，则用它作为起点（复盘历史某日的推荐用法）。
-        # 两种情况下 init 都不联网（日期校验仅在可用时用本地日历做，失败则放行）。
-        start_date = getattr(args, "trade_date", None)
+        # 校验已在锁外完成（见上），这里**不再取数**。
         if start_date:
-            start_date = str(start_date)[:10]
-            try:
-                ds = _make_ds(_cfg_with_cash(cfg, args.cash), bool(getattr(args, "offline", False)))
-                if not ds.is_trade_date(start_date):
-                    started["error"] = f"{start_date} 不是交易日（可用 --offline 读本地日历校验）"
-                    return store.NO_WRITE      # 同上：校验失败不得落盘
-            except Exception:  # noqa: BLE001 - 日历不可用时不阻塞建账
-                pass
             built.trade_date = start_date
         started["start"] = start_date
         return built
@@ -491,7 +454,7 @@ def cmd_order(args: argparse.Namespace, cfg: AppConfig) -> int:
     ds = _make_ds(cfg, bool(args.offline))
     generated: dict[str, Any] = {}
     # 锁外预热（BLOCK-1）：交易日按锁内同款逻辑解析，并带上本次下单标的
-    _prewarm_before_write(cfg, ds, args.trade_date, extra_codes=(args.code,))
+    _prewarm_before_write(cfg, ds, args.trade_date, extra_codes=(args.code,), side=args.side)
 
     def _mutate(state: AccountState | None) -> AccountState:
         if state is None:
@@ -559,7 +522,7 @@ def cmd_close(args: argparse.Namespace, cfg: AppConfig) -> int:
     Engine, _ = _import_engine()
     ds = _make_ds(cfg, bool(getattr(args, "offline", False)))
     generated: dict[str, Any] = {}
-    _prewarm_before_write(cfg, ds, args.trade_date, extra_codes=(args.code,))
+    _prewarm_before_write(cfg, ds, args.trade_date, extra_codes=(args.code,), side="close")
 
     def _mutate(state: AccountState | None) -> AccountState:
         if state is None:
