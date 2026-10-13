@@ -58,11 +58,20 @@ def run_json(root, *args, **kwargs):
 
 
 def _dates(cli_root):
+    """返回 ``(有数据的最新交易日, 其上一交易日, 其下一交易日)``。
+
+    **必须用** :func:`tests._guards.price_asof` 而不是 ``ds.latest_trade_date()``：
+    后者读交易日历（覆盖到 2026-12-31），而日线夹具止于 2026-10-09 ——
+    系统日期一往前走，它就会返回「日历上有、却没有行情」的日期，
+    下单被 ``SUSPENDED`` 拒掉（2026-10-13 实测 8 个用例因此失败）。
+    """
+    from tests._guards import price_asof
+
     from ptrade.config import load_config
     from ptrade.datasource import DataSource
 
     ds = DataSource(load_config(str(cli_root)), offline=True)
-    latest = ds.latest_trade_date()
+    latest = price_asof(ds)
     return latest, ds.prev_trade_date(latest), ds.next_trade_date(latest)
 
 
@@ -483,3 +492,94 @@ def test_settle_and_close_accept_offline(cli_root, command):
     proc = run_cli(cli_root, command, "--help")
     assert proc.returncode == 0
     assert "--offline" in proc.stdout
+
+
+# --------------------------------------------------------------------------- #
+# BLOCK-1（架构评审发现，Lead 复现并修复）：写命令必须先**在锁外**预热数据
+#
+# 修之前：写命令把「读 → 改 → 写」整体放进锁，而引擎在临界区内会调
+# trade_dates / next_trade_date / quote / last_close / daily / spot；离线时是本地夹具读
+# （持锁 ≈0.12s，无害），但**在线 + 冷缓存**时是网络取数 —— 实测单段持锁 24.97s，
+# 而网页端锁超时是 10s → 网页下单稳定 503，而账户本身没有任何问题。
+# Lead 修复后实测（在线路径）：锁内缓存未命中 2 → **0**（两次未命中被移到锁外）。
+# --------------------------------------------------------------------------- #
+def test_block1_write_commands_prewarm_before_lock():
+    """**BLOCK-1 的机制断言**：三个写命令都必须调用 `_prewarm_before_write`。
+
+    这是静态断言；真正的行为证据（在线路径锁内缓存未命中 2→0）记录在
+    `.omx/probe/verify_block1_fixed.py`。此处守住「调用点不会消失」。
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(ROOT, "ptrade", "cli.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    found: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in ("cmd_order", "cmd_settle", "cmd_close"):
+            body = ast.get_source_segment(src, node) or ""
+            found[node.name] = "_prewarm_before_write(" in body
+    assert set(found) == {"cmd_order", "cmd_settle", "cmd_close"}, f"未找到全部写命令：{sorted(found)}"
+    missing = [name for name, ok in found.items() if not ok]
+    assert not missing, (
+        f"这些写命令没有在锁外预热：{missing} —— BLOCK-1 复发（在线冷缓存会在锁内联网）"
+    )
+
+
+def test_block1_prewarm_actually_warms_the_order_code():
+    """**BLOCK-1 的关键细节**：预热必须真的覆盖本次下单标的的 quote 等数据。
+
+    第一版修复栽在这里：直接用 ``args.trade_date``（``init`` 后为空）→
+    ``trade_date=None`` → quote/last_close/daily 全被跳过，锁内仍是 6 次数据访问。
+    """
+    from ptrade import cli as cli_mod
+
+    called: dict[str, object] = {}
+
+    class FakeDS:
+        def trade_dates(self):
+            called["trade_dates"] = True
+            return ["2025-10-09", "2025-10-10"]
+
+        def next_trade_date(self, d):
+            called["next_trade_date"] = d
+            return "2025-10-10"
+
+        def is_trade_date(self, d):
+            return True
+
+        def quote(self, code, asof):
+            called[f"quote:{code}"] = asof
+            return {"last": 7.02, "prev_close": 7.0}
+
+        def last_close(self, code, asof):
+            called[f"last_close:{code}"] = asof
+            return 7.0
+
+        def daily(self, code, start, end):
+            called[f"daily:{code}"] = end
+            return []
+
+        def spot(self):
+            called["spot"] = True
+            return None
+
+    class FakeState:
+        trade_date = ""
+        positions: dict = {}
+
+    warmed = cli_mod.prewarm_for_write(FakeDS(), FakeState(), "2025-10-09", extra_codes=("601398",))
+    assert warmed, "预热什么都没做（空实现 = BLOCK-1 未修复）"
+    assert called.get("quote:601398") == "2025-10-09", f"未预热下单标的的 quote：{called}"
+    assert "trade_dates" in called, "未预热交易日历"
+    assert called.get("next_trade_date") == "2025-10-09", "未按交易日预热 next_trade_date"
+
+    # 非空守卫：trade_date 为 None 时，必须**明显少做事**（证明这个参数是必需的）
+    called.clear()
+    warmed_none = cli_mod.prewarm_for_write(FakeDS(), FakeState(), None, extra_codes=("601398",))
+    assert not any(k.startswith("quote:") for k in called), (
+        "trade_date=None 时不应假装预热了 quote —— 否则本测试无法区分参数是否被使用"
+    )
+    assert len(warmed_none) < len(warmed), (
+        f"trade_date=None 的预热量应与正常情况不同：{len(warmed_none)} vs {len(warmed)}"
+    )

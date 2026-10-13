@@ -238,7 +238,16 @@ def test_spot_limit_up_down_formula(offline_ds):
 
 
 def test_quote_contract_exact_keys(offline_ds):
-    asof = offline_ds.latest_trade_date()
+    """报价契约：键集合与不变式。
+
+    **asof 必须用「有数据的最近交易日」**（``price_asof``），不能用
+    ``latest_trade_date()`` —— 后者读交易日历（覆盖到 2026-12-31），而日线夹具止于
+    2026-10-09，于是 ``quote()`` 会因「日线末值日期 != asof」返回 ``suspended=True``
+    （2026-10-13 实测本用例因此失败）。理由详见 ``tests/_guards.py``。
+    """
+    from tests._guards import price_asof
+
+    asof = price_asof(offline_ds)
     quote = offline_ds.quote("600519", asof)
     assert set(quote.keys()) == {
         "code", "name", "last", "prev_close", "limit_up", "limit_down", "suspended"

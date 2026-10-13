@@ -45,6 +45,7 @@ from .core import (
     settle_t1,
 )
 from .datasource import DataSource
+from . import store
 
 __all__ = ["OrderRequest", "Engine"]
 
@@ -1342,9 +1343,16 @@ class Engine:
             order.debt_delta = float(plan["debt_delta"])
 
     def _append_ledger(self, order: Order) -> None:
-        root = Path(self.cfg.root)
-        data_dir = root / "data"
+        """落账到 ``<root>/data/ledger.jsonl``（**委托** :func:`ptrade.store.append_jsonl`）。
+
+        为什么不再裸 ``open("a")``（Architect B3 + core-builder 实测）：
+        Windows CRT 的 ``O_APPEND`` 是「seek 到末尾 + write」两步，**不是行原子** ——
+        3 进程 × 60 行实测丢 3 行。``store.append_jsonl`` 在追加前取数据根常驻锁，
+        保证一次写入一行；它在 ``locked_update`` 临界区内**可重入**，不引入额外开销。
+
+        ledger 水位由 :func:`ptrade.store.save_state` 在落盘时按 ledger 实际行数记录，
+        因此这里不需要（也不应该）往 state 上挂任何标记。
+        """
+        data_dir = Path(self.cfg.root) / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(asdict(order), ensure_ascii=False)
-        with (data_dir / "ledger.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        store.append_jsonl(str(data_dir / "ledger.jsonl"), asdict(order))

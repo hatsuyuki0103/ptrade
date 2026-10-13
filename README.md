@@ -101,9 +101,50 @@ python tools/build_fixtures.py     # 用 akshare 现拉重建（需联网，约 
 | `close --code [--ratio]` | 平仓（先买券还券，再卖券还款/卖出） |
 | `ledger [--limit N]` | 成交流水（`data/ledger.jsonl`） |
 | `chart --code [--period daily\|weekly\|monthly] [--out]` | 离线单文件 K 线图 HTML |
+| `search <代码或名称> [--limit N] [--offline]` | 搜索股票（代码前缀 / 中文名子串） |
+| `watchlist --action add\|remove\|list [code] [--name] [--note]` | 自选池增删查（幂等） |
+| `serve [--host] [--port] [--offline]` | **启动本地网页端**（默认 `127.0.0.1:8765`） |
 
 全局 `--root <path>` 覆盖数据根目录；`--json` 输出 `{"ok","command","data","error"}`，**退出码 0/1**
 （业务拒单不算错误：`ok=true` 且 `data.orders[].status == "rejected"`）。
+
+## 网页端
+
+```powershell
+python -m ptrade serve            # 浏览器打开 http://127.0.0.1:8765
+```
+
+在浏览器里可以看账户 / 持仓 / 风险 / 七因子打分数表 / K 线图，并能**下单、平仓、结算**。
+前端是**单个自包含页面**（内联 CSS/JS，**零外链**）；K 线图由 `/api/chart` 返回完整 HTML 内嵌显示。
+
+> ⚠️ **网页端没有鉴权**。默认只绑 `127.0.0.1`，这是**唯一的边界**。
+> `--host 0.0.0.0` 会让同网段任何人都能对你的模拟盘下单 —— 启动横幅会就此警告。
+
+**写者互斥**：网页端与 CLI 会写**同一份** `data/state.json` 与 `data/ledger.jsonl`，
+因此两者共用一把跨进程写锁（`data/.ptrade.lock`）：任一时刻只有一个写者在「读 → 改 → 写」临界区内。
+并发写会排队；锁超时（默认 10s）时网页端返回 **HTTP 503**（`error_code=STATE_LOCK_TIMEOUT`），
+CLI 返回退出码 1 —— **都不会静默写坏状态**。
+
+**账实一致性**：`status` 与 `/api/state` 都会给出 `ledger_consistency`
+（`{"consistent","ledger_lines","recorded","diverged"}`）。写一单的时序是「先落 ledger，再原子写 state」，
+若 state 落盘失败就会出现「ledger 有单、state 无单」的分叉 —— 这个字段让它**可被检出**
+（`diverged=true`），而不是悄悄留下不一致。`diverged=null` 表示**无法判定**（例如有写事务正在进行），
+此时 `consistent=false`：**不把「不知道」当成「没问题」**。
+
+## 搜索与自选池
+
+```powershell
+python -m ptrade search "茅台" --offline              # 按中文名
+python -m ptrade search "600519" --offline            # 按代码
+python -m ptrade watchlist --action add 600519 --name 贵州茅台
+python -m ptrade watchlist --action list
+```
+
+`search` 的全市场名称表缓存在 `data/cache/stock_list.json`（TTL 7 天）。
+**`--offline` 只读缓存**：没有缓存会**明确报错并给出获取方式**，而不是静默返回空；
+**无命中**则返回 `ok=true` 且 `count=0` —— 两者被严格区分。
+自选池 `add` 是**幂等**的（重复添加不产生重复项、不报错）。
+
 
 ## 账户数学（v3.2 口径）
 

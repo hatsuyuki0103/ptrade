@@ -1017,6 +1017,12 @@ python -m ptrade chart --code 600519 [--period daily|weekly|monthly] [--asof 202
 | INV-21 | **边界语义严格 `<`**：`ratio==1.300` → `margin_call`（非 forced）；`1.299` → `forced`；三例同测 50.0%/50.1%/49.9% | 五处一致 |
 | INV-22 | **「融上再融」**：浮盈 → `net_assets`↑ → 单票上限与 `margin_available`↑；**浮盈不得计入 `available_cash`** | §3.2.1 四条硬规则 |
 | INV-23 | **可提取额度只读**：`ratio >= 3.00` 时 `risk_report()` 产出 `MAINTENANCE_EXTRACTABLE`（info）；本版本不实现资金划出 | 让 `max_maintenance_ratio` 生效 |
+| INV-35 | **写者互斥（执行体级）**：任一数据根下，同一时刻最多一个**执行体**（进程或线程）处于 `store.locked_update` 临界区；`store.state_lock` 同进程同线程**可重入**，跨线程/跨进程互斥。超时抛 `StateLockTimeout`（`error_code="STATE_LOCK_TIMEOUT"`），**不得继续写** | 新：`tests/test_store.py` S1–S3、S7；跨前端 C1–C4 |
+| INV-36 | **原子写必须有写方重试**：`os.replace` 在 Windows 上遇读者持有句柄会 `PermissionError(errno=13)`；`store.atomic_write_text` 在**有界预算**（`WRITE_RETRY_BUDGET_SECONDS`，默认 0.40s）内重试**可重试 errno**（11/13/16/26），预算耗尽抛 `StateWriteTimeout`（`error_code="STATE_WRITE_TIMEOUT"`）。**绝不退回非原子写、绝不假装成功** | core-builder 实测：去掉重试 45/200 失败（≈22.5%），有重试 0/200；`test_S9_*`、S10 |
+| INV-37 | **重试逻辑单点落位**：除 `store.py` 外，任何模块**不得**直接调用 `os.replace`（否则绕过写方重试；`watchlist.py` 曾因此在 4 读者线程下 60 次写失败 50 次） | `test_meta_only_store_may_call_os_replace`（AST 判定）+ `test_meta_guard_would_catch_a_violation` |
+| INV-38 | **审计与成交分流**：`state_audit.jsonl` 记**状态写入审计**（每次落盘一行，含 `source`/`pid`/`net_assets`/`ledger_lines`）；`ledger.jsonl` **只记成交**，每行一个 `Order`。**禁止**把审计行混进 `ledger.jsonl` —— `_read_ledger` 逐行全收、不做 kind 过滤，混入会让 `ledger --json` 返回幽灵订单并让计数判据失效 | Critic P1 裁决；`test_ledger_*` |
+| INV-39 | **ledger 水位与分叉可检出**：`state.json` 的 `app.ledger_lines` 记录落盘时刻的 ledger 非空行数；`store.check_ledger_state_consistency(cfg)` 比对水位与实测行数，返回 `diverged`。任一侧不可读时 `diverged=None` 且 `consistent=False`（**不得**把「无法判定」当成「没问题」） | 新：`test_store.py` S12–S14；实测：正常路径 0/0、1/1 一致；注入一行后 `diverged=True` 检出 |
+| INV-40 | **append_jsonl 行原子**：追加前取该数据根常驻锁，保证一次写入一行（Windows CRT 的 `O_APPEND` 是「seek + write」两步，**非行原子**；3 进程 × 60 行实测丢 3 行） | core-builder 实测；`tests/test_store.py` S8（断言精确行数） |
 
 ---
 

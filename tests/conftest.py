@@ -66,11 +66,14 @@ def offline_ds(offline_cfg):
     return DataSource(offline_cfg, offline=True)
 
 
+
 @pytest.fixture
 def seeded_account(offline_cfg, offline_ds):
     """已建仓账户：上一交易日买入 600519 100 股，已结算（可卖）。"""
+    from tests._guards import price_asof as _price_asof
+
     state = core.new_state(offline_cfg)
-    latest = offline_ds.latest_trade_date()
+    latest = _price_asof(offline_ds)                # ← 有数据的最新日（不是日历最新日）
     prev = offline_ds.prev_trade_date(latest)
     price = offline_ds.last_close("600519", prev)
     trade_date = prev

@@ -33,6 +33,33 @@ def _has_json(directory: str) -> bool:
     )
 
 
+def price_asof(ds, code: str = "600519") -> str:
+    """返回**日线数据真正覆盖到**的最近交易日（可安全下单/取价）。
+
+    为什么不能直接用 ``ds.latest_trade_date()``（2026-10-13 暴露的时间炸弹）：
+    它读的是 ``trade_dates.json``，那张日历覆盖到 2026-12-31；而 32 只票的
+    **日线夹具全部止于 2026-10-09**。于是只要系统日期往前走，它就会返回一个
+    **日历上有、却没有任何行情**的日期：依赖它的夹具会建仓在无数据的日期 ——
+    ``quote()`` 因「日线末值日期 != asof」标 ``suspended=True``，引擎按 ``SUSPENDED``
+    拒单，一批无关用例集体变红（实测 2026-10-13 早上 **8 个**失败，前一天全绿）。
+
+    ``--asof`` 纪律要求历史序列**不得依赖系统时钟**；测试夹具同理：
+    唯一真源是「数据实际覆盖到哪里」。
+
+    判定用 ``quote()['suspended']`` —— 那正是引擎下单时的判据。
+    **不能用** ``last_close()``：它按「≤asof 的最后一行」取值，越界会静默回落到更早日期，
+    因此探测不出「当天无数据」（第一版就栽在这里，返回了无数据的 2026-10-12）。
+
+    本函数放在 ``_guards.py`` 而非 ``conftest.py``，是为了**可被测试模块导入**。
+    """
+    day = ds.latest_trade_date()
+    for _ in range(60):                             # 夹具窗口内足够
+        if not ds.quote(code, day)["suspended"]:
+            return day
+        day = ds.prev_trade_date(day)
+    return ds.latest_trade_date()                   # 兜底：保持旧行为，由调用方报错
+
+
 def require_fixtures() -> None:
     """真实夹具（`data/fixture/`）缺失 → skip。"""
     if not _has_json(FIXTURE_DIR):

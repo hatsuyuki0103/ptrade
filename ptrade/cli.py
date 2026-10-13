@@ -17,10 +17,13 @@ import json
 import math
 import os
 import sys
+from dataclasses import asdict
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterable
 
 from . import core
+from . import service
+from . import store
 from .config import AccountConfig, AppConfig, load_config
 from .core import AccountState, Side
 from .datasource import DataSource, DataUnavailable
@@ -36,28 +39,11 @@ LEDGER_FILE = "ledger.jsonl"
 # 输出 / 序列化
 # --------------------------------------------------------------------------- #
 def _jsonable(obj: Any) -> Any:
-    """递归转 JSON 安全结构（CanslimResult/FactorScore 用 to_dict()，dataclass 用 asdict）。"""
-    if obj is None or isinstance(obj, (str, bool, int)):
-        return obj
-    if isinstance(obj, float):
-        # CR-9：非有限浮点一律序列化为 null（JSON 无 Infinity/NaN；禁止裸 Infinity）
-        return obj if math.isfinite(obj) else None
-    if hasattr(obj, "to_dict") and callable(obj.to_dict):
-        return _jsonable(obj.to_dict())
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return _jsonable(dataclasses.asdict(obj))
-    if isinstance(obj, dict):
-        return {str(k): _jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_jsonable(v) for v in obj]
-    item = getattr(obj, "item", None)  # numpy 标量
-    if callable(item):
-        try:
-            return _jsonable(item())
-        except Exception:  # noqa: BLE001
-            pass
-    return str(obj)
+    """递归转 JSON 安全结构 —— 转发到 :func:`ptrade.service.jsonable`（W-7：消除分层倒置）。
 
+    保留同名私有函数是为了**零改动**既有调用点与测试；真实实现只有一处（service）。
+    """
+    return service.jsonable(obj)
 
 def _want_json(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "json", False))
@@ -165,29 +151,28 @@ def _print_human(command: str, data: dict[str, Any]) -> None:
 # 状态与账本 IO
 # --------------------------------------------------------------------------- #
 def _state_path(cfg: AppConfig) -> str:
-    return os.path.join(cfg.root, STATE_DIR, STATE_FILE)
-
+    """转发到 :func:`ptrade.service.state_path`。"""
+    return service.state_path(cfg)
 
 def _ledger_path(cfg: AppConfig) -> str:
-    return os.path.join(cfg.root, STATE_DIR, LEDGER_FILE)
-
+    """转发到 :func:`ptrade.service.ledger_path`。"""
+    return service.ledger_path(cfg)
 
 def _load_state(cfg: AppConfig) -> AccountState:
-    path = _state_path(cfg)
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"未找到账户文件 {path}，请先执行 `python -m ptrade init`")
-    with open(path, "r", encoding="utf-8") as fh:
-        doc = json.load(fh)
-    return core.state_from_document(doc, cfg)
+    """读账户状态。**只读路径**：不取写锁（INV-26）。
+
+    文件不存在时抛出与既有语义一致的可读错误（`status`/`scan` 等命令依赖它）。
+    """
+    state = store.read_state(cfg)
+    if state is None:
+        raise FileNotFoundError(f"未找到账户文件 {_state_path(cfg)}，请先执行 `python -m ptrade init`")
+    return state
 
 
-def _save_state(cfg: AppConfig, state: AccountState) -> str:
-    path = _state_path(cfg)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(core.state_document(state), fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
-    return path
+# `_save_state` 已删除（Critic P3 裁决）：它零调用点，而**保留它就是保留一个陷阱** ——
+# 任何新写命令顺手调用它，就会退化成「锁外写」（丢掉读-改-写的原子性，即 Architect B1），
+# 而且不会有任何测试变红。写路径的唯一入口是
+# `store.locked_update(cfg, mutate, source="cli")`，见 cmd_init / cmd_order / cmd_settle / cmd_close。
 
 
 # 注意：ledger.jsonl 的**写**归 engine.submit（§5），CLI 只读不写，
@@ -213,56 +198,13 @@ def _read_ledger(cfg: AppConfig, limit: int) -> tuple[list[dict[str, Any]], int]
 
 
 def _state_summary(state: AccountState) -> dict[str, Any]:
-    ratio = state.maintenance_ratio
-    return {
-        "trade_date": state.trade_date,
-        "initial_cash": state.initial_cash,
-        "available_cash": state.available_cash,
-        "frozen_t1": state.frozen_t1,
-        "frozen_collateral": state.frozen_collateral,
-        "frozen_cash": state.frozen_cash,
-        "financing_debt": state.financing_debt,
-        "short_cost_debt": dict(state.short_cost_debt),
-        "short_qty_debt": dict(state.short_qty_debt),
-        "interest_accrued": state.interest_accrued,
-        "long_market_value": state.long_market_value,
-        "short_market_value": state.short_market_value,
-        "collateral_value": state.collateral_value,
-        "total_assets": state.total_assets,
-        "total_debt": state.total_debt,
-        "net_assets": state.net_assets,
-        "maintenance_ratio": None if ratio == float("inf") else ratio,
-        "leverage": state.leverage,
-        "margin_required": state.margin_required,
-        "margin_available": state.margin_available,
-        "total_pnl": state.total_pnl,
-        "margin_call": state.margin_call,
-        "forced_liquidation": state.forced_liquidation,
-        "positions": [
-            {
-                "code": pos.code,
-                "name": pos.name,
-                "long_qty": pos.long_qty,
-                "long_available": pos.long_available,
-                "short_qty": pos.short_qty,
-                "short_available": pos.short_available,
-                "long_cost": pos.long_cost,
-                "short_cost": pos.short_cost,
-                "last_price": pos.last_price,
-                "long_value": pos.long_value,
-                "short_value": pos.short_value,
-                "long_pnl": pos.long_pnl,
-                "short_pnl": pos.short_pnl,
-            }
-            for pos in state.positions.values()
-            if pos.is_active
-        ],
-    }
+    """账户快照序列化 —— 转发到 :func:`ptrade.service.state_summary`。
 
+    已逐字段比对（24 键、0 差异、JSON 字节级一致、持仓按 ``is_active`` 过滤），
+    见 ``.omx/probe/verify_service_parity.py``。
+    """
+    return service.state_summary(state)
 
-# --------------------------------------------------------------------------- #
-# 延迟导入（模块未就绪时给明确错误）
-# --------------------------------------------------------------------------- #
 def _import_engine():
     try:
         from .engine import Engine, OrderRequest
@@ -288,32 +230,113 @@ def _import_chart():
 
 
 def _make_ds(cfg: AppConfig, offline: bool) -> DataSource:
-    return DataSource(cfg, offline=offline)
+    """转发到 :func:`ptrade.service.make_ds`。"""
+    return service.make_ds(cfg, offline)
+
+def _engine_for(engine_cls, cfg: AppConfig, ds: DataSource, state: AccountState, *, source: str = "cli"):
+    """构造 Engine 并把 ledger 落账标注来源（**Critic W8**）。
+
+    为什么需要：``core.Order`` **没有** ``source`` 字段，所以 CLI 下单落进
+    ``ledger.jsonl`` 的行原本 18 个字段、**不含 ``source``**；而网页侧用
+    ``webapp.attach_ledger_source`` 加了 ``source="web"``。结果同一份 ledger 里
+    网页行有来源、CLI 行没有 —— 「谁下的单」不可审计。
+
+    这里做与网页侧**同构**的钩子（CLI 不能 import ``webapp``：那是分层倒置，见 Critic W-7）。
+    待 ``ptrade/service.py`` 落地后，两边应改为共同依赖 service 里的单一实现。
+    """
+    engine = engine_cls(cfg, ds, state)
+
+    def _append_with_source(order) -> None:
+        row = asdict(order)
+        row["source"] = source
+        store.append_jsonl(store.ledger_path(cfg), row)
+
+    engine._append_ledger = _append_with_source  # noqa: SLF001 - 有意的落账钩子替换
+    return engine
 
 
-MARKET_CLOSE = (15, 30)
+def prewarm_for_write(
+    ds: DataSource,
+    state: AccountState | None,
+    trade_date: str | None,
+    extra_codes: Iterable[str] = (),
+) -> list[str]:
+    """在**进入写锁之前**把写路径会用到的数据预热进缓存（架构评审 BLOCK-1）。
+
+    为什么必须这么做：写命令把「读 → 改 → 写」整体放进 ``store.locked_update``，
+    而引擎在这个临界区内会调 ``trade_dates`` / ``next_trade_date`` / ``quote`` /
+    ``last_close`` / ``daily`` / ``spot``（实测 **6 次**）。**离线**时这些是本地夹具读
+    （锁持有 ≈0.12s，无害）；但**在线 + 冷缓存**时它们是网络取数 —— 架构评审实测
+    单段持锁 **24.97s**（另一次 >180s），而网页端 ``DEFAULT_LOCK_TIMEOUT`` 是 **10s**
+    → 网页下单稳定 503，且**账户本身没有任何问题**。
+
+    ``DataSource`` 的缓存落在磁盘（``_read_entry`` 先读盘），所以这里预热一次之后，
+    锁内的同类调用会命中新鲜缓存而**不再联网**。
+
+    参数：
+      * ``state``：用于取出**全部持仓**代码 —— 引擎的 mark-to-market 会遍历所有持仓，
+        不只本次下单的那只；
+      * ``extra_codes``：本次操作涉及的代码（下单标的等），与持仓代码合并去重；
+      * ``trade_date``：**必须在锁外算好**。若传 ``None``，几乎预不到东西（第一版就栽在这里：
+        ``init`` 后 ``state.trade_date`` 为空 → 交易日由锁内的 ``_resolve_asof`` 才确定 →
+        预热全被跳过，锁内仍是 6 次数据访问）。
+
+    本函数**幂等**且**不抛**（best-effort）：真正的失败仍由锁内路径按原语义报错，
+    这里只负责尽量让锁内不联网。返回成功预热的键列表（供测试与非空守卫断言「确实做了事」）。
+    """
+    warmed: list[str] = []
+    codes = [str(c) for c in (getattr(state, "positions", {}) or {})]
+    all_codes = list(dict.fromkeys([*codes, *(str(c) for c in extra_codes)]))
+
+    def _try(label: str, fn) -> None:
+        try:
+            fn()
+            warmed.append(label)
+        except Exception:  # noqa: BLE001 - 预热尽力而为，失败留给锁内按原语义报错
+            pass
+
+    _try("trade_dates", lambda: ds.trade_dates())
+    if trade_date:
+        _try("next_trade_date", lambda: ds.next_trade_date(trade_date))
+        _try("is_trade_date", lambda: ds.is_trade_date(trade_date))
+        for code in all_codes:
+            _try(f"quote:{code}", lambda c=code: ds.quote(c, trade_date))
+            _try(f"last_close:{code}", lambda c=code: ds.last_close(c, trade_date))
+            _try(f"daily:{code}", lambda c=code: ds.daily(c, None, trade_date))
+        if all_codes:
+            _try("spot", lambda: ds.spot())
+    return warmed
+
+
+def _prewarm_before_write(
+    cfg: AppConfig,
+    ds: DataSource,
+    explicit_date: str | None,
+    extra_codes: Iterable[str] = (),
+) -> list[str]:
+    """锁外预热助手：用**与锁内完全相同的逻辑**解析交易日，再预热。
+
+    为什么必须「相同逻辑」：第一版预热直接用 ``args.trade_date``，而 ``init`` 后
+    ``state.trade_date`` 为空、交易日是锁内 ``_resolve_asof`` 才定下来的 →
+    预热时 ``trade_date=None`` → ``quote``/``last_close``/``daily`` 全被跳过，
+    锁内仍是 6 次数据访问（实测：修复尝试无效）。这里改成先按锁内同款规则算出日期。
+    """
+    peek = store.read_state(cfg)
+    date = explicit_date or (peek.trade_date if peek else "") or None
+    if not date:
+        try:
+            date = _resolve_asof(ds, None)
+        except Exception:  # noqa: BLE001 - 失败留给锁内按原语义报错
+            date = None
+    return prewarm_for_write(ds, peek, date, extra_codes=extra_codes)
 
 
 def _resolve_asof(ds: DataSource, asof: str | None, notes: list[str] | None = None) -> str:
-    """``--asof`` 未来函数防护（v3.1）：只允许**已收盘**交易日。
+    """``--asof`` 未来函数防护 —— 转发到 :func:`ptrade.service.resolve_asof`。
 
-    * 缺省 = ``ds.latest_trade_date()``（其本身已裁剪到"最近已收盘交易日"）；
-    * 显式传入当天且当前时间 < 15:30 → 自动回退到上一交易日，并在 ``notes`` 里标注；
-    * 传入未来日期 → 报 ``NO_MARKET_DATA``。
+    语义逐字一致（含 ``RuntimeError("NO_MARKET_DATA: ...")`` 与 15:30 回退规则）。
     """
-    day = str(asof)[:10] if asof else ds.latest_trade_date()
-    today = ds._today()
-    now = datetime.now()
-    if day > today:
-        raise RuntimeError(f"NO_MARKET_DATA: asof={day} 超出可用数据范围（今天 {today}）")
-    closed = (now.hour, now.minute) >= MARKET_CLOSE
-    if day == today and not closed and ds.is_trade_date(today):
-        prev = ds.prev_trade_date(today)
-        if notes is not None:
-            notes.append(f"当日（{today}）尚未收盘（<15:30），已回退到上一交易日 {prev}")
-        return prev
-    return day
-
+    return service.resolve_asof(ds, asof, notes)
 
 def _split_codes(text: str | None) -> list[str]:
     if not text:
@@ -331,40 +354,60 @@ def _cfg_with_cash(cfg: AppConfig, cash: float | None) -> AppConfig:
 # 子命令实现
 # --------------------------------------------------------------------------- #
 def cmd_init(args: argparse.Namespace, cfg: AppConfig) -> int:
+    """初始化账户。
+
+    **B1 修复**：整个「存在性检查 → 建账 → 落盘」周期放进 ``store.locked_update``
+    临界区。此前是裸的 read-modify-write，与网页端并发时会丢更新。
+    """
     path = _state_path(cfg)
-    if os.path.isfile(path) and not args.reset:
-        return _emit(args, "init", {"path": path}, error="账户已存在（使用 --reset 重建）")
-    cfg = _cfg_with_cash(cfg, args.cash)
-    state = core.new_state(cfg)
-    # trade_date 缺省**留空**（账户"未落定"）：首笔 order/settle 的 --trade-date 决定起点，
-    # 因此既能从最近交易日开跑，也能从任意历史交易日复盘。
-    # 若显式给了 --trade-date，则用它作为起点（复盘历史某日的推荐用法）。
-    # 两种情况下 init 都不联网（日期校验仅在可用时用本地日历做，失败则放行）。
-    start = getattr(args, "trade_date", None)
-    if start:
-        start = str(start)[:10]
-        try:
-            ds = _make_ds(cfg, bool(getattr(args, "offline", False)))
-            if not ds.is_trade_date(start):
-                return _emit(args, "init", {"path": path}, error=f"{start} 不是交易日（可用 --offline 读本地日历校验）")
-        except Exception:  # noqa: BLE001 - 日历不可用时不阻塞建账
-            pass
-        state.trade_date = start
-    _save_state(cfg, state)
+    os.makedirs(os.path.join(cfg.root, STATE_DIR), exist_ok=True)
+    started: dict[str, Any] = {}
+
+    def _mutate(_existing: AccountState | None) -> Any:
+        # 存在性检查必须在锁内：否则两个并发 init 可能都通过检查后互相覆盖
+        if os.path.isfile(path) and not args.reset:
+            started["error"] = "账户已存在（使用 --reset 重建）"
+            # **NO_WRITE**（不是 None）：`locked_update` 把 `None` 解释成「写回入参状态」，
+            # 于是错误路径也会落盘 —— 而 `save_state` 会顺手刷新 ledger 水位，
+            # 一次失败的 init 就能抹掉已检出的账实分叉（code-review H2，已复现）。
+            return store.NO_WRITE
+        built = core.new_state(_cfg_with_cash(cfg, args.cash))
+        # trade_date 缺省**留空**（账户"未落定"）：首笔 order/settle 的 --trade-date 决定起点，
+        # 因此既能从最近交易日开跑，也能从任意历史交易日复盘。
+        # 若显式给了 --trade-date，则用它作为起点（复盘历史某日的推荐用法）。
+        # 两种情况下 init 都不联网（日期校验仅在可用时用本地日历做，失败则放行）。
+        start_date = getattr(args, "trade_date", None)
+        if start_date:
+            start_date = str(start_date)[:10]
+            try:
+                ds = _make_ds(_cfg_with_cash(cfg, args.cash), bool(getattr(args, "offline", False)))
+                if not ds.is_trade_date(start_date):
+                    started["error"] = f"{start_date} 不是交易日（可用 --offline 读本地日历校验）"
+                    return store.NO_WRITE      # 同上：校验失败不得落盘
+            except Exception:  # noqa: BLE001 - 日历不可用时不阻塞建账
+                pass
+            built.trade_date = start_date
+        started["start"] = start_date
+        return built
+
+    state = store.locked_update(cfg, _mutate, source="cli")
+    if "error" in started or not isinstance(state, AccountState):
+        return _emit(args, "init", {"path": path}, error=started.get("error", "账户初始化未完成"))
     data = _state_summary(state)
     data["path"] = path
     data["reset"] = bool(args.reset)
     data["hint"] = (
-        f"起点交易日 = {state.trade_date}" if start
+        f"起点交易日 = {state.trade_date}" if started.get("start")
         else "trade_date 为空（未落定）：首笔 order/settle 的 --trade-date 决定起点"
     )
     return _emit(args, "init", data)
 
-
 def cmd_status(args: argparse.Namespace, cfg: AppConfig) -> int:
+    """账户状态。**M3 修复**：同时给出账实一致性，让分叉真的被用户看见。"""
     state = _load_state(cfg)
     data = _state_summary(state)
     data["state_path"] = _state_path(cfg)
+    data["ledger_consistency"] = service.consistency(cfg)
     return _emit(args, "status", data)
 
 
@@ -443,59 +486,60 @@ def cmd_plan(args: argparse.Namespace, cfg: AppConfig) -> int:
 
 
 def cmd_order(args: argparse.Namespace, cfg: AppConfig) -> int:
+    """下单。**B1 修复**：读-改-写整体进临界区。**BLOCK-1 修复**：临界区前预热数据。"""
     Engine, OrderRequest = _import_engine()
     ds = _make_ds(cfg, bool(args.offline))
-    state = _load_state(cfg)
-    trade_date = args.trade_date or state.trade_date or _resolve_asof(ds, None)
-    engine = Engine(cfg, ds, state)
-    if state.trade_date != trade_date:
-        state = engine.roll_to(trade_date)
-    request = OrderRequest(
-        code=args.code, side=args.side, qty=int(args.qty),
-        price=(None if args.price is None else float(args.price)), trade_date=trade_date,
-    )
-    order = engine.submit(request)
-    state = engine.state
-    _save_state(cfg, state)
+    generated: dict[str, Any] = {}
+    # 锁外预热（BLOCK-1）：交易日按锁内同款逻辑解析，并带上本次下单标的
+    _prewarm_before_write(cfg, ds, args.trade_date, extra_codes=(args.code,))
+
+    def _mutate(state: AccountState | None) -> AccountState:
+        if state is None:
+            raise FileNotFoundError(f"未找到账户文件 {_state_path(cfg)}，请先执行 `python -m ptrade init`")
+        trade_date = args.trade_date or state.trade_date or _resolve_asof(ds, None)
+        engine = _engine_for(Engine, cfg, ds, state, source="cli")
+        if state.trade_date != trade_date:
+            state = engine.roll_to(trade_date)
+        request = OrderRequest(
+            code=args.code, side=args.side, qty=int(args.qty),
+            price=(None if args.price is None else float(args.price)), trade_date=trade_date,
+        )
+        order = engine.submit(request)
+        generated["order"] = order
+        generated["trade_date"] = trade_date
+        return engine.state
+
+    state = store.locked_update(cfg, _mutate, source="cli")
     # ledger.jsonl 由 engine.submit 负责落账（§5），CLI **不得**重复追加
     return _emit(
         args, "order",
-        {"trade_date": trade_date, "orders": [_jsonable(order)], "state": _state_summary(state)},
+        {
+            "trade_date": generated.get("trade_date"),
+            "orders": [_jsonable(generated["order"])],
+            "state": _state_summary(state),
+        },
     )
 
 
 def cmd_settle(args: argparse.Namespace, cfg: AppConfig) -> int:
+    """结算。**B1 修复**：读-改-写整体进临界区。**BLOCK-1 修复**：临界区前预热数据。"""
     Engine, _ = _import_engine()
     ds = _make_ds(cfg, bool(args.offline))
-    state = _load_state(cfg)
-    engine = Engine(cfg, ds, state)
-    state = engine.roll_to(args.trade_date)
-    _save_state(cfg, state)
+    _prewarm_before_write(cfg, ds, args.trade_date)
+
+    def _mutate(state: AccountState | None) -> AccountState:
+        if state is None:
+            raise FileNotFoundError(f"未找到账户文件 {_state_path(cfg)}，请先执行 `python -m ptrade init`")
+        engine = _engine_for(Engine, cfg, ds, state, source="cli")
+        return engine.roll_to(args.trade_date)
+
+    state = store.locked_update(cfg, _mutate, source="cli")
     return _emit(args, "settle", {"trade_date": state.trade_date, "orders": [], "state": _state_summary(state)})
 
 
 def _risk_from_core(state: AccountState, cfg: AppConfig) -> dict[str, Any]:
-    """engine 未就绪时的 core 兜底（口径与 engine.risk_report 一致）。"""
-    state = core.refresh_risk_flags(state, cfg.risk, cfg.margin)
-    ratio = state.maintenance_ratio
-    return {
-        "maintenance_ratio": None if ratio == float("inf") else ratio,
-        "status": core.risk_status(state, cfg.risk, cfg.margin),
-        "alerts": core.check_risk(state, cfg.risk, cfg.margin),
-        "leverage": state.leverage,
-        "exposure": {
-            "long_market_value": state.long_market_value,
-            "short_market_value": state.short_market_value,
-            "gross_exposure": state.gross_exposure,
-            "short_exposure": state.short_exposure,
-            "margin_required": state.margin_required,
-            "margin_available": state.margin_available,
-            "max_leverage": cfg.risk.max_leverage,
-        },
-        "positions": _state_summary(state)["positions"],
-        "source": "core",
-    }
-
+    """engine 未就绪时的 core 兜底 —— 转发到 :func:`ptrade.service.risk_from_core`。"""
+    return service.risk_from_core(state, cfg)
 
 def cmd_risk(args: argparse.Namespace, cfg: AppConfig) -> int:
     state = _load_state(cfg)
@@ -511,20 +555,33 @@ def cmd_risk(args: argparse.Namespace, cfg: AppConfig) -> int:
 
 
 def cmd_close(args: argparse.Namespace, cfg: AppConfig) -> int:
+    """平仓。**B1 修复**：读-改-写整体进临界区。**BLOCK-1 修复**：临界区前预热数据。"""
     Engine, _ = _import_engine()
     ds = _make_ds(cfg, bool(getattr(args, "offline", False)))
-    state = _load_state(cfg)
-    trade_date = args.trade_date or state.trade_date or _resolve_asof(ds, None)
-    engine = Engine(cfg, ds, state)
-    if state.trade_date != trade_date:
-        state = engine.roll_to(trade_date)
-    orders = engine.close_position(args.code, trade_date, float(args.ratio))
-    state = engine.state
-    _save_state(cfg, state)
+    generated: dict[str, Any] = {}
+    _prewarm_before_write(cfg, ds, args.trade_date, extra_codes=(args.code,))
+
+    def _mutate(state: AccountState | None) -> AccountState:
+        if state is None:
+            raise FileNotFoundError(f"未找到账户文件 {_state_path(cfg)}，请先执行 `python -m ptrade init`")
+        trade_date = args.trade_date or state.trade_date or _resolve_asof(ds, None)
+        engine = _engine_for(Engine, cfg, ds, state, source="cli")
+        if state.trade_date != trade_date:
+            state = engine.roll_to(trade_date)
+        orders = engine.close_position(args.code, trade_date, float(args.ratio))
+        generated["orders"] = orders
+        generated["trade_date"] = trade_date
+        return engine.state
+
+    state = store.locked_update(cfg, _mutate, source="cli")
     # 平仓内部走 submit → ledger 已由引擎落账，CLI 不重复追加
     return _emit(
         args, "close",
-        {"trade_date": trade_date, "orders": _jsonable(orders), "state": _state_summary(state)},
+        {
+            "trade_date": generated.get("trade_date"),
+            "orders": _jsonable(generated["orders"]),
+            "state": _state_summary(state),
+        },
     )
 
 
@@ -625,7 +682,103 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", default=None)
     sp.add_argument("--offline", action="store_true")
 
+    # ---- W5 集成：搜索 / 自选池 / 网页端 ----
+    sp = add("search", "搜索股票（代码前缀或中文名）")
+    sp.add_argument("query", help="代码片段（如 600519）或名称（如 茅台）")
+    sp.add_argument("--limit", type=int, default=30)
+    sp.add_argument("--refresh", action="store_true", help="强制刷新全市场名称表（需联网）")
+    sp.add_argument("--offline", action="store_true")
+
+    sp = add("watchlist", "自选池增删查")
+    # 用**扁平**参数而不是嵌套子解析器：嵌套的 add/remove/list 子解析器拿不到全局
+    # `--root/--json/--offline`，于是 `watchlist add X --json` 会报 unrecognized arguments。
+    # 扁平 `--action` 与既有 `close --ratio` 的写法一致。
+    sp.add_argument("code", nargs="?", default=None,
+                    help="股票代码（--action add/remove 时必填）")
+    sp.add_argument("--action", choices=["add", "remove", "list"], default="list")
+    sp.add_argument("--name", default="")
+    sp.add_argument("--note", default="")
+    # 自选池本身只读写 ``<root>/data/watchlist.json``、不联网，但全局 ``--offline``
+    # 必须被接受：否则 `watchlist list --offline` 会以退出码 2 报 unrecognized arguments，
+    # 而调用方（脚本/网页/用户）没有理由知道「这个命令恰好不需要它」。
+    sp.add_argument("--offline", action="store_true")
+
+    sp = add("serve", "启动本地网页端（默认绑 127.0.0.1，无鉴权）")
+    sp.add_argument("--host", default=None, help="监听地址（默认 127.0.0.1；改成其它值会让同网段可下单）")
+    sp.add_argument("--port", type=int, default=None, help="监听端口（默认 8765）")
+    sp.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=None)
+    sp.add_argument("--offline", action="store_true",
+                    help="硬闸：网页端一律不联网（请求级 ?offline= 只能更严不能更松）")
+
     return parser
+
+
+# --------------------------------------------------------------------------- #
+# 网页端 / 搜索 / 自选池（W5 集成）
+# --------------------------------------------------------------------------- #
+def cmd_search(args: argparse.Namespace, cfg: AppConfig) -> int:
+    """搜索股票（代码前缀 / 中文名子串）。
+
+    ``--offline`` 只读本地缓存；无缓存则**明确报错**（沿用 ``DataUnavailable`` 语义，
+    不得静默返回空 —— INV-28：区分「没搜到」与「拿不到数据」）。
+    """
+    from . import search as search_mod
+
+    offline = bool(getattr(args, "offline", False))
+    limit = int(getattr(args, "limit", 30) or 30)
+    rows = search_mod.search_stocks(
+        cfg, args.query, offline=offline, limit=limit,
+        force_refresh=bool(getattr(args, "refresh", False)),
+    )
+    return _emit(args, "search", {
+        "query": args.query,
+        "count": len(rows),
+        "results": _jsonable(rows),
+        "offline": offline,
+    })
+
+
+def cmd_watchlist(args: argparse.Namespace, cfg: AppConfig) -> int:
+    """自选池增删查（幂等；删不存在的 code 不报错）。"""
+    from . import watchlist as wl
+
+    action = getattr(args, "action", None) or "list"
+    code = getattr(args, "code", None)
+    if action in ("add", "remove") and not code:
+        return _emit(args, f"watchlist.{action}", None, error=f"--action {action} 需要提供股票代码")
+    if action == "add":
+        doc = wl.add_to_watchlist(cfg, code, name=getattr(args, "name", "") or "",
+                                  note=getattr(args, "note", "") or "")
+        return _emit(args, "watchlist.add", {
+            "count": len(doc.get("items", [])), "items": _jsonable(doc.get("items", [])),
+        })
+    if action == "remove":
+        doc = wl.remove_from_watchlist(cfg, code)
+        return _emit(args, "watchlist.remove", {
+            "count": len(doc.get("items", [])), "items": _jsonable(doc.get("items", [])),
+        })
+    items = wl.list_watchlist(cfg)
+    return _emit(args, "watchlist.list", {"count": len(items), "items": _jsonable(items)})
+
+
+def cmd_serve(args: argparse.Namespace, cfg: AppConfig) -> int:
+    """启动本地网页端（``python -m ptrade serve``）。
+
+    默认绑 ``127.0.0.1``（**无鉴权，这是唯一边界**）；``--host`` 改变时由
+    ``webapp.banner`` 打印警告。
+
+    .. note::
+       这是**阻塞式**长驻命令，因此它返回服务退出码（``0`` 正常、``130`` Ctrl+C），
+       而不是 ``--json`` 信封 —— 把长驻服务包进一次性 JSON 输出没有意义。
+    """
+    from . import webapp
+
+    host = getattr(args, "host", None) or webapp.DEFAULT_HOST
+    port = int(getattr(args, "port", None) or webapp.DEFAULT_PORT)
+    offline = bool(getattr(args, "offline", False))
+    lock_timeout = float(getattr(args, "lock_timeout", None) or webapp.DEFAULT_LOCK_TIMEOUT)
+    return webapp.serve(cfg, host=host, port=port, offline=offline,
+                        lock_timeout=lock_timeout)
 
 
 _HANDLERS = {
@@ -641,6 +794,9 @@ _HANDLERS = {
     "close": cmd_close,
     "ledger": cmd_ledger,
     "chart": cmd_chart,
+    "search": cmd_search,
+    "watchlist": cmd_watchlist,
+    "serve": cmd_serve,
 }
 
 
