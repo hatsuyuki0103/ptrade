@@ -1222,3 +1222,99 @@ def test_m5_watchlist_lock_timeout_maps_to_503(web_cfg, method, query, body):
         f"{payload.get('error')}"
     )
     assert "STATE_LOCK_TIMEOUT" in str(payload.get("error")), payload
+
+
+def test_m5_style_state_lock_only_converts_acquisition_timeout(web_cfg):
+    """`WebApp._state_lock()` **只**把「取锁阶段」的超时转成 503。
+
+    **为什么需要这条**（我自己的实证发现，是 `_state_lock()` 引入的**新**风险）：
+    直觉写法 `with state_lock(...): try: yield except StateLockTimeout -> _LockTimeout`
+    会把「**块内**抛出的 `StateLockTimeout`」也误转成 503 ——
+    实测确认会发生（见 `.omx/probe/verify_m5_contextmanager.py`）。
+    块内的同类型异常是**块体自己的 bug**，该走 500，不该伪装成「锁忙、请重试」。
+    所以实现改为手动分离 `__enter__` 与块体；这条用例守住它。
+
+    三种情形都要验（**含正例**，否则「不转换」可以靠「把转换删掉」蒙过去）：
+    * 取锁超时 → 必须转成 `_LockTimeout`（503）
+    * 块内抛 `StateLockTimeout` → 必须**原样上抛**（走 500）
+    * 块内抛其它异常 → 原样上抛
+    """
+    import threading
+    import time
+
+    from ptrade import store
+    from ptrade.webapp import _LockTimeout
+
+    app = _app(web_cfg, lock_timeout=0.4)
+
+    # 正例：取锁超时**必须**转换（否则 M5 的 503 就没了）
+    ready = threading.Event()
+
+    def hold():
+        with store.state_lock(web_cfg.root, timeout=10):
+            ready.set()
+            time.sleep(1.5)
+
+    t = threading.Thread(target=hold, daemon=True)
+    t.start()
+    assert ready.wait(timeout=10)
+    try:
+        with pytest.raises(_LockTimeout):
+            with app._state_lock():
+                pass
+    finally:
+        t.join(timeout=10)
+
+    # 反例：块内同类型异常**不得**被转换
+    with pytest.raises(store.StateLockTimeout):
+        with app._state_lock():
+            raise store.StateLockTimeout("注入：块内")
+
+    # 反例：块内其它异常原样上抛
+    with pytest.raises(RuntimeError, match="注入：其它"):
+        with app._state_lock():
+            raise RuntimeError("注入：其它")
+
+
+def test_m5_style_state_lock_passes_real_exc_info_to_cm(web_cfg, monkeypatch):
+    """`_state_lock()` 必须把**真实**的 `exc_info` 交给底层 CM，而不是 `(None, None, None)`。
+
+    **为什么**（第五轮复核 L4，观察项）：手动调 `cm.__exit__(None, None, None)` 会
+    丢弃 CM 的**抑制能力** —— 若将来 `store.state_lock` 换成会抑制异常的 CM，
+    抑制会被悄悄丢掉（而本方法的本意恰是「块内异常必须走 500」）。
+    所以要求 `__exit__` 收到真实异常三元组。
+
+    做法：用假的 `state_lock` 替身记录 `__exit__` 的入参。
+    """
+    from ptrade import store
+
+    seen: dict = {}
+
+    class _FakeCm:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            seen["exc_info"] = exc_info
+            return False
+
+    monkeypatch.setattr(store, "state_lock", lambda *a, **k: _FakeCm(), raising=True)
+
+    app = _app(web_cfg)
+    with pytest.raises(RuntimeError, match="注入"):
+        with app._state_lock():
+            raise RuntimeError("注入")
+
+    assert seen.get("exc_info") is not None, "CM 的 __exit__ 没被调用"
+    etype, evalue, _tb = seen["exc_info"]
+    assert etype is RuntimeError, (
+        f"CM 收到的应是真实异常类型（RuntimeError），实际 {etype} —— "
+        f"若为 None 说明传了 (None, None, None)，CM 的抑制能力被丢弃"
+    )
+    assert "注入" in str(evalue)
+
+    # 正常退出时仍应传 (None, None, None)（不能反过来说「总传异常」）
+    seen.clear()
+    with app._state_lock():
+        pass
+    assert seen.get("exc_info") == (None, None, None), seen

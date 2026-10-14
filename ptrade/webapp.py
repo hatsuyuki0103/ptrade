@@ -608,7 +608,20 @@ class WebApp:
         }))
 
     def _locked_update(self, mutate: Callable, command: str):
-        """临界区入口：把 ``StateLockTimeout`` 映射为 503（W7）。"""
+        """临界区入口：把 ``StateLockTimeout`` 映射为 503（W7）。
+
+        **与 `_state_lock` 的形态差异是有意的，也是已知的**（第五轮复核 L3，观察项）：
+        这里 `store.locked_update(...)` 整体在 `try` 内，所以**块体**（`mutate` 内）
+        抛出的 `StateLockTimeout` 理论上也会被转成 503。复核**逐条排除了当前的可达性**：
+        `mutate` 内唯一的取锁点是 `save_state → _append_audit → store.append_jsonl(timeout=10)`，
+        而它是**同线程可重入**的（不等待、不超时）；另一个可能的失败
+        `_replace_with_retry` 抛的是 `StateWriteTimeout`（**另一类**异常，不会被这里接住）。
+
+        之所以没把它改成 `_state_lock` 那种「手动分离 `__enter__`」的形态：
+        `locked_update` 是**仓库的公共 API**（CLI 与网页端共用），拆它要动 `store.py`，
+        超出本轮范围。**记为后续观察项**：若将来 `mutate` 内出现会真正等待锁的调用，
+        这里就成了「把块体 bug 伪装成锁忙」的入口。
+        """
         store = _store()
         try:
             return store.locked_update(self.cfg, mutate, source="web", timeout=self.lock_timeout)
@@ -623,14 +636,39 @@ class WebApp:
         原先**直接**用 `store.state_lock`，锁超时抛的是原始 `store.StateLockTimeout` ——
         它**不在 `map_exception` 的映射表里** → 落进兜底 **HTTP 500**，
         而 INV-45 契约要求 **503 + `STATE_LOCK_TIMEOUT`**。
-        这与 `_locked_update` 是同一类错误（同一种超时，两种表现），所以在这里统一转换。
+
+        **为什么手动分离 `__enter__` 与块体**（我自己的实证发现，见
+        `.omx/probe/verify_m5_contextmanager.py`）：直觉写法
+
+            with state_lock(...):   # 异常在此抛出
+                try: yield
+                except StateLockTimeout -> _LockTimeout
+
+        会把「**块内**抛出的 `StateLockTimeout`」也误转成 503 —— 实测确认会发生。
+        块内的同类型异常是**块体自己的 bug**，该走 500，不该伪装成「锁忙、请重试」。
+        所以：只把 **`__enter__` 阶段**的异常转成 `_LockTimeout`，块内的原样上抛。
+
+        `__exit__` 会收到**真实的** `exc_info`（而不是 `(None, None, None)`）——
+        这样若将来 `state_lock` 换成会**抑制异常**的 CM，抑制不会被悄悄丢掉；
+        当前 `store.state_lock` 永不抑制（`_locked_file` 的 `finally` 只做清理），
+        所以返回值可以忽略，但**不该断言它一定是假**（第五轮复核 L4）。
         """
         store = _store()
+        cm = store.state_lock(self.cfg.root, self.lock_timeout)
         try:
-            with store.state_lock(self.cfg.root, self.lock_timeout):
-                yield
+            cm.__enter__()                    # ← 只在这里可能因锁超时抛错
         except store.StateLockTimeout as exc:
             raise _LockTimeout(str(exc)) from exc
+        try:
+            yield
+        except BaseException:
+            # 把真实异常告知 CM（而不是 `(None, None, None)`），然后**无条件上抛**：
+            # 本方法要的是「块内异常 → 500」，若因 CM 抑制而静默消失就与本意相反。
+            # 当前 `store.state_lock` 永不抑制，所以返回值只作告知用。
+            cm.__exit__(*sys.exc_info())
+            raise
+        else:
+            cm.__exit__(None, None, None)
 
     # ==================================================================
     # 路由

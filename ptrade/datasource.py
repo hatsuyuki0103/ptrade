@@ -582,15 +582,19 @@ class DataSource:
         # 边缘标的（长期停牌 / B 股 / 新上市）仍可能复发 P3-2 的同类症状。
         #
         # 本函数**无法**在这一段里再找出「本身有行情」的日期（那正是第一段找不到的），
-        # 所以这里**不假装成功**：发一条 `RuntimeWarning` 让「退到了次优判据」**可见**，
+        # 所以这里**不假装成功**：记一条 `logger.info` 让「退到了次优判据」**留痕**，
         # 而不是静默返回一个下游可能被判停牌的日期。
+        # （**不是** `warnings.warn` —— 该分支在离线夹具下频繁触发，warnings 会污染
+        #   CLI/网页端输出并在测试里刷屏；见第四轮复核 M6 / `ROUND13-ptrade-web.md`。）
         day = base
         for _ in range(max(1, int(max_back))):
             if any(_has_window(code, day) for code in probes):
                 # 用 **logger** 而不是 `warnings.warn`：这条消息会**频繁出现**
                 # （实测离线夹具下自选池打分就走到第二段 → 全量测试报出 9 条 warnings），
                 # `warnings.warn` 会污染 CLI/网页端输出、并在测试里刷屏。
-                # 「留痕」的诉求仍在（`caplog` 可断言、`--verbose` 可见），但不打扰正常使用。
+                # 「留痕」的诉求仍在（`caplog` 可断言；把日志级别调低到 INFO 即可见 ——
+                # 本模块 `logger.propagate=True` 且**不装 handler**，默认 WARNING 级不输出），
+                # 但不打扰正常使用。
                 _log.info(
                     "latest_trade_asof 退到「回看窗口非空」判据：返回 %s，"
                     "但探针 %s 在该日都没有行情（第一段判据未命中）。"
