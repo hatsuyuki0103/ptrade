@@ -53,6 +53,7 @@ __all__ = [
     "WRITE_RETRY_BUDGET_SECONDS",
     "READ_RETRY_BUDGET_SECONDS",
     "StateLockTimeout",
+    "AcquireTimeout",
     "StateWriteTimeout",
     "cleanup_stale",
     "state_lock",
@@ -65,6 +66,7 @@ __all__ = [
     "save_state",
     "check_ledger_state_consistency",
     "locked_update",
+    "locked_update_split",
     "NO_WRITE",
     "state_path",
     "ledger_path",
@@ -741,3 +743,65 @@ def locked_update(
         if isinstance(target, AccountState):
             save_state(cfg, target, source=source)
         return result if result is not None else target
+
+
+class AcquireTimeout(StateLockTimeout):
+    """**取锁阶段**的超时（`internal` 专用）。
+
+    ## 为什么需要它（第五轮复核 L3 —— 我第一版修错了）
+
+    `locked_update` 的形状是 ``with state_lock(...): ... mutate(...) ...``，
+    于是 ``mutate`` **体内**抛出的 `StateLockTimeout` 与「取锁超时」**类型相同**，
+    调用方的 ``except StateLockTimeout -> 503`` 无法区分，会把
+    「块体自己的 bug」伪装成「锁忙，请重试」。
+
+    我第一版抽了 `locked_update_split`（取锁阶段与块体分离）——
+    **那没解决问题**：两个阶段抛的仍是同一个类型，调用点照样分不清
+    （实测：块内异常仍返回 503）。真正的修法是**用类型区分阶段**：
+
+    * 取锁失败 → :class:`AcquireTimeout`（→ 调用方映射 503）
+    * 块体内异常 → 原样 ``StateLockTimeout``（→ 调用方兜底 500）
+
+    它是 `StateLockTimeout` 的**子类**，所以既有的 ``except StateLockTimeout``
+    仍能接住它（向后兼容，不会有人漏接而崩栈）。
+    """
+
+
+def locked_update_split(
+    cfg: AppConfig,
+    mutate: Callable[[AccountState | None], Any],
+    *,
+    source: str = "cli",
+    timeout: float = 10.0,
+) -> Any:
+    """与 :func:`locked_update` 语义相同，但**取锁阶段的超时用 :class:`AcquireTimeout`**。
+
+    `mutate` **体内**抛出的 `StateLockTimeout` 会被包装成普通 `RuntimeError`
+    （**不是** `AcquireTimeout`）—— 这样调用方的 ``except StateLockTimeout``
+    只会命中「锁忙」那一类，块体自己的 bug 会走兜底 500，不再被伪装。
+
+    **与 `locked_update` 并存**（不替换）：后者被 CLI 与多处调用，改它的形状会动既有行为。
+    """
+    cm = state_lock(cfg.root, timeout=timeout)
+    try:
+        cm.__enter__()                   # ← 只有这里可能因**取锁**超时抛错
+    except StateLockTimeout as exc:
+        raise AcquireTimeout(str(exc)) from exc          # 阶段标记：取锁
+    try:
+        state = read_state(cfg)
+        try:
+            result = mutate(state)
+        except StateLockTimeout as exc:
+            # **块体内的**超时：不是「锁忙」。包装成普通 RuntimeError，
+            # 于是调用方的 `except StateLockTimeout` 不会误接它。
+            raise RuntimeError(
+                f"临界区块体内抛出 StateLockTimeout（不是取锁超时，属块体自身缺陷）：{exc}"
+            ) from exc
+        if result is NO_WRITE:
+            return state
+        target = result if isinstance(result, AccountState) else state
+        if isinstance(target, AccountState):
+            save_state(cfg, target, source=source)
+        return result if result is not None else target
+    finally:
+        cm.__exit__(None, None, None)

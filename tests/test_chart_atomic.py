@@ -22,7 +22,9 @@ import pathlib
 import pytest
 
 from ptrade import chart as C
+from ptrade import webapp
 from tests._guards import price_asof
+from tests.test_webapp import _SimpleProxy, _app, _call
 
 
 @pytest.fixture
@@ -229,3 +231,109 @@ def test_cache_write_keeps_nan_tolerance(tmp_path):
     got = DataSource._read_entry(str(cache), "nan")
     assert got is not None, "含 NaN 的缓存应能写入并读回"
     assert got["payload"]["last"] != got["payload"]["last"], "NaN 应保持为 NaN（不等于自身）"
+
+
+# --------------------------------------------------------------------------- #
+# 第五轮复核 L3 的结构性收口：取锁超时与块内异常**用类型区分**
+#
+# `locked_update` 的形状是 `with state_lock(...): ... mutate(...) ...` ——
+# 两个阶段抛的都是 `StateLockTimeout`，调用方的 `except StateLockTimeout -> 503`
+# 会把「块体自己的 bug」伪装成「锁忙，请重试」。
+#
+# **我第一版的修法是错的**：抽 `locked_update_split` 只做了「取锁阶段与块体分离」，
+# 两个阶段抛的仍是同一类型 → 调用点照样分不清（实测：块内异常仍返回 503）。
+# 真正的修法是**用类型区分阶段**：取锁失败 → `AcquireTimeout`（子类）；
+# 块内异常 → 包装成普通 `RuntimeError`。
+# --------------------------------------------------------------------------- #
+def test_locked_update_split_marks_stage_by_exception_type(tmp_path):
+    """**核心**：块内 `StateLockTimeout` 必须**不再**是 `StateLockTimeout`（也不是其子类）。"""
+    from ptrade import core, store
+    from ptrade.config import load_config
+
+    cfg = load_config(str(tmp_path))
+    store.locked_update_split(cfg, lambda s: core.new_state(cfg), source="t")
+
+    def mutate(state):
+        raise store.StateLockTimeout("注入：块体内的 bug")
+
+    with pytest.raises(RuntimeError) as ei:
+        store.locked_update_split(cfg, mutate, source="t")
+
+    assert not isinstance(ei.value, store.StateLockTimeout), (
+        "块内异常仍是 StateLockTimeout（或其子类）→ 调用方的 "
+        "`except StateLockTimeout -> 503` 会把它误判成「锁忙，请重试」。"
+        "取锁阶段与块体必须用**不同类型**区分。"
+    )
+    assert "块体内" in str(ei.value), ei.value
+
+
+def test_acquire_timeout_is_a_state_lock_timeout_subclass():
+    """**向后兼容**：`AcquireTimeout` 必须是 `StateLockTimeout` 的子类。
+
+    否则既有那些 `except StateLockTimeout` 的调用点会**漏接**而崩栈 ——
+    修一个「错误分类」问题不该引入新的崩溃面。
+    """
+    from ptrade import store
+
+    assert issubclass(store.AcquireTimeout, store.StateLockTimeout)
+
+
+def test_locked_update_split_equivalent_on_normal_paths(tmp_path):
+    """**行为等价**：正常路径（初始化 / 就地修改 / `NO_WRITE`）两个函数结果一致。
+
+    否则「更严格」就成了「换了一套语义」。
+    """
+    from ptrade import core, store
+    from ptrade.config import load_config
+
+    for fn in (store.locked_update, store.locked_update_split):
+        root = tmp_path / fn.__name__
+        root.mkdir()
+        cfg = load_config(str(root))
+        st = fn(cfg, lambda s, c=cfg: core.new_state(c), source="t")
+        assert isinstance(st, core.AccountState), f"{fn.__name__} 初始化应返回 AccountState"
+
+        def bump(s):
+            s.trade_date = "2026-10-09"
+            return s
+
+        r = fn(cfg, bump, source="t")
+        assert isinstance(r, core.AccountState) and r.trade_date == "2026-10-09"
+        assert store.read_state(cfg).trade_date == "2026-10-09", "改动应落盘"
+
+        # NO_WRITE：明确不落盘，但返回值是「实际被持久化的那个 state」（契约）
+        r_no = fn(cfg, lambda s: store.NO_WRITE, source="t")
+        assert isinstance(r_no, core.AccountState), f"{fn.__name__} NO_WRITE 应返回当前 state"
+        # 返回 None：保存被就地修改的入参，并返回它
+        r_none = fn(cfg, lambda s: None, source="t")
+        assert isinstance(r_none, core.AccountState), f"{fn.__name__} None 应返回当前 state"
+
+
+def test_l3_in_body_timeout_is_not_reported_as_lock_busy(web_root, monkeypatch):
+    """**端到端**：`mutate` 体内抛锁超时 → 网页端 **500**（不是 503）。
+
+    这条是 L3 的真正验收判据 —— 修前实测返回 **503**
+    （「锁忙、请重试」），而真实原因可能是块体自身的缺陷。
+
+    （用本文件的 `web_root` 夹具；`web_cfg` 是 `test_webapp.py` 的局部夹具，
+    不能跨文件共享。）
+    """
+    import ptrade.store as store
+
+    real = store.locked_update_split
+
+    def _in_body(cfg_, mutate, *, source="cli", timeout=10.0):
+        def bad(state):
+            raise store.StateLockTimeout("注入：mutate 自己的 bug")
+        return real(cfg_, bad, source=source, timeout=timeout)
+
+    proxy = _SimpleProxy(store, locked_update_split=_in_body)
+    monkeypatch.setattr(webapp, "_store", lambda: proxy)
+
+    status, payload = _call(_app(web_root), "POST", "/api/order",
+                            body={"code": "000001", "side": "buy", "qty": 100})
+    assert status == 500, (
+        f"块内异常必须走 500（实测 {status}）—— 若为 503 说明它又被伪装成「锁忙、请重试」；"
+        f"error={payload.get('error')}"
+    )
+    assert "块体内" in str(payload.get("error")), payload

@@ -177,20 +177,30 @@ def _buy(app: WebApp, code="000001", qty=100, **extra):
 
 
 class _NaiveStore:
-    """**故意不加锁**的 store 替身：用于证明 W6 的断言有牙齿（必须丢更新）。"""
+    """**故意不加锁**的 store 替身：用于证明 W6 的断言有牙齿（必须丢更新）。
+
+    **同时覆盖 `locked_update` 与 `locked_update_split`**：网页端用的是后者
+    （第五轮复核 L3 后改的）。只覆盖前者的话，`__getattr__` 会**回落到真实加锁实现** ——
+    于是「无锁替身」根本没生效，两条守卫都变成空守卫
+    （实测：改 `_locked_update` 用 `locked_update_split` 后，本文件两条用例同时变红）。
+    """
 
     def __init__(self, real, window: float = 0.01):
         self._real = real
         self._window = window
         self.StateLockTimeout = real.StateLockTimeout
 
-    def locked_update(self, cfg, mutate, *, source="cli", timeout=10.0):
+    def _naive_update(self, cfg, mutate, *, source="cli", timeout=10.0):
         state = self._real.read_state(cfg)
         time.sleep(self._window)                # 放大 read-modify-write 窗口
         new_state = mutate(state)
         if new_state is not None:
             self._real.save_state(cfg, new_state, source=source)
         return new_state
+
+    # 两个入口都要覆盖（webapp 用 split；CLI/其它可能用原版）
+    locked_update = _naive_update
+    locked_update_split = _naive_update
 
     def __getattr__(self, name):
         return getattr(self._real, name)
@@ -533,13 +543,19 @@ def test_w7_lock_held_by_other_process_returns_503(web_cfg, tmp_path):
 
 
 def test_w7_lock_timeout_maps_to_503_mechanism(web_cfg, monkeypatch):
-    """机制层（不依赖真 store）：``StateLockTimeout`` 必须映射为 503 + error_code。"""
+    """机制层（不依赖真 store）：``StateLockTimeout`` 必须映射为 503 + error_code。
+
+    **注意要同时替换 `locked_update` 与 `locked_update_split`**：网页端用的是后者
+    （第五轮复核 L3 后改的）。只替换前者的话 `__getattr__` 会回落到**真实实现**，
+    于是这条用例变成空守卫（实测：改 `_locked_update` 后它变红，暴露了这一点）。
+    """
     import ptrade.store as store
 
     def _boom(cfg, mutate, *, source="cli", timeout=10.0):
         raise store.StateLockTimeout("STATE_LOCK_TIMEOUT: 模拟锁超时")
 
-    monkeypatch.setattr(webapp, "_store", lambda: _SimpleProxy(store, locked_update=_boom))
+    proxy = _SimpleProxy(store, locked_update=_boom, locked_update_split=_boom)
+    monkeypatch.setattr(webapp, "_store", lambda: proxy)
     app = _app(web_cfg)
     for path, body in (("/api/order", {"code": "000001", "side": "buy", "qty": 100}),
                        ("/api/settle", {"trade_date": "2026-10-09"})):
@@ -547,6 +563,34 @@ def test_w7_lock_timeout_maps_to_503_mechanism(web_cfg, monkeypatch):
         assert status == 503, (path, status, payload)
         assert "STATE_LOCK_TIMEOUT" in payload["error"]
     assert _ledger_rows(web_cfg) == []
+
+
+def test_w7_guard_mechanism_actually_reached(web_cfg, monkeypatch):
+    """**非空守卫**：上面那条能红，是因为 `locked_update_split` 真的被调用了。
+
+    这条件是「机制层用例必须替换的名字」——只替换 `locked_update`
+    （旧名字）时，`__getattr__` 会回落到真实 store，用例**静默变成空守卫**。
+    这条直接断言「网页端调的就是 split 版本」。
+    """
+    import ptrade.store as store
+
+    seen: list[str] = []
+
+    def _record(name):
+        def fn(cfg, mutate, *, source="cli", timeout=10.0):
+            seen.append(name)
+            return store.locked_update_split(cfg, mutate, source=source, timeout=timeout)
+        return fn
+
+    proxy = _SimpleProxy(store,
+                         locked_update=_record("old"),
+                         locked_update_split=_record("split"))
+    monkeypatch.setattr(webapp, "_store", lambda: proxy)
+    _call(_app(web_cfg), "POST", "/api/settle", body={"trade_date": "2026-10-09"})
+    assert seen == ["split"], (
+        f"网页端应调用 `locked_update_split`（第五轮复核 L3），实测调用序列 = {seen} —— "
+        f"若为 ['old'] 说明又切回旧入口，本文件两条机制用例会随之失去牙齿"
+    )
 
 
 class _SimpleProxy:
