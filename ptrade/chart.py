@@ -23,6 +23,7 @@ from typing import Any
 
 import pandas as pd
 
+from . import store
 from .config import AppConfig
 from .datasource import DataSource
 
@@ -37,6 +38,9 @@ __all__ = [
     "resample_ohlc",
     "chart_payload",
     "build_chart",
+    "render_chart",
+    "chart_out_path",
+    "write_chart",
     "MA_PERIODS",
     "VOL_MA_PERIODS",
 ]
@@ -761,6 +765,56 @@ def _render_html(payload: dict, analysis: dict | None, period: str) -> str:
     return html
 
 
+def render_chart(
+    cfg: AppConfig,
+    ds: DataSource,
+    code: str,
+    asof: str,
+    period: str = "daily",
+    use_qfq: bool = True,
+    analysis: dict | None = None,
+) -> tuple[str, dict]:
+    """渲染 K 线图 HTML，**返回 `(html, payload)`**（不落盘）。
+
+    **为什么单独有这个函数**（W-6）：`/api/chart` 要的是**内联 HTML**，
+    而 `build_chart` 只返回路径 —— 于是它必须 `write_text` 500 KB 再 `open().read()`
+    读回来，**一次请求两趟盘**。这个函数让调用方直接拿到内存里的 html。
+    """
+    if period not in PERIODS:
+        raise ValueError(f"未知周期: {period!r}（可选 {'/'.join(PERIODS)}）")
+
+    payload = chart_payload(cfg, ds, code, asof, use_qfq=use_qfq)
+    if analysis is None:
+        analysis = _score_analysis(cfg, ds, code, payload["asof"])
+    return _render_html(payload, analysis, period), payload
+
+
+def chart_out_path(cfg: AppConfig, code: str, asof: str, out: str | None = None) -> Path:
+    """解析图表落盘路径（默认 `<root>/reports/chart_<code>_<asof>.html`）。
+
+    抽出来是为了让 `build_chart`（CLI）与 `/api/chart`（网页端）用**同一套**路径规则 ——
+    两边各写一份就迟早漂移。
+    """
+    target = out or os.path.join(str(cfg.root), "reports", f"chart_{code}_{asof}.html")
+    return Path(target).expanduser()
+
+
+def write_chart(path: Path, html: str) -> str:
+    """原子写图表 HTML（tmp → fsync → `os.replace`），返回绝对路径。
+
+    **W-6**：原先 `path.write_text(html)` 非原子。图表 HTML 约 500 KB，
+    写到一半被杀（Ctrl+C / 断电 / 磁盘满）会留下**半截文件**，
+    而文件名按「代码+asof」定址 → 下次同参数请求会**命中这个残文件**当成有效结果。
+    原子写之后，读者要么看到旧内容、要么看到完整新内容。
+
+    **不取写锁**：`reports/` 是按「代码+日期」定址的只写产物、不参与账户状态；
+    并发写各自文件，`os.replace` 保证替换是原子的。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    store.atomic_write_text(str(path), html)
+    return str(path.resolve())
+
+
 def build_chart(
     cfg: AppConfig,
     ds: DataSource,
@@ -771,23 +825,14 @@ def build_chart(
     use_qfq: bool = True,
     analysis: dict | None = None,
 ) -> str:
-    """渲染 K 线图 HTML 并返回**绝对路径**。``period ∈ {"daily","weekly","monthly"}``。"""
-    if period not in PERIODS:
-        raise ValueError(f"未知周期: {period!r}（可选 {'/'.join(PERIODS)}）")
+    """渲染 K 线图 HTML、**原子落盘**，返回**绝对路径**。``period ∈ {"daily","weekly","monthly"}``。
 
-    payload = chart_payload(cfg, ds, code, asof, use_qfq=use_qfq)
-    if analysis is None:
-        analysis = _score_analysis(cfg, ds, code, payload["asof"])
-
-    html = _render_html(payload, analysis, period)
-
-    target = out or os.path.join(
-        str(cfg.root), "reports", f"chart_{code}_{payload['asof']}.html"
-    )
-    path = Path(target).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(html, encoding="utf-8")
-    return str(path.resolve())
+    返回**路径**（而不是 html）是既有契约，CLI 与 7 处测试都依赖它 ——
+    要拿内存里的 html 请用 :func:`render_chart`（网页端就是这么做的，见 W-6）。
+    """
+    html, payload = render_chart(cfg, ds, code, asof, period=period, use_qfq=use_qfq,
+                                 analysis=analysis)
+    return write_chart(chart_out_path(cfg, code, payload["asof"], out), html)
 
 
 def _strip_script_bodies(html: str) -> str:

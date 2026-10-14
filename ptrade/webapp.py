@@ -373,8 +373,14 @@ class WebApp:
         }))
 
     def api_chart(self, query, body) -> Response:
-        """W9：**内联返回**单文件 HTML（不得返回路径字符串冒充）。"""
-        from .chart import build_chart
+        """W9：**内联返回**单文件 HTML（不得返回路径字符串冒充）。
+
+        **W-6**：改用 `chart.render_chart` 拿**内存里的** html，
+        不再 `write_text` 500 KB 再 `open().read()` 读回来（原先一次请求两趟盘）。
+        落盘仍然做（`chart.write_chart`，**原子写**）—— 用户要能在
+        `reports/` 下直接拿到文件，也要能「另存为」。
+        """
+        from .chart import chart_out_path, render_chart, write_chart
 
         code = (query.get("code") or [""])
         code = (code[0] if isinstance(code, list) else code) or ""
@@ -389,10 +395,10 @@ class WebApp:
         asof_query = query.get("asof")
         asof_query = (asof_query[0] if isinstance(asof_query, list) else asof_query) or None
         asof = _svc().resolve_asof(ds, asof_query, notes)
-        out = os.path.join(self.cfg.root, "reports", f"chart_{code}_{asof}.html")
-        path = os.path.abspath(str(build_chart(self.cfg, ds, code, asof, period=period, out=out)))
-        with open(path, "r", encoding="utf-8") as fh:
-            html = fh.read()
+
+        # 渲染**一次**：html 从内存返回，同时原子落盘（同一个 html，不会不一致）
+        html, payload = render_chart(self.cfg, ds, code, asof, period=period)
+        write_chart(chart_out_path(self.cfg, code, payload["asof"]), html)
         return Response(200, body=html.encode("utf-8"),
                         content_type="text/html; charset=utf-8")
 
