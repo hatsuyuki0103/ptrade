@@ -618,40 +618,26 @@ class WebApp:
     # 路由
     # ==================================================================
     def dispatch(self, method: str, path: str, query: dict, body: dict | None) -> Response:
+        """路由 + **异常映射**。
+
+        映射逻辑抽到模块级纯函数 :func:`map_exception`（2026-10-14）：这样
+        `NetworkForbiddenInLock → 409` 这类分支可以被**直接单测**（喂异常对象即可，
+        不必跑整条路由）—— 此前它在变异实验里会卡死，给不出「违反时会红」的证据。
+        """
         method = method.upper()
         try:
             return self._route(method, path, query or {}, body)
-        except _ParamError as exc:
-            command = _command_of(path)
-            return Response(400, _envelope(command, None, error=f"{exc}"))
-        except _LockTimeout as exc:
-            command = _command_of(path)
-            return Response(503, _envelope(command, None, error=f"STATE_LOCK_TIMEOUT: {exc}"))
-        except NetworkForbiddenInLock as exc:
-            # **守卫错误**（INV-42）：写锁临界区内试图联网。这是**服务端编码错误**，不是
-            # 客户端数据问题，也不是「暂时拿不到数据」—— 它意味着某条写在锁内取数了。
-            # 返回 **409 Conflict** 并给出**可执行**的提示（架构 S-1 ③ 要求），
-            # 而不是混进 200 业务态（那会让用户以为「稍后重试就好」）。
-            command = _command_of(path)
-            return Response(409, _envelope(
-                command, None,
-                error=f"NETWORK_IN_LOCK: {exc}",
-            ))
-        except DataUnavailable as exc:
-            # 「拿不到数据」是**业务态**而非服务端故障（search/chart 早已这样处理）。
-            # **按类型匹配**，不用 `type(exc).__name__ == "DataUnavailable"` ——
-            # 后者漏掉子类（`NetworkForbiddenInLock` 就是子类，实测曾被判成 HTTP 500）。
-            command = _command_of(path)
-            return Response(200, _envelope(command, None, error=str(exc)))
-        except ValueError as exc:
-            # **客户端数据问题**归 400：非法交易日、未来日期、回退到更早日期、
-            # 非法代码格式等都抛 ValueError（实测曾有 7 处报 500）。
-            # 500 只留给真正的服务端故障（未预期异常）。
-            command = _command_of(path)
-            return Response(400, _envelope(command, None, error=f"{exc}"))
-        except Exception as exc:                           # noqa: BLE001 - 统一 500
-            command = _command_of(path)
-            return Response(500, _envelope(command, None, error=f"{type(exc).__name__}: {exc}"))
+        except Exception as exc:                           # noqa: BLE001 - 统一映射
+            mapped = map_exception(path, exc)
+            if mapped is not None:
+                return mapped
+            # 未预期异常 → 500（映射表不管这一类）
+            return Response(
+                500,
+                _envelope(_command_of(path), None,
+                          error=f"{type(exc).__name__}: {exc}"),
+            )
+
 
     def _route(self, method: str, path: str, query: dict, body: dict | None) -> Response:
         if path in ("/", "/index.html") and method == "GET":
@@ -685,6 +671,51 @@ class WebApp:
 
 class _LockTimeout(RuntimeError):
     """写锁超时 → HTTP 503（内部信号）。"""
+
+
+# --------------------------------------------------------------------------- #
+# 异常 → HTTP 响应 的**纯函数**映射（2026-10-14）
+#
+# 抽出来的理由：这些分支是**契约**（400 / 409 / 503 / 200业务态 / 500），
+# 抽成纯函数后才能「喂异常对象 → 断言状态码」地单测，不必跑整条路由 ——
+# 后者在变异实验里会卡死，导致 `NetworkForbiddenInLock → 409` 长期拿不到变异证据。
+# --------------------------------------------------------------------------- #
+def map_exception(path: str, exc: BaseException) -> Response | None:
+    """把已知异常映射为 ``Response``；**不认识就返回 `None`**（交给调用方兜底 500）。
+
+    **顺序即契约**（子类必须在前）：
+
+    ============================================  ==========================================
+    异常                                          映射
+    ============================================  ==========================================
+    ``_ParamError``                               400（客户端参数非法）
+    ``_LockTimeout``                              503 + ``STATE_LOCK_TIMEOUT``
+    ``NetworkForbiddenInLock``                    **409 + ``NETWORK_IN_LOCK``**（INV-42）
+    ``DataUnavailable``                           **200 业务态**（「拿不到数据」不是服务端故障）
+    ``ValueError``                                400（非法交易日/未来日期/非法代码等）
+    其它                                          ``None`` → 调用方 500
+    ============================================  ==========================================
+
+    ``NetworkForbiddenInLock`` 是 ``DataUnavailable`` 的**子类**，所以它必须排在前面；
+    这也正是原实现「按**类名字符串**匹配」漏掉子类的根因（守卫错误曾被判成 500）。
+    """
+    command = _command_of(path)
+    if isinstance(exc, _ParamError):
+        return Response(400, _envelope(command, None, error=f"{exc}"))
+    if isinstance(exc, _LockTimeout):
+        return Response(503, _envelope(command, None, error=f"STATE_LOCK_TIMEOUT: {exc}"))
+    if isinstance(exc, NetworkForbiddenInLock):
+        # 写锁临界区内试图联网：**服务端编码错误**，不是客户端数据问题、
+        # 也不是「暂时拿不到数据」。409 并给出可执行的 `NETWORK_IN_LOCK` 提示
+        # （架构 S-1 ③ 要求），而不是混进 200 业务态（那会让用户以为「稍后重试就好」）。
+        return Response(409, _envelope(command, None, error=f"NETWORK_IN_LOCK: {exc}"))
+    if isinstance(exc, DataUnavailable):
+        # 「拿不到数据」是**业务态**而非服务端故障（search/chart 早已这样处理）。
+        return Response(200, _envelope(command, None, error=str(exc)))
+    if isinstance(exc, ValueError):
+        # 客户端数据问题：非法交易日、未来日期、回退到更早日期、非法代码格式等。
+        return Response(400, _envelope(command, None, error=f"{exc}"))
+    return None
 
 
 def _command_of(path: str) -> str:

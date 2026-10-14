@@ -1058,16 +1058,29 @@ def test_inv43_order_prewarm_receives_side_for_margin():
 # 现改为**按类型**匹配，并给守卫错误单独的 **409**（架构 S-1 ③ 要求的可执行提示）。
 # --------------------------------------------------------------------------- #
 def test_network_in_lock_maps_to_409(web_cfg, monkeypatch):
-    """**守卫错误 → HTTP 409 + `NETWORK_IN_LOCK`**（不是 500，也不是 200 业务态）。"""
+    """**守卫错误 → HTTP 409 + `NETWORK_IN_LOCK`**（不是 500，也不是 200 业务态）。
+
+    **为什么改成直接 monkeypatch 路由处理函数**（2026-10-14 实测的测试设计问题）：
+    第一版把 `WebApp._ds` 换成抛错的函数、再打 `/api/chart`。那条路径下
+    **变异实验会卡死**（注掉 409 分支后子进程 >300s 不返回，我不得不杀进程）。
+
+    机制上的解释：`NetworkForbiddenInLock` 是 `DataUnavailable` 的**子类**，
+    注掉 `except NetworkForbiddenInLock` 后它会被 `except DataUnavailable` 接住 →
+    返回 200 → 测试应**快速失败**，所以「卡住」与 409 分支无关，
+    而在于**让整条 chart 路由跑起来**这件事本身在变异态下的行为不可预测。
+    本用例只需要验**映射**，不该依赖整条路由 —— 直接替换处理函数即可，
+    既更聚焦又不会卡。
+    """
     from ptrade import webapp as webapp_mod
     from ptrade.datasource import NetworkForbiddenInLock
 
-    def _boom(*a, **k):
+    def _boom(self, query, body):
         raise NetworkForbiddenInLock("注入：写锁临界区内禁止联网取数")
 
-    # 让任意端点都能触发守卫错误（挂在数据源构造上，覆盖所有路由）
-    monkeypatch.setattr(webapp_mod.WebApp, "_ds", _boom, raising=True)
-    status, payload = _call(_app(web_cfg), "GET", "/api/chart", {"code": ["600519"]}, None)
+    # 直接替换路由处理函数：只触发 dispatch 的异常映射，不跑 chart 的取数/渲染
+    app = _app(web_cfg)
+    monkeypatch.setattr(app, "api_chart", lambda q, b: _boom(app, q, b), raising=True)
+    status, payload = _call(app, "GET", "/api/chart", {"code": ["600519"]}, None)
     assert status == 409, f"守卫错误应映射为 409，实际 {status}: {payload.get('error')}"
     assert "NETWORK_IN_LOCK" in str(payload.get("error")), payload
 
@@ -1087,3 +1100,80 @@ def test_dataunavailable_still_maps_to_200_business_state(web_cfg, monkeypatch):
     status, payload = _call(_app(web_cfg), "GET", "/api/chart", {"code": ["600519"]}, None)
     assert status == 200, f"DataUnavailable 应映射为 200 业务态，实际 {status}"
     assert payload["ok"] is False and payload["error"]
+
+
+# --------------------------------------------------------------------------- #
+# 异常映射的**纯函数**单测（2026-10-14）
+#
+# 为什么单独测纯函数：上面那两条走的是**整条路由**，于是「注掉实现看是否变红」的
+# 变异实验会**卡死**（>300s，我为此杀过 4 次进程），导致
+# 「NetworkForbiddenInLock → 409」长期拿不到变异证据。
+# 抽出 `webapp.map_exception` 后，直接喂异常对象即可断言状态码 —— 不跑路由、不卡。
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("exc_factory,expected_status,needle", [
+    (lambda: WebApp_MapProbe.param_error(), 400, "参数非法"),
+    (lambda: WebApp_MapProbe.lock_timeout(), 503, "STATE_LOCK_TIMEOUT"),
+    (lambda: WebApp_MapProbe.guard_error(), 409, "NETWORK_IN_LOCK"),
+    (lambda: WebApp_MapProbe.data_unavailable(), 200, "缺少数据"),
+    (lambda: ValueError("非法交易日"), 400, "非法交易日"),
+])
+def test_map_exception_status_codes(exc_factory, expected_status, needle):
+    """**契约表**：`map_exception` 对 5 类异常的状态码与错误串。"""
+    from ptrade import webapp as webapp_mod
+
+    resp = webapp_mod.map_exception("/api/chart", exc_factory())
+    assert resp is not None, "已知异常不该返回 None（那会被兜底成 500）"
+    assert resp.status == expected_status, (
+        f"{type(exc_factory()).__name__} 应映射为 {expected_status}，实际 {resp.status}"
+    )
+    payload = resp.payload or json.loads(resp.to_bytes().decode("utf-8"))
+    assert needle in str(payload.get("error")), payload
+
+
+def test_map_exception_returns_none_for_unknown():
+    """**未预期异常返回 `None`**（交给调用方兜底 500）—— 否则兜底逻辑会被吞掉。"""
+    from ptrade import webapp as webapp_mod
+
+    assert webapp_mod.map_exception("/api/chart", RuntimeError("boom")) is None
+    assert webapp_mod.map_exception("/api/chart", KeyError("k")) is None
+
+
+def test_map_exception_guard_must_come_before_dataunavailable():
+    """**顺序断言**：`NetworkForbiddenInLock` 是 `DataUnavailable` 的**子类** ——
+    映射里它必须排在前面，否则会被父类分支接住变成 200 业务态。
+
+    这条是「守卫错误曾经被判成 500」那类漏配的**机制性**守卫：
+    它断言的是**子类关系**与**顺序**，而不是某个具体状态码。
+    """
+    from ptrade import webapp as webapp_mod
+    from ptrade.datasource import DataUnavailable, NetworkForbiddenInLock
+
+    assert issubclass(NetworkForbiddenInLock, DataUnavailable), "前提：它确实是子类"
+    resp = webapp_mod.map_exception("/api/order", NetworkForbiddenInLock("注入"))
+    assert resp.status == 409, (
+        f"子类被父类分支接住了（得到 {resp.status}）—— 映射顺序错了"
+    )
+
+
+class WebApp_MapProbe:
+    """测试用的异常构造器（避免在 parametrize 里写长 import）。"""
+
+    @staticmethod
+    def param_error():
+        from ptrade import webapp as m
+        return m._ParamError("参数非法")
+
+    @staticmethod
+    def lock_timeout():
+        from ptrade import webapp as m
+        return m._LockTimeout("锁超时")
+
+    @staticmethod
+    def guard_error():
+        from ptrade.datasource import NetworkForbiddenInLock
+        return NetworkForbiddenInLock("写锁临界区内禁止联网取数")
+
+    @staticmethod
+    def data_unavailable():
+        from ptrade.datasource import DataUnavailable
+        return DataUnavailable("离线模式缺少数据")
