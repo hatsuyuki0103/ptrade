@@ -178,3 +178,54 @@ def web_root(tmp_path):
     from ptrade.config import load_config
 
     return load_config(str(tmp_path))
+
+
+# --------------------------------------------------------------------------- #
+# 同类问题：`data/cache/*.json` 的写者原先也是**非原子**的
+#
+# WATCH 项「`data/cache/*.json` 写者未归类」的收口。失败模式比图表更严重：
+# `open(path, "w")` **先截断目标**，随后 `json.dump` 抛错 →
+# 缓存文件残缺 → `_read_entry` 的 `json.load` 抛 → 返回 `None`
+# → 该 key 被当成**没有缓存**，直到重新联网重建。
+# 离线场景下就是「数据突然全没了」，且**没有任何提示**。
+# --------------------------------------------------------------------------- #
+class _NotJsonable:
+    """不能 JSON 序列化的对象（模拟缓存里混进脏对象）。"""
+
+
+def test_cache_write_is_atomic_on_serialize_failure(tmp_path):
+    """**核心断言**：缓存序列化失败时，已有缓存文件**逐字节不变**。"""
+    from ptrade.datasource import DataSource
+
+    cache = tmp_path / "cache"
+    DataSource._write_entry(str(cache), "k", {"good": 1, "rows": [1, 2, 3]})
+    target = cache / "k.json"
+    before = target.read_bytes()
+
+    with pytest.raises(TypeError):
+        DataSource._write_entry(str(cache), "k", {"bad": _NotJsonable()})
+
+    assert target.read_bytes() == before, (
+        "★序列化失败后缓存被破坏了 —— 非原子写会先截断目标，"
+        "残缺内容会被 `_read_entry` 当成「没有缓存」，离线时等于数据全丢"
+    )
+    # 仍然可读（没被截断成非法 JSON）
+    got = DataSource._read_entry(str(cache), "k")
+    assert got is not None and got["payload"] == {"good": 1, "rows": [1, 2, 3]}, got
+    # 不残留 tmp
+    assert sorted(p.name for p in cache.iterdir()) == ["k.json"], list(cache.iterdir())
+
+
+def test_cache_write_keeps_nan_tolerance(tmp_path):
+    """**行为保持不变**：缓存写仍**容忍 NaN**（没有换成 `allow_nan=False` 的原子写）。
+
+    理由：行情里偶尔出现 NaN；为了「更严格」而让 `quote()` 报「无数据」是更糟的取舍。
+    若哪天有人把 `_write_entry` 换成 `store.atomic_write_json`，这条会红。
+    """
+    from ptrade.datasource import DataSource
+
+    cache = tmp_path / "cache"
+    DataSource._write_entry(str(cache), "nan", {"last": float("nan"), "rows": []})
+    got = DataSource._read_entry(str(cache), "nan")
+    assert got is not None, "含 NaN 的缓存应能写入并读回"
+    assert got["payload"]["last"] != got["payload"]["last"], "NaN 应保持为 NaN（不等于自身）"

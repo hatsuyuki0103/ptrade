@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ptrade"
-version = "1.6.1"
+version = "1.6.2"
 description = "A 股 CANSLIM 模拟盘：T+1 / 融资融券 / 风控 / 七因子打分 / K 线图"
 readme = "README.md"
 requires-python = ">=3.11"

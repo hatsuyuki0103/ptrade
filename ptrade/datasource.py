@@ -320,11 +320,27 @@ class DataSource:
 
     @staticmethod
     def _write_entry(directory: str, key: str, payload: Any) -> str:
+        """写一条缓存。
+
+        **必须原子**（WATCH 项「`data/cache/*.json` 写者未归类」的收口）：
+        原先 `open(path, "w")` + `json.dump(entry, fh)` —— **先截断目标、再序列化**。
+        于是「序列化抛错」（例如 payload 里混进不能 JSON 化的对象）会留下
+        **被截断的缓存文件**；`_read_entry` 读它 → `json.load` 抛 → 返回 `None`
+        → 该 key 被当成**没有缓存**，直到重新联网重建为止。
+        离线场景下这就是「数据突然全没了」。
+
+        改成：**先在内存序列化，再原子落盘**（`store.atomic_write_text`，tmp → fsync →
+        `os.replace`）。序列化失败时**目标文件原封不动**。
+
+        **不改变 NaN 宽容度**：这里仍用默认的 `json.dumps`（允许 NaN），
+        没有换成 `store.atomic_write_json`（那个 `allow_nan=False` 会**抛错**）——
+        缓存里的行情偶尔出现 NaN，为此让 `quote()` 报「无数据」是更糟的取舍。
+        """
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, f"{key}.json")
         entry = {"fetched_at": datetime.now(timezone.utc).isoformat(), "payload": payload}
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(entry, fh, ensure_ascii=False)
+        text = json.dumps(entry, ensure_ascii=False)      # ← 先序列化（失败则不碰目标文件）
+        store.atomic_write_text(path, text)
         return path
 
     @staticmethod
