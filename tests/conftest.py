@@ -25,6 +25,62 @@ from ptrade import core  # noqa: E402
 from ptrade.config import load_config  # noqa: E402
 from ptrade.datasource import DataSource  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def block_real_network(monkeypatch):
+    """在**类**上阻断 `DataSource._ak()`，避免 `import akshare` 与其后的取数（autouse）。
+
+    ## 与既有的 `_no_network` 分工（两者互补，都要）
+
+    `_no_network` 拦 `socket.connect` / `socket.create_connection` —— 它保证
+    **真的联网会失败**（正确性）。但它**拦不住 `import akshare` 的耗时**：
+    akshare 是个很重的包（0.9~1.6s，还可能触发额外的网络/文件 IO），
+    于是「用 `offline=False` 但实际只读夹具/缓存」的用例会白等。
+
+    ## 实测收益（2026-10-14）
+
+    | 文件 | 加本夹具前 | 加本夹具后 |
+    |---|---|---|
+    | `tests/test_search.py` | 16s | **2.54s** |
+    | `tests/test_inlock_network_guard.py` | 22.96s | **2.8s** |
+
+    而且这是**变异实验的前提**：把守卫实现注掉后，锁内会真的去取数 ——
+    实测子进程卡 **30 分钟 / 1802s CPU**，我不得不杀两次。
+    **测试在「实现被注掉」时必须是有界失败，不能转去联网。**
+
+    ## 做法
+
+    在**类**上替换（不是实例 —— 实例属性挡不住 `make_ds()` 造的新实例），
+    保留两段既有语义（`offline=True` 报错、锁内禁网拦截），
+    只把「真 import akshare」换成**任何属性访问都抛错**的替身。
+    需要真实数据的用例应自备缓存/夹具，或在用例内显式 monkeypatch 覆盖本守卫。
+    """
+    from ptrade import store
+    from ptrade.datasource import DataUnavailable, NetworkForbiddenInLock
+
+    class _NoNetworkAk:
+        """任何属性访问都抛错 —— 从机制上断绝联网。"""
+
+        def __getattr__(self, name: str):
+            raise RuntimeError(
+                f"测试禁止访问 akshare.{name}（`conftest.block_real_network` 在拦截）。"
+                f"若本用例需要真实数据，请写缓存/夹具，或在用例内显式 monkeypatch 本守卫。"
+            )
+
+    def blocked_ak(self):
+        if self.offline:
+            raise DataUnavailable(
+                "offline=True：禁止访问 akshare（离线模式只读 data/cache 与 data/fixture）"
+            )
+        if store.in_critical_section():
+            raise NetworkForbiddenInLock(
+                "写锁临界区内禁止联网取数：请把该数据的获取移到锁外"
+                "（用 service.prewarm_before_write 预热），或改用 --offline。"
+            )
+        return _NoNetworkAk()
+
+    monkeypatch.setattr(DataSource, "_ak", blocked_ak, raising=True)
+
 FIXTURE_DIR = os.path.join(ROOT, "data", "fixture")
 SCENARIO_DIR = os.path.join(ROOT, "data", "scenario")
 
