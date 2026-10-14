@@ -31,7 +31,7 @@ python -m pytest tests -q
 | `scan --codes ... [--asof] [--offline] [--json]` | CANSLIM 七因子打分 |
 | `recommend --codes ...` | 交易建议 |
 | `plan --codes ...` | 建仓/调仓计划 |
-| `order --code --side --qty [--price] [--trade-date]` | 下单（六种方向） |
+| `order --code --side --qty [--price PRICE\|live] [--trade-date]` | 下单（六种方向） |
 | `settle --trade-date` | 推进交易日：T+1 结算 → 计息 → 盯市 → 风险 |
 | `risk [--json]` | 风险报告（担保比例/杠杆/敞口/告警） |
 | `close --code [--ratio]` | 平仓（先买券还券，再卖券还款/卖出） |
@@ -40,6 +40,42 @@ python -m pytest tests -q
 
 全局 `--root <path>` 覆盖数据根目录；`--json` 输出 `{"ok","command","data","error"}`，**退出码 0/1**
 （业务拒单不算错误：`ok=true` 且 `data.orders[].status == "rejected"`）。
+
+## 成交价：三种来源，以及「按实时价成交」
+
+下单时的成交价有三种来源，**订单上会记录是哪种**：
+
+| `--price` | 成交价来源 | `price_source` |
+|---|---|---|
+| `live` | **当前快照价**（`data/cache/spot.json`，在线时是 akshare 实时全市场快照，TTL 60s） | `live` |
+| 具体数字 | 你给的价 | `request` |
+| 不传 | 行情 `last` ± 滑点（市价） | `""` |
+
+```powershell
+python -m ptrade order --code 600519 --side buy --qty 100 --price live --trade-date 2026-10-14
+```
+
+**为什么需要 `live`**：`--trade-date` 缺省会用 `resolve_asof`，它在 **15:30 前会回退到
+上一交易日**（未来函数防护），于是盘中缺省下单会走到「日线推导」分支并**被判停牌**。
+`--price live` 是**显式**入口，不动回测语义。
+
+⚠️ **快照陈旧时 `--price live` 会明确拒绝**，**不会**退回陈旧价 ——
+「以为是实时价、其实是几天前的价」比明确失败危险得多。错误信息会告诉你
+`asof` / `fetched_at` 与实际今天，并给出「在线重取快照」或「改用 `--price <价格>`」两条出路。
+
+### 成交价审计（每笔都能回答「用的是哪一刻的价」）
+
+`ledger.jsonl` 与 `status --json` 的每条订单都带：
+
+| 字段 | 含义 |
+|---|---|
+| `price_source` | `"live"` / `"request"` / `""`（市价） |
+| `price_asof` | 该价对应的**行情日期**（快照的 `asof`） |
+| `price_fetched_at` | 该快照的**抓取时刻**（真正回答「哪一刻的价」） |
+
+**与真实盘的已知差距**（诚实列出）：没有盘口/撮合（一律立即全额成交）、没有滑点、
+价格分辨率是 60 秒（`TTL_SPOT`）而非逐笔、涨跌停只有价格边界检查没有排队。
+
 
 ## 账户数学（v3.2 口径）
 

@@ -289,6 +289,35 @@ def _resolve_asof(ds: DataSource, asof: str | None, notes: list[str] | None = No
     """
     return service.resolve_asof(ds, asof, notes)
 
+
+def _coerce_price_arg(raw: Any) -> Any:
+    """把 ``--price`` 的原始字符串转成引擎要的形式（B，2026-10-14）。
+
+    * ``None`` → ``None``（市价）
+    * ``"live"``（大小写/空白不敏感）→ 原样返回该字符串，由引擎识别
+      （``Engine.LIVE_PRICE_SENTINEL``）
+    * 其它 → ``float()``；非法值给**明确**错误而不是 ``ValueError`` 崩栈
+
+    **为什么不能只写 `type=float`**：argparse 的 `float("live")` 会抛
+    `ValueError: could not convert string to float: 'live'`，用户看到的是 argparse 的
+    内部报错，而不是「live 是什么」的说明。
+
+    ``Engine`` 在 cli 里是**惰性导入**（函数内 `from .engine import Engine`），
+    所以这里用同值常量而不是 ``Engine.LIVE_PRICE_SENTINEL``；
+    `tests/test_cli.py` 有一条断言两者一致，防止哪天漂移。
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if text.lower() == "live":
+        return "live"
+    try:
+        return float(text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"--price 必须是数字或 'live'（按当前快照价成交），收到 {raw!r}"
+        ) from exc
+
 def _split_codes(text: str | None) -> list[str]:
     if not text:
         return []
@@ -465,7 +494,9 @@ def cmd_order(args: argparse.Namespace, cfg: AppConfig) -> int:
             state = engine.roll_to(trade_date)
         request = OrderRequest(
             code=args.code, side=args.side, qty=int(args.qty),
-            price=(None if args.price is None else float(args.price)), trade_date=trade_date,
+            # `--price live` 原样传给引擎（它认 LIVE_PRICE_SENTINEL）；
+            # 其它值仍是数字。**不要**在这里 float() —— 那会把 "live" 变成 ValueError。
+            price=_coerce_price_arg(args.price), trade_date=trade_date,
         )
         order = engine.submit(request)
         generated["order"] = order
@@ -618,7 +649,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--code", required=True)
     sp.add_argument("--side", required=True, choices=[s.value for s in Side])
     sp.add_argument("--qty", type=int, required=True)
-    sp.add_argument("--price", type=float, default=None, help="缺省 = 市价（收盘价 ± 滑点）")
+    sp.add_argument(
+        "--price",
+        dest="price",
+        default=None,
+        metavar="PRICE|live",
+        help="委托价；缺省 = 市价（用行情 last ± 滑点）；**live = 按当前快照价成交**"
+             "（要求快照新鲜且当天有效，否则明确报错，不退回陈旧价）",
+    )
     sp.add_argument("--trade-date", dest="trade_date", default=None)
     sp.add_argument("--offline", action="store_true")
 

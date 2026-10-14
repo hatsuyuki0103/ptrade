@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import AppConfig
-from .datasource import DataSource, _norm_code
+from .datasource import DataSource, NetworkForbiddenInLock, _norm_code
 from . import store
 
 __all__ = [
@@ -167,6 +167,8 @@ def _has_market_data(ds: DataSource, code: str, asof: str | None) -> bool:
     """
     try:
         quote = ds.quote(code, asof) if asof else None
+    except NetworkForbiddenInLock:
+        raise      # 守卫错误：上抛，**不得**把有数据的票判成「无数据」
     except Exception:  # noqa: BLE001 - 取不到行情即视为无数据
         return False
     if not isinstance(quote, dict):
@@ -199,7 +201,19 @@ def score_watchlist(
     ds = DataSource(cfg, offline=offline)
     if not asof:
         try:
-            asof = ds.latest_trade_date()
+            # **不是 `latest_trade_date()`**（独立复核第二轮 N4）：那读的是交易日历，
+            # 日历可以覆盖到未来（sina 到 2026-12-31），而行情只到已收盘的最近一天。
+            # 用日历日期当 asof 会构造出「asof-60d 窗口内一根日线都没有」的区间 →
+            # 整个自选池被判「无数据」（受影响的是**调用本函数的路径**与**缺省 asof 的日期选择**）。
+            # **已更正**：第三轮独立复核用真实 `WebApp.dispatch` 跑 7 个时钟证明
+            # `/api/watchlist/score` **不走** `score_watchlist`（该端点全部
+            # `200 / no_data=0 / 真实分数`）—— 原先写的「生产端点全池 no_data」**不成立**。
+            #
+            # **必须把池内代码当探针**：第一版我从全市场快照里随便挑 5 只，挑到 920xxx
+            # 北交所票（夹具无日线）→ 每个探针都失败 → 回退日历日期，修复等于没做。
+            asof = ds.latest_trade_asof([_norm_code(i.get("code")) for i in items])
+        except NetworkForbiddenInLock:
+            raise   # 守卫错误：上抛，**不得**吞成 asof=None（那会让整池判「无数据」）
         except Exception:  # noqa: BLE001 - 无交易日历时交给 strategy 报错
             asof = None
     scorer = strategy.CanslimScorer(cfg, ds, offline=offline)
@@ -225,6 +239,8 @@ def score_watchlist(
 
         try:
             scored = scorer.score(code, asof)
+        except NetworkForbiddenInLock:
+            raise   # 守卫错误：上抛，**不得**降级成「无数据」（那是另一回事）
         except Exception as exc:  # noqa: BLE001 - 缺数据必须降级为「无数据」而不是 0 分
             results.append(
                 {

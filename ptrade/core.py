@@ -240,6 +240,10 @@ class Order:
     margin_used: float = 0.0  # 本笔占用保证金（自有资金部分，仅审计用，不入账）
     debt_delta: float = 0.0  # 对总负债的影响（融资=元；融券=券款元额）
     realized_pnl: float = 0.0  # 平仓本笔实现盈亏
+    # ---- 成交价审计（D，2026-10-14）----
+    price_source: str = ""      # "request"（用户给的价）/ "live"（实时快照）/ ""（市价推导）
+    price_asof: str = ""        # 该价对应的行情日期（快照 payload.asof）
+    price_fetched_at: str = ""  # 该快照的抓取时刻（缓存 fetched_at）—— 真正回答「哪一刻的价」
 
     @property
     def total_fee(self) -> float:

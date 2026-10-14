@@ -45,6 +45,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from .datasource import DataUnavailable, NetworkForbiddenInLock
+
 __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
@@ -336,9 +338,12 @@ class WebApp:
         offline = _as_bool(query.get("offline"), self.offline) or self.offline
         try:
             rows = search_stocks(self.cfg, text, offline=offline, limit=limit)
-        except Exception as exc:                          # DataUnavailable → 业务态（非 500）
-            if type(exc).__name__ == "DataUnavailable":
-                return Response(200, _envelope("search", None, error=str(exc)))
+        except NetworkForbiddenInLock as exc:
+            # 守卫错误 → 409（同 dispatch 的映射；见那里的说明）
+            return Response(409, _envelope("search", None, error=f"NETWORK_IN_LOCK: {exc}"))
+        except DataUnavailable as exc:                    # 业务态（非 500）
+            return Response(200, _envelope("search", None, error=str(exc)))
+        except Exception:
             raise
         return Response(200, _envelope("search", {
             "query": text, "offline": offline, "count": len(rows), "results": rows,
@@ -494,7 +499,14 @@ class WebApp:
             raise _ParamError("qty 必须为正整数")
         if qty % 100 != 0:
             raise _ParamError(f"qty 必须是 100 的整数倍（收到 {qty}）")
-        price = _parse_float(body.get("price"), "price")
+        # `price` 允许字符串 "live"（B/D，2026-10-14）：按当前快照价成交。
+        # 不能直接 `_parse_float` —— `float("live")` 会变成参数错误，
+        # 而这里它是**合法的哨兵值**。
+        raw_price = body.get("price")
+        if isinstance(raw_price, str) and raw_price.strip().lower() == "live":
+            price: Any = "live"
+        else:
+            price = _parse_float(raw_price, "price")
         ds = self._ds()
         trade_date = str(body.get("trade_date") or "").strip() or None
 
@@ -615,21 +627,30 @@ class WebApp:
         except _LockTimeout as exc:
             command = _command_of(path)
             return Response(503, _envelope(command, None, error=f"STATE_LOCK_TIMEOUT: {exc}"))
+        except NetworkForbiddenInLock as exc:
+            # **守卫错误**（INV-42）：写锁临界区内试图联网。这是**服务端编码错误**，不是
+            # 客户端数据问题，也不是「暂时拿不到数据」—— 它意味着某条写在锁内取数了。
+            # 返回 **409 Conflict** 并给出**可执行**的提示（架构 S-1 ③ 要求），
+            # 而不是混进 200 业务态（那会让用户以为「稍后重试就好」）。
+            command = _command_of(path)
+            return Response(409, _envelope(
+                command, None,
+                error=f"NETWORK_IN_LOCK: {exc}",
+            ))
+        except DataUnavailable as exc:
+            # 「拿不到数据」是**业务态**而非服务端故障（search/chart 早已这样处理）。
+            # **按类型匹配**，不用 `type(exc).__name__ == "DataUnavailable"` ——
+            # 后者漏掉子类（`NetworkForbiddenInLock` 就是子类，实测曾被判成 HTTP 500）。
+            command = _command_of(path)
+            return Response(200, _envelope(command, None, error=str(exc)))
         except ValueError as exc:
             # **客户端数据问题**归 400：非法交易日、未来日期、回退到更早日期、
             # 非法代码格式等都抛 ValueError（实测曾有 7 处报 500）。
-            # 「拿不到数据」（DataUnavailable，其类名不是 ValueError 的子类名匹配）单独处理：
-            # 那是**业务态**而非服务端故障 —— search 早已这样处理，chart 此前会掉进 500
-            # （实测：离线缺夹具 → 500）。
             # 500 只留给真正的服务端故障（未预期异常）。
             command = _command_of(path)
-            if type(exc).__name__ == "DataUnavailable":
-                return Response(200, _envelope(command, None, error=str(exc)))
             return Response(400, _envelope(command, None, error=f"{exc}"))
         except Exception as exc:                           # noqa: BLE001 - 统一 500
             command = _command_of(path)
-            if type(exc).__name__ == "DataUnavailable":
-                return Response(200, _envelope(command, None, error=str(exc)))
             return Response(500, _envelope(command, None, error=f"{type(exc).__name__}: {exc}"))
 
     def _route(self, method: str, path: str, query: dict, body: dict | None) -> Response:

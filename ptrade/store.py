@@ -56,6 +56,7 @@ __all__ = [
     "StateWriteTimeout",
     "cleanup_stale",
     "state_lock",
+    "in_critical_section",
     "lock_path",
     "atomic_write_text",
     "atomic_write_json",

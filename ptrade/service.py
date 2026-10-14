@@ -29,7 +29,7 @@ from typing import Any, Iterable
 from . import core, store
 from .config import AppConfig
 from .core import AccountState
-from .datasource import DataSource
+from .datasource import DataSource, NetworkForbiddenInLock
 
 __all__ = [
     "jsonable",
@@ -158,17 +158,36 @@ MARKET_CLOSE = (15, 30)
 def resolve_asof(ds: DataSource, asof: str | None, notes: list[str] | None = None) -> str:
     """``--asof`` 未来函数防护（v3.1）：只允许**已收盘**交易日。
 
-    语义与原 ``cli._resolve_asof`` **逐字一致**（含错误类型与消息前缀）：
+    语义与原 ``cli._resolve_asof`` 一致（含错误类型与消息前缀）：
 
-    * 缺省 = ``ds.latest_trade_date()``（其本身已裁剪到"最近已收盘交易日"）；
+    * 缺省 = **``ds.latest_trade_asof()``**（见下方"缺省值"小节）；
     * 传未来日期 → ``RuntimeError("NO_MARKET_DATA: ...")``；
     * 显式传入当天、当前 < 15:30 **且当天是交易日** → 回退上一交易日并在 ``notes`` 标注。
 
+    **缺省值修正（2026-10-13，P3-2 —— 第三轮独立复核指出，今天就在发作）**：
+    原实现用 ``ds.latest_trade_date()``，那是**交易日历**上的最近一天，
+    而行情只到已收盘的最近一天。两者相差时（实测：日历给 2026-10-12、日线止于 2026-10-09）
+    缺省路径会拿到一个**没有行情**的日期，于是：
+
+    * 引擎 ``quote()`` 标 ``suspended=True`` → **缺省下单全部被 `SUSPENDED` 误拒**
+      （实测 ``order --code 000001 --side buy --qty 100 --offline``（不传 ``--price``）
+      → ``rejected / SUSPENDED 停牌或无有效行情``）；
+    * 测试夹具里一批无关用例集体变红。
+
+    改用 ``latest_trade_asof()`` 后，缺省落在**真有行情**的那一天。
     第二版修正：我第一版按想象写成「用 ``datetime.now()`` 比 15:30、抛 ValueError」，
     与真实实现（用 ``ds._today()`` 做上界、抛 ``RuntimeError`` 且消息以 ``NO_MARKET_DATA``
     开头）不符 —— 那会让上层的错误分类与既有测试一起漂移。
     """
-    day = str(asof)[:10] if asof else ds.latest_trade_date()
+    if asof:
+        day = str(asof)[:10]
+    else:
+        try:
+            day = ds.latest_trade_asof()
+        except NetworkForbiddenInLock:
+            raise
+        except Exception:  # noqa: BLE001 - 拿不到「有行情的日期」就退回日历语义
+            day = ds.latest_trade_date()
     today = ds._today()  # noqa: SLF001 - 与原 cli 实现同款（它承载"当前可用交易日"语义）
     now = datetime.now()
     if day > today:
@@ -253,6 +272,13 @@ def prewarm_for_write(
 
     _try("trade_dates", lambda: ds.trade_dates())
     _try("spot", lambda: ds.spot())
+    # **必须同时预热「按代码」的快照**（独立复核第二轮指出）：
+    # `engine._float_shares` 在 `quote()` 没有 `float_mv` 时会走 `ds.spot([code])`
+    # → `_enrich_spot`，那里是**另一个取数点**（会调 `_ak()`）。
+    # 只预热 `ds.spot()`（codes=None）覆盖不到它 —— 守卫开火后 `source_limit` 变 0，
+    # 而调用点判定是 `0 < source_limit` → **券源上限检查被静默跳过**（风控静默失效）。
+    if all_codes:
+        _try("spot:codes", lambda: ds.spot(list(all_codes)))
     # 融资/融券方向：锁内会查两融标的白名单（两个独立接口，冷缓存时很慢）
     if side and str(side) in MARGIN_SIDES:
         _try("margin_targets", lambda: ds.margin_targets())

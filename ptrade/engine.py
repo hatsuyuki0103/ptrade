@@ -44,7 +44,7 @@ from .core import (
     round_lot,
     settle_t1,
 )
-from .datasource import DataSource
+from .datasource import DataSource, DataUnavailable, NetworkForbiddenInLock
 from . import store
 
 __all__ = ["OrderRequest", "Engine"]
@@ -63,7 +63,13 @@ _EPS = 1e-9
 
 @dataclass
 class OrderRequest:
-    """下单请求。``price=None`` 表示市价（用最新价 ± 滑点）。"""
+    """下单请求。
+
+    * ``price=None`` → 市价（用最新价 ± 滑点）；
+    * ``price="live"`` → **按当前快照价成交**（B，2026-10-14）：要求快照新鲜且
+      当天有效，否则明确报错（不静默退回陈旧价）；
+    * 其它 → 用户给定的委托价。
+    """
 
     code: str
     side: str
@@ -130,6 +136,8 @@ class Engine:
             if px is None:
                 try:
                     last_close = self._as_float(self.ds.last_close(code, trade_date))
+                except NetworkForbiddenInLock:
+                    raise   # 守卫错误：上抛，**不得**静默沿用旧价重估（复核者 F-4）
                 except Exception:
                     last_close = None
                 if last_close is not None and last_close > 0:
@@ -188,6 +196,8 @@ class Engine:
             return
         try:
             unlock = self.ds.next_trade_date(trade_date)
+        except NetworkForbiddenInLock:
+            raise      # 守卫错误：上抛，**不得**静默不回填 unlock_date（复核者 F-5）
         except Exception:
             return
         if not unlock:
@@ -231,7 +241,7 @@ class Engine:
                 f"trade_date={td!r} 与账户交易日 {self.state.trade_date!r} 不一致，请先 roll_to",
             )
 
-        if req.price is not None:
+        if req.price is not None and not self._is_live_price(req.price):
             px_in = self._as_float(req.price)
             if px_in is None or px_in <= 0:
                 return self._reject(req, ErrorCode.NO_PRICE, f"委托价非法: {req.price!r}")
@@ -251,14 +261,50 @@ class Engine:
         limit_down = self._as_float(quote.get("limit_down"))
 
         # ---------- 3. 涨跌停 ----------
-        if req.price is not None:
+        # 成交价与**审计来源**（D）：`price_source` 回答「这个价从哪来」，
+        # `price_asof`/`price_fetched_at` 回答「用的是哪一刻的价」。
+        price_source = ""
+        price_asof = ""
+        price_fetched_at = ""
+        if self._is_live_price(req.price):
+            # **B：按当前快照价成交**（2026-10-14）。要求快照新鲜且当天有效 ——
+            # 陈旧时 `live_quote` 抛 DataUnavailable（**绝不静默退回陈旧价**）。
+            try:
+                live = self.ds.live_quote(code)
+            except DataUnavailable as exc:
+                return self._reject(
+                    req, ErrorCode.NO_PRICE,
+                    f"按实时价成交失败：{exc}", name=name,
+                )
+            px = self._as_float(live["quote"].get("last"))
+            if px is None or px <= 0:
+                return self._reject(
+                    req, ErrorCode.NO_PRICE,
+                    f"{name}({code}) 实时快照无有效价，无法按实时价成交", name=name,
+                )
+            price_source = "live"
+            price_asof = str(live.get("asof") or "")
+            price_fetched_at = str(live.get("fetched_at") or "")
+            # 实时价路径下，涨跌停边界也应以**快照**为准（它与 px 同源）
+            limit_up = self._as_float(live["quote"].get("limit_up")) or limit_up
+            limit_down = self._as_float(live["quote"].get("limit_down")) or limit_down
+        elif req.price is not None:
             px = float(self._as_float(req.price))
+            price_source = "request"
         else:
             if last is None or last <= 0:
                 return self._reject(
                     req, ErrorCode.NO_PRICE, f"{name}({code}) 无最新价，无法市价委托", name=name
                 )
             px = self._market_price(last, side)
+            price_source = ""      # 市价（由 quote 的 last 推导）
+
+        # 记下本次的审计信息，供 `_order()` 落进成交单（唯一出口）
+        self._price_audit = {
+            "price_source": price_source,
+            "price_asof": price_asof,
+            "price_fetched_at": price_fetched_at,
+        }
 
         if side in BUY_SIDES and limit_up and px >= limit_up:
             return self._reject(
@@ -1139,6 +1185,8 @@ class Engine:
     def _quote(self, code: str, trade_date: str) -> dict | None:
         try:
             quote = self.ds.quote(code, trade_date)
+        except NetworkForbiddenInLock:
+            raise      # 守卫错误：上抛，**不得**降级成「拿不到报价」
         except Exception:
             return None
         if not quote:
@@ -1148,12 +1196,16 @@ class Engine:
     def _is_margin_target(self, code: str, trade_date: str) -> bool:
         try:
             return bool(self.ds.is_margin_target(code, trade_date))
+        except NetworkForbiddenInLock:
+            raise      # 守卫错误：上抛，**不得**把合法标的说成「非两融标的」
         except Exception:
             return False
 
     def _is_short_target(self, code: str, trade_date: str) -> bool:
         try:
             return bool(self.ds.is_short_target(code, trade_date))
+        except NetworkForbiddenInLock:
+            raise      # 守卫错误：上抛，**不得**把合法标的说成「非融券标的」
         except Exception:
             return False
 
@@ -1168,6 +1220,14 @@ class Engine:
         return int(float_shares * float(self.cfg.margin.short_source_limit_ratio))
 
     def _float_shares(self, quote: dict, code: str, trade_date: str) -> float:
+        """流通股本（用于券源上限）。取不到时返回 0.0 = **不限制**。
+
+        **守卫错误必须上抛，不得降级成 0**（INV-42，独立复核第二轮指出）：
+        这里原本是 `except Exception: return 0.0`，于是锁内禁网守卫抛的错被吞成 0，
+        而调用点判定是 `0 < source_limit` —— 0 不成立 → **券源上限检查被静默跳过**。
+        实测（同一输入）：守卫开火时 `source_limit=0`（不限制），守卫关闭时 `source_limit=25,001,632`。
+        「风控静默失效」比「订单被拒」危险得多，所以让守卫错误一路上抛。
+        """
         float_mv = self._as_float(quote.get("float_mv"))
         last_px = self._as_float(quote.get("last"))
         if float_mv is None or float_mv <= 0 or last_px is None or last_px <= 0:
@@ -1179,6 +1239,8 @@ class Engine:
                         float_mv = self._as_float(row.get("float_mv"))
                     if last_px is None or last_px <= 0:
                         last_px = self._as_float(row.get("last"))
+            except NetworkForbiddenInLock:
+                raise                      # 守卫错误：上抛，**不得**降级成「不限制」
             except Exception:
                 return 0.0
         if not float_mv or not last_px or float_mv <= 0 or last_px <= 0:
@@ -1268,6 +1330,36 @@ class Engine:
             reason="试算",
         )
 
+    # ------------------------------------------------------------------ #
+    # 成交价审计（B + D，2026-10-14）
+    # ------------------------------------------------------------------ #
+    LIVE_PRICE_SENTINEL = "live"
+
+    @classmethod
+    def _is_live_price(cls, price: object) -> bool:
+        """``price`` 是否为「按当前快照价成交」的哨兵（B）。
+
+        接受 ``"live"`` 字符串（大小写不敏感、去空白）—— CLI 用 `--price live`、
+        网页端用 ``{"price": "live"}``。数字价一律走原路径。
+        """
+        return isinstance(price, str) and price.strip().lower() == cls.LIVE_PRICE_SENTINEL
+
+    def _fill_price_audit_fields(self, order: Order) -> None:
+        """把本次的**成交价**审计信息落进订单（D，2026-10-14）。
+
+        **注意命名**：本类已有一个 `_fill_audit_fields`（做**费用**回填，
+        用 `core.fill_plan` 口径）。我第一版新方法也叫这个名字，于是**被它覆盖**
+        （后定义者胜），审计字段一直是空的 —— 诊断证据见 `.omx/probe/diag_fill_audit.py`
+        （AST 显示定义两次 + `inspect.getsource` 取到的是费用那个）。改名为本方法。
+
+        调用点在 ``_order()``（构造 ``Order`` 的**唯一出口**），所以拒绝单与成交单
+        都能带上「价从哪来」；未经过价格解析的拒绝单保持空值。
+        """
+        audit = getattr(self, "_price_audit", None) or {}
+        order.price_source = str(audit.get("price_source", "") or "")
+        order.price_asof = str(audit.get("price_asof", "") or "")
+        order.price_fetched_at = str(audit.get("price_fetched_at", "") or "")
+
     def _reject(
         self,
         req: OrderRequest,
@@ -1321,8 +1413,12 @@ class Engine:
             tax=float(tax),
             transfer_fee=float(transfer_fee),
         )
-        if status == "filled":
-            self._fill_audit_fields(order)
+        # D：**成交价**审计字段对成交单与拒绝单都落 —— 拒绝单同样能回答
+        # 「这次尝试用的是哪一刻的价」，排查「为什么被拒」时很有用。
+        # 注意这里有两个不同的审计：`_fill_audit_fields` 管**费用**（既有），
+        # `_fill_price_audit_fields` 管**价格来源**（本次新增）。两个都要调。
+        self._fill_audit_fields(order)
+        self._fill_price_audit_fields(order)
         return order
 
     def _fill_audit_fields(self, order: Order) -> None:

@@ -28,7 +28,7 @@ import pandas as pd
 from . import store
 from .config import AppConfig
 
-__all__ = ["DataSource", "DataUnavailable"]
+__all__ = ["DataSource", "DataUnavailable", "NetworkForbiddenInLock"]
 
 # ---- TTL（秒） ------------------------------------------------------------- #
 TTL_TRADE_DATES = 24 * 3600
@@ -96,6 +96,23 @@ _INDEX_ALIASES = {
 
 class DataUnavailable(RuntimeError):
     """数据不可用（离线缺夹具 / 联网失败且无缓存）。"""
+
+
+class NetworkForbiddenInLock(DataUnavailable):
+    """**写锁临界区内试图联网**（INV-42）。
+
+    为什么需要**独立类型**（独立复核第二轮指出）：`DataUnavailable` 的语义是
+    「这份数据暂时取不到」，各调用点的 `except Exception` 会**回退过期缓存**或**降级兜底**
+    —— 那会把「锁内禁网」这个**编码错误**静默吞掉：
+
+    * `_cached` / `daily` / `index_daily`：有过期缓存时静默返回**陈旧数据**（无异常），
+      无缓存时才响亮报错 —— 等于「违规是否响亮」取决于缓存状态；
+    * `engine._float_shares`：`except Exception: return 0.0` → `source_limit=0`
+      → `0 < source_limit` 不成立 → **券源上限检查被静默跳过**（风控静默失效）。
+
+    所以守卫错误必须**穿透过期缓存兜底与降级兜底**，一路上抛到写命令边界，
+    让开发者立刻看见「这里有漏网取数」，而不是让用户拿到陈旧数据或被取消的风控。
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -257,7 +274,7 @@ class DataSource:
         # `_cached` 的新鲜缓存命中 / 离线夹具读都**不需要** akshare，
         # 只有真正要联网时才走到这里 —— 所以这个位置既严格又不误伤缓存命中。
         if store.in_critical_section():
-            raise DataUnavailable(
+            raise NetworkForbiddenInLock(
                 "写锁临界区内禁止联网取数：请把该数据的获取移到锁外"
                 "（用 service.prewarm_before_write 预热），或改用 --offline。"
                 "详见 INTERFACES.md INV-42。"
@@ -354,6 +371,11 @@ class DataSource:
             )
         try:
             payload = fetch()
+        except NetworkForbiddenInLock:
+            # **守卫错误必须穿透**（INV-42）：若在这里回退过期缓存，「锁内禁网」就会被静默吞掉 ——
+            # 违规是否响亮会取决于缓存状态（有过期缓存就静默返回陈旧数据）。独立复核实测：同一锁内调用
+            # 有过期缓存 → 静默返回 5572 行陈旧数据、无异常；无缓存 → 才响亮报错。
+            raise
         except Exception as exc:  # noqa: BLE001
             if cached is not None:
                 return cached["payload"]
@@ -450,6 +472,105 @@ class DataSource:
                 return earlier[-1]
         return latest
 
+    def latest_trade_asof(
+        self, probe_codes: "list[str] | None" = None, *, max_back: int = 30
+    ) -> str:
+        """最近一个**既有交易日历、又有实际行情**的交易日（asof 的安全默认值）。
+
+        **为什么需要它**（独立复核第二轮 N4，且这是**生产**缺陷不只是测试问题）：
+        ``latest_trade_date()`` 只读交易日历 —— 日历可以覆盖到未来（sina 日历到 2026-12-31），
+        而**行情数据只到已收盘的最近一天**。把日历日期当 asof 会构造出一个
+        ``asof-60d ~ asof`` 里**一根日线都没有**的窗口：
+
+        * 自选池打分：``_has_market_data`` 判「无数据」→ **整个池子被报成无数据**
+          （**已更正**：第三轮独立复核用真实 `WebApp.dispatch` 跑 7 个时钟证明
+          `/api/watchlist/score` **不走** `score_watchlist`，该端点全部
+          `200 / no_data=0 / 真实分数` —— 所以「生产端点全池 no_data」这句**不成立**，
+          受影响的是调用 `score_watchlist` 的路径（CLI/测试）与**缺省 asof 的日期选择**本身）；
+        * 测试夹具：一批无关用例因 ``SUSPENDED`` 集体变红（实测 8 个，前一天全绿）。
+
+        :param probe_codes: **优先用这些代码当探针**（调用方知道自己在乎哪些票，
+            例如自选池的成员）。这一点很关键 —— 第一版我从全市场快照里随便挑了 5 只
+            （挑到 ``920xxx`` 北交所票，夹具里没有它们的日线），**每个探针都失败** →
+            直接回退日历日期，修复等于没做。用调用方给的代码才有意义。
+        :param max_back: 最多往回找几个交易日（默认 30）。
+
+        判定方式**两段式**（见下方实现）：
+        先找「**那一天本身有行情**」（``quote()['suspended'] is False``）——
+        这同时满足策略层与引擎下单；找不到再退到「**回看窗口非空**」。
+        """
+        try:
+            base = self.latest_trade_date()
+        except Exception:  # noqa: BLE001 - 无日历时交给调用方
+            return self._today()
+
+        # 探针优先级：调用方给的代码（调用方知道自己在乎哪些票）> 快照里的活跃票。
+        # 快照里随便挑的票可能**根本没有日线数据**（第一版挑到 920xxx 北交所票，
+        # 夹具里没有它们的日线 → 每个探针都失败 → 直接回退日历日期，修复等于没做）。
+        probes: list[str] = [str(c).zfill(6) for c in (probe_codes or [])]
+        if not probes:
+            try:
+                frame = self.spot()
+                if frame is not None and len(frame) > 0:
+                    for _, row in frame.iterrows():
+                        last = row.get("last")
+                        vol = row.get("volume")
+                        if last is None or pd.isna(last) or float(last) <= 0:
+                            continue
+                        if vol is None or pd.isna(vol) or float(vol) <= 0:
+                            continue
+                        code = str(row.get("code") or "").zfill(6)
+                        if code and code not in probes:
+                            probes.append(code)
+                        if len(probes) >= 5:
+                            break
+            except NetworkForbiddenInLock:
+                raise  # 守卫错误：上抛，**不得**当成「拿不到快照」
+            except Exception:  # noqa: BLE001 - 拿不到快照就不探，退回日历日期
+                probes = []
+        if not probes:
+            return base
+
+        # **两段式判据**（2026-10-13 修正，P3-2）：
+        # 两个消费者需要的「有数据的日期」**不是同一件事**：
+        #   * `score_watchlist` / 策略层：只要求 **asof 回看窗口非空**（它们自己去取窗口内的日线）；
+        #   * `resolve_asof` / 引擎下单：要求 **那一天本身有行情**，否则 `quote()` 标
+        #     `suspended=True`，订单被 `SUSPENDED` 误拒 —— 实测（真实时钟、离线、缺省下单）
+        #     `quote(000001, 2026-10-12).suspended=True` 而窗口里其实有数据。
+        # 第一版只用「窗口非空」判据，于是返回了 2026-10-12（本身无数据）→ 缺省下单全被判停牌。
+        # 所以先按「那一天本身有行情」找，找不到再退到「窗口非空」。
+        def _has_quote(code: str, d: str) -> bool:
+            try:
+                return not self.quote(code, d)["suspended"]
+            except NetworkForbiddenInLock:
+                raise
+            except Exception:  # noqa: BLE001 - 该票该日取不到
+                return False
+
+        def _has_window(code: str, d: str) -> bool:
+            try:
+                frame = self.daily(code, self._offset(d, -60), d)
+                return frame is not None and len(frame) > 0
+            except NetworkForbiddenInLock:
+                raise  # 守卫错误：上抛，**不得**当「该探针不行」吞掉（复核者 F-1）
+            except Exception:  # noqa: BLE001 - 该票该窗口取不到
+                return False
+
+        # 第一段：那一天本身有行情（优先，因为它同时满足两个消费者）
+        day = base
+        for _ in range(max(1, int(max_back))):
+            if any(_has_quote(code, day) for code in probes):
+                return day
+            day = self.prev_trade_date(day)
+
+        # 第二段：退而求其次，只要回看窗口非空
+        day = base
+        for _ in range(max(1, int(max_back))):
+            if any(_has_window(code, day) for code in probes):
+                return day
+            day = self.prev_trade_date(day)
+        return base
+
     # ------------------------------------------------------------------ #
     # 日线
     # ------------------------------------------------------------------ #
@@ -496,6 +617,8 @@ class DataSource:
             )
         try:
             payload = self._fetch_daily(c, adj, start, end)
+        except NetworkForbiddenInLock:
+            raise      # 同上：守卫错误不得被过期缓存兜底吞掉
         except Exception as exc:  # noqa: BLE001
             if cached is not None:
                 return self._frame(cached["payload"], DAILY_COLUMNS)
@@ -730,6 +853,57 @@ class DataSource:
         frame = self._frame(payload, SPOT_COLUMNS)
         return frame, asof
 
+    def live_quote(self, code: str, *, require_today: bool = True) -> dict:
+        """**按当前快照价**报价（B，2026-10-14：用户选定的「实时价」入口）。
+
+        返回::
+
+            {"quote": <同 quote() 的 dict>, "source": "live",
+             "asof": <快照 payload.asof>, "fetched_at": <缓存 fetched_at>,
+             "stale": <bool>}
+
+        **为什么需要它**：``resolve_asof`` 在 15:30 前会把 asof 回退到上一交易日
+        （未来函数防护），于是**盘中缺省下单会走到「日线推导」分支并判停牌**。
+        重写 ``resolve_asof`` 会动到回测语义，所以给一个**显式**入口：用户明说「按现价成交」。
+
+        **绝不静默退回陈旧价**：``require_today=True`` 时，若快照的 ``asof`` 不是今天
+        （或快照缺失/过期），抛 :class:`DataUnavailable` 并说明怎么办 ——
+        因为「以为是实时价、其实是几天前的价」比「明确失败」危险得多。
+
+        ``fetched_at`` 是**真正回答「这笔用的哪一刻的价」**的字段（D：落进订单审计）。
+        """
+        entry = self._read_entry(self.cache_dir, "spot")
+        expired = entry is None or self._expired(entry, TTL_SPOT)
+        if expired and self.offline:
+            entry = self._read_fixture("spot") or entry
+        if entry is None:
+            raise DataUnavailable(
+                f"没有可用的实时快照（{self.cache_dir}/spot.json 缺失）："
+                f"在线时先跑一次取数（如 `python -m ptrade sync --codes {code}`），"
+                f"或改用 --price <价格> 显式指定成交价。"
+            )
+        payload = entry.get("payload") or {}
+        asof = str(payload.get("asof", ""))[:10] if isinstance(payload, dict) else ""
+        fetched_at = str(entry.get("fetched_at", ""))
+        today = self._today()
+        stale = bool(expired) or (bool(asof) and asof != today)
+        if require_today and stale:
+            when = f"asof={asof or '(未记录)'}、fetched_at={fetched_at or '(未记录)'}"
+            raise DataUnavailable(
+                f"实时快照不可用（{when}，今天 {today}）：不能按当前价成交。"
+                f"请在线重取快照，或改用 --price <价格> 显式指定。"
+                f"（**不会**退回陈旧价 —— 那会让你以为按实时价成交了。）"
+            )
+        frame = self._frame(payload, SPOT_COLUMNS)
+        c = _norm_code(code)
+        row = frame[frame["code"].astype(str).str.zfill(6) == c] if len(frame) else frame
+        if len(row) == 0:
+            raise DataUnavailable(f"实时快照里没有 {c}（快照 asof={asof or '未知'}）")
+        item = row.iloc[0]
+        quote = self.quote(c, asof or today)
+        return {"quote": quote, "source": "live", "asof": asof,
+                "fetched_at": fetched_at, "stale": stale}
+
     def quote(self, code: str, asof: str) -> dict:
         """单票快照：``{"code","name","last","prev_close","limit_up","limit_down","suspended"}``。
 
@@ -766,6 +940,8 @@ class DataSource:
         name = c
         try:
             name = str(self.spot([c]).iloc[0]["name"])
+        except NetworkForbiddenInLock:
+            raise  # 守卫错误：上抛，**不得**把名称静默退回代码
         except Exception:  # noqa: BLE001 - 名称非必需
             pass
         if len(window) == 0:
@@ -1131,6 +1307,8 @@ class DataSource:
         """行业名；取不到返回空串（策略层据此退化到绝对 RS 分档）。"""
         try:
             return self._industry_map().get(_norm_code(code), "")
+        except NetworkForbiddenInLock:
+            raise      # 守卫错误：上抛，**不得**静默退化成「无行业」
         except DataUnavailable:
             return ""
 
@@ -1138,6 +1316,8 @@ class DataSource:
         """同行业代码列表；取不到返回空列表。"""
         try:
             mapping = self._industry_map()
+        except NetworkForbiddenInLock:
+            raise      # 守卫错误：上抛（它是 DataUnavailable 子类，必须排在前面）
         except DataUnavailable:
             return []
         return sorted([c for c, ind in mapping.items() if ind and ind == str(industry)])
@@ -1146,6 +1326,8 @@ class DataSource:
         """比对基准池（夹具/缓存内标的），用于市场宽度与行业内排名。"""
         try:
             payload = self._cached("universe", TTL_FUNDAMENTAL, lambda: list(UNIVERSE_CODES))
+        except NetworkForbiddenInLock:
+            raise      # 守卫错误：上抛，**不得**静默换掉比对基准池
         except DataUnavailable:
             return list(UNIVERSE_CODES)
         if isinstance(payload, dict):
@@ -1174,6 +1356,8 @@ class DataSource:
             raise DataUnavailable(f"离线模式缺少指数日线 {code}（期望夹具 {fixture_key}.json）")
         try:
             payload = self._fetch_index(code, start, end)
+        except NetworkForbiddenInLock:
+            raise      # 同上
         except Exception as exc:  # noqa: BLE001
             if cached is not None:
                 return self._frame(cached["payload"], INDEX_COLUMNS)
@@ -1292,6 +1476,8 @@ class DataSource:
         for code in codes:
             try:
                 window = self.daily(code, self._offset(asof, -40), asof)
+            except NetworkForbiddenInLock:
+                raise  # 守卫错误：上抛，**不得**少算涨跌家数
             except DataUnavailable:
                 continue
             if len(window) < 2:

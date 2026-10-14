@@ -998,8 +998,16 @@ def test_inv43_web_write_endpoints_prewarm_before_lock():
     """**机制断言**：三个网页写端点都必须调用 `prewarm_before_write`。
 
     用 AST 取函数源码段再查字符串 —— 与 `test_cli.py::test_block1_write_commands_prewarm_before_lock`
-    同一手法。行为证据（锁内取数 2~3 → 0、持锁 1.27s → 0.06s、503 2 → 0）在
-    `.omx/probe/verify_block1_web2.py`。
+    同一手法。
+
+    **行为证据请引用「模拟在线」的测量**（第三轮独立复核复现）：
+    预热 OFF → 锁内真实取数 **4** 次 / 最长持锁 **3.93s** / **2×503**；
+    预热 ON → **0** 次 / **0.12s** / **0×503**。
+
+    ⚠️ **不要引用 `.omx/probe/verify_block1_web2.py`** —— 它测的是**离线**路径，
+    而离线 `_cached` 不写缓存，「锁外预热」读了也白读，**物理上不可能**把锁内取数降到 0。
+    复核者直接跑它得到「修后仍 3 次 / 1.87s / 2×503」，该脚本头部已加降级警示。
+    我原先在这里列的那组数字（2~3→0 / 1.27s→0.06s / 503 2→0）**不可复现，已删除**。
     """
     import ast
     import pathlib
@@ -1036,3 +1044,46 @@ def test_inv43_order_prewarm_receives_side_for_margin():
     assert "side=side" in seg, (
         "api_order 的预热没有传 side= —— 融资/融券不会预热 margin_targets（N2 复发）"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 守卫错误的 HTTP 映射（第三轮复核 P3-9 / 我修的一处真缺陷）
+#
+# 修之前 `dispatch` 用 `type(exc).__name__ == "DataUnavailable"` **按类名字符串**匹配。
+# 问题有两层：
+#   1. 该检查写在 `except ValueError` 分支里，而 `DataUnavailable` 继承 `RuntimeError`
+#      **不是** `ValueError` → 那行**永远不可达**；
+#   2. `NetworkForbiddenInLock` 是 `DataUnavailable` 的**子类**，类名字符串不匹配
+#      → 守卫错误掉进通用 500。
+# 现改为**按类型**匹配，并给守卫错误单独的 **409**（架构 S-1 ③ 要求的可执行提示）。
+# --------------------------------------------------------------------------- #
+def test_network_in_lock_maps_to_409(web_cfg, monkeypatch):
+    """**守卫错误 → HTTP 409 + `NETWORK_IN_LOCK`**（不是 500，也不是 200 业务态）。"""
+    from ptrade import webapp as webapp_mod
+    from ptrade.datasource import NetworkForbiddenInLock
+
+    def _boom(*a, **k):
+        raise NetworkForbiddenInLock("注入：写锁临界区内禁止联网取数")
+
+    # 让任意端点都能触发守卫错误（挂在数据源构造上，覆盖所有路由）
+    monkeypatch.setattr(webapp_mod.WebApp, "_ds", _boom, raising=True)
+    status, payload = _call(_app(web_cfg), "GET", "/api/chart", {"code": ["600519"]}, None)
+    assert status == 409, f"守卫错误应映射为 409，实际 {status}: {payload.get('error')}"
+    assert "NETWORK_IN_LOCK" in str(payload.get("error")), payload
+
+
+def test_dataunavailable_still_maps_to_200_business_state(web_cfg, monkeypatch):
+    """**对照**：普通 `DataUnavailable` 仍映射为 **200 业务态**（别把两件事混成一件）。
+
+    若两者映射相同，上面那条就没有鉴别力。
+    """
+    from ptrade import webapp as webapp_mod
+    from ptrade.datasource import DataUnavailable
+
+    def _boom(*a, **k):
+        raise DataUnavailable("离线模式缺少数据")
+
+    monkeypatch.setattr(webapp_mod.WebApp, "_ds", _boom, raising=True)
+    status, payload = _call(_app(web_cfg), "GET", "/api/chart", {"code": ["600519"]}, None)
+    assert status == 200, f"DataUnavailable 应映射为 200 业务态，实际 {status}"
+    assert payload["ok"] is False and payload["error"]

@@ -1666,6 +1666,9 @@ def test_submit_appends_history_and_ledger(env):
         "order_id", "ts", "trade_date", "code", "name", "side", "qty", "price",
         "status", "error_code", "reason", "fee", "tax", "transfer_fee",
         "cash_delta", "margin_used", "debt_delta", "realized_pnl",
+        # D（2026-10-14，用户选的「成交价审计」）：回答「这笔用的是哪一刻的价」。
+        # 落进台账后，事后可以区分「用户给的价 / 实时快照价 / 市价推导」。
+        "price_source", "price_asof", "price_fetched_at",
     }
 
 

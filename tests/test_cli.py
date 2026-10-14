@@ -560,8 +560,13 @@ def test_block1_prewarm_actually_warms_the_order_code():
             called[f"daily:{code}"] = end
             return []
 
-        def spot(self):
-            called["spot"] = True
+        def spot(self, codes=None):
+            # **必须接住 `codes`**（第三轮独立复核指出）：`prewarm_for_write` 会调
+            # `ds.spot(list(all_codes))` 来覆盖 `engine._enrich_spot`（`_float_shares` 的取数点）。
+            # 原先这个 stub 签名是 `spot(self)`，传 `codes` 会 `TypeError`，
+            # 而那个异常被 `_try` 的 best-effort 吞掉 → `warmed` 里没有 `spot:codes`
+            # → **`spot([codes])` 的预热零测试覆盖**（注掉实现后全量仍绿）。
+            called["spot" if codes is None else "spot:codes"] = True
             return None
 
     class FakeState:
@@ -573,6 +578,13 @@ def test_block1_prewarm_actually_warms_the_order_code():
     assert called.get("quote:601398") == "2025-10-09", f"未预热下单标的的 quote：{called}"
     assert "trade_dates" in called, "未预热交易日历"
     assert called.get("next_trade_date") == "2025-10-09", "未按交易日预热 next_trade_date"
+    # **`spot([codes])` 必须真的被预热**（第三轮独立复核：这处原先零覆盖）——
+    # 它覆盖 `engine._enrich_spot`，也就是 `_float_shares`（券源上限）的取数点；
+    # 不预热的话守卫开火会让 `source_limit` 变 0 = **券源上限静默跳过**。
+    assert called.get("spot:codes") is True, (
+        f"未预热 spot([codes]) —— `_enrich_spot` 会在锁内取数（F3 的隐患）：{called}"
+    )
+    assert "spot:codes" in warmed, f"warmed 里没有 spot:codes：{warmed}"
 
     # 非空守卫：trade_date 为 None 时，必须**明显少做事**（证明这个参数是必需的）
     called.clear()
