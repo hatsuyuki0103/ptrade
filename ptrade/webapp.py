@@ -264,21 +264,43 @@ class WebApp:
     # 只读端点
     # ==================================================================
     def api_health(self, query, body) -> Response:
-        """探活 + **回报真实监听地址**（PRD §9.3 W-10：A1 要可机械判定）。
+        """探活 + 真实监听地址 + **账实分叉**（N7）。
 
-        不能写死 ``DEFAULT_HOST:DEFAULT_PORT`` —— 那样 ``--port`` 改变监听端口后
+        地址不能写死 ``DEFAULT_HOST:DEFAULT_PORT`` —— 那样 ``--port`` 改变监听端口后
         ``/api/health`` 仍报默认值，判据就失效了（实测：``--port 8791`` 时它报 8765）。
         真实地址由 :func:`create_server` 回填到 ``app.bound_address``；
         ``port=0``（系统分配）时同样正确。
+
+        **为什么探活要报分叉**（N7）：``/api/health`` 是**监控与被脚本轮询的入口**。
+        一个只看 ``status == "ok"`` 的监控方，在账实分叉时**完全看不出来** ——
+        而分叉意味着「重试同一笔下单可能重复成交」。所以：
+
+        * ``diverged`` 扁平化到顶层（脚本一条 ``jq .data.diverged`` 就能判）；
+        * ``diverged is True`` 时 ``status`` 变为 **``"diverged"``** 且 HTTP **503**
+          （健康检查语义上一律如此：不健康就该非 2xx，否则 ``curl -f`` 判不出来）；
+        * ``diverged is None``（**无法判定**）→ 仍 **200**，但 ``status`` 为
+          ``"unknown"`` —— 「没查成」不是「不健康」，但**也绝不当成 ok**。
         """
         addr = self.bound_address
         host, port = addr if addr else (DEFAULT_HOST, DEFAULT_PORT)
-        return Response(200, _envelope("health", {
-            "status": "ok",
+        consistency = _svc().consistency(self.cfg)
+        diverged = consistency.get("diverged")
+        if diverged is True:
+            status, http = "diverged", 503
+        elif diverged is None:
+            status, http = "unknown", 200
+        else:
+            status, http = "ok", 200
+        return Response(http, _envelope("health", {
+            "status": status,
             "root": self.cfg.root,
             "offline": self.offline,
             "bind": f"{host}:{port}",
             "source": "web",
+            # 扁平化顶层：便于脚本判定（不必知道 ledger_consistency 的内部结构）
+            "diverged": diverged,
+            "consistent": consistency.get("consistent"),
+            "ledger_consistency": consistency,
         }))
 
     def api_state(self, query, body) -> Response:

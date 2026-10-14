@@ -96,11 +96,22 @@ def web_cfg(tmp_path):
 
 
 def _write_state(cfg, state) -> str:
-    path = os.path.join(cfg.root, "data", "state.json")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(core.state_document(state), fh, ensure_ascii=False, indent=2)
-    return path
+    """写 state.json。
+
+    **N7 起改用 `store.save_state`**（而不是裸 `json.dump`）——
+    它会顺手写 **ledger 水位**（`app.ledger_lines`）。
+    修前这里绕过了水位，于是 `check_ledger_state_consistency` 恒返回
+    `diverged=None`（**无法判定**），`/api/health` 因此从 `ok` 变成 `unknown`
+    （`test_w1_health_ok` 实测变红 —— 那条红是**对的**：夹具没给出一致性的判据）。
+
+    改用水位后夹具状态**确实一致**（`ledger_lines` 与实际行数相等），
+    于是健康检查能诚实地报 `ok`；「无水位」的情形另由
+    `test_n7_health_unknown_when_no_watermark` 覆盖。
+    """
+    from ptrade import store as _store_mod
+
+    _store_mod.save_state(cfg, state, source="test")
+    return os.path.join(cfg.root, "data", "state.json")
 
 
 def _read_state_doc(cfg) -> dict:

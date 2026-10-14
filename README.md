@@ -39,6 +39,8 @@ python -m pytest tests -q
 | `chart --code [--period daily\|weekly\|monthly] [--out]` | 离线单文件 K 线图 HTML |
 
 全局 `--root <path>` 覆盖数据根目录；`--json` 输出 `{"ok","command","data","error"}`，**退出码 0/1**
+（**例外**：`status` 检出**账实分叉**时退出码为 **1** 而 JSON 里 `ok` 仍为 `true` ——
+`ok` 描述命令本身，退出码描述「是否需要人工处理」；详见 `INTERFACES.md` INV-47）
 （业务拒单不算错误：`ok=true` 且 `data.orders[].status == "rejected"`）。
 
 ## 成交价：三种来源，以及「按实时价成交」

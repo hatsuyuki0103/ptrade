@@ -49,8 +49,23 @@ def _want_json(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "json", False))
 
 
-def _emit(args: argparse.Namespace, command: str, data: Any = None, error: str | None = None) -> int:
-    """统一输出：``--json`` → JSON 到 stdout；否则中文可读；返回退出码。"""
+def _emit(
+    args: argparse.Namespace,
+    command: str,
+    data: Any = None,
+    error: str | None = None,
+    *,
+    exit_code: int | None = None,
+) -> int:
+    """统一输出：``--json`` → JSON 到 stdout；否则中文可读；返回退出码。
+
+    ``exit_code``：**仅**给「命令成功、但有必须被脚本看见的问题」用
+    （目前唯一用途是 `status` 检出**账实分叉**，见 N7）。
+    默认仍是「有 error → 1，否则 0」。
+    注意此时 JSON 里 ``ok`` **仍为 true**（命令确实成功了）而退出码为 1 ——
+    这是**有意**的：`ok` 描述命令是否执行成功，退出码描述「是否需要人工处理」。
+    脚本侧按退出码分流、按 ``ok`` 判断命令本身，两者不混。
+    """
     if _want_json(args):
         payload = {
             "ok": error is None,
@@ -64,6 +79,8 @@ def _emit(args: argparse.Namespace, command: str, data: Any = None, error: str |
         print(f"[错误] {error}", file=sys.stderr)
     else:
         _print_human(command, data or {})
+    if exit_code is not None:
+        return int(exit_code)
     return 0 if error is None else 1
 
 
@@ -405,12 +422,32 @@ def cmd_init(args: argparse.Namespace, cfg: AppConfig) -> int:
     return _emit(args, "init", data)
 
 def cmd_status(args: argparse.Namespace, cfg: AppConfig) -> int:
-    """账户状态。**M3 修复**：同时给出账实一致性，让分叉真的被用户看见。"""
+    """账户状态。**M3 修复**：同时给出账实一致性，让分叉真的被用户看见。
+
+    **N7**：检出**已知**账实分叉（``diverged is True``）时退出码为 **1** ——
+    修前「分叉了但 rc=0」，脚本侧的 `if ! ptrade status` 完全看不出来，
+    而分叉意味着「重试同一笔下单可能重复成交」。
+
+    三态的处置（**不把「不知道」当成「没问题」**）：
+
+    * ``diverged is True``  → rc **1**（必须人工处理）
+    * ``diverged is None``  → rc **0**（**无法判定**：通常是正有写事务在跑。
+      命令本身没失败，不该让脚本以为「坏了」；但 JSON 里 ``diverged=null``
+      与 ``consistent=false`` 如实反映「没查成」）
+    * ``diverged is False`` → rc 0
+
+    JSON 里 ``ok`` **仍为 true**（命令确实成功了）—— ``ok`` 描述命令本身，
+    退出码描述「是否需要人工处理」，两者不混。
+    """
     state = _load_state(cfg)
     data = _state_summary(state)
     data["state_path"] = _state_path(cfg)
-    data["ledger_consistency"] = service.consistency(cfg)
-    return _emit(args, "status", data)
+    consistency = service.consistency(cfg)
+    data["ledger_consistency"] = consistency
+    return _emit(
+        args, "status", data,
+        exit_code=1 if consistency.get("diverged") is True else None,
+    )
 
 
 def cmd_sync(args: argparse.Namespace, cfg: AppConfig) -> int:

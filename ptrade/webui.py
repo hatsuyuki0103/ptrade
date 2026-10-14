@@ -70,6 +70,13 @@ tbody tr:hover{background:#1d2739;cursor:pointer}
 .badge-watch{background:#3f3f46;color:#e4e4e7}.badge-avoid{background:#422006;color:#fed7aa}
 .err-txt{color:var(--err)}.warn-txt{color:var(--warn)}
 .empty{color:var(--mut);padding:6px 0}
+/* 账实分叉**常驻**横幅（N7）：用常驻而不是 toast —— 分叉是需要用户持续看见的状态，
+   toast 会自己消失，不适合承载「账实可能不一致」这种必须被处理的信息。 */
+#divergence{display:none;margin:0;padding:10px 14px;border-left:5px solid var(--warn);
+  background:#3a2c08;color:#ffe6b0;font-size:14px;line-height:1.5}
+#divergence.is-diverged{border-left-color:var(--err);background:#3d1518;color:#ffd0d3}
+#divergence.is-unknown{border-left-color:var(--mut);background:#252c3d;color:#cfd8e8}
+#divergence code{background:rgba(0,0,0,.28);padding:1px 5px;border-radius:4px}
 </style>
 </head>
 <body>
@@ -83,6 +90,10 @@ tbody tr:hover{background:#1d2739;cursor:pointer}
   <span id="health" class="small muted"></span>
   <div id="toast" role="status" aria-live="polite"></div>
 </header>
+
+<!-- N7：账实分叉横幅。放在 header 与 main 之间 —— 必须是**页面级**可见，
+     不能藏在某个卡片里（分叉影响对**所有**数字的信任）。 -->
+<div id="divergence" role="alert" aria-live="assertive"></div>
 
 <main>
   <section class="card">
@@ -312,8 +323,44 @@ function pick(obj, names) {
   return null;
 }
 
+function renderDivergence(d) {
+  // N7：把「账实是否分叉」渲染成**页面级常驻横幅**。
+  // 三态，**不得**把「不知道」当成「没问题」：
+  //   diverged === true  → 红色：账实不一致，重试可能重复成交
+  //   diverged === null  → 灰色：无法判定（拿不到写锁 / 一侧不可读）
+  //   diverged === false → 隐藏
+  var el = $("divergence");
+  if (!el) { return; }
+  var lc = (d && d.ledger_consistency) || null;
+  var diverged = lc ? lc.diverged : undefined;
+  if (diverged === false) {
+    el.style.display = "none";
+    el.className = "";
+    el.innerHTML = "";
+    return;
+  }
+  if (diverged === true) {
+    el.className = "is-diverged";
+    el.innerHTML = "<strong>⚠️ 账实分叉（ledger 有单、state 无单）</strong>："
+      + "台账 <code>" + esc(lc.ledger_lines) + "</code> 行，而 state 水位记的是 <code>"
+      + esc(lc.recorded) + "</code>。"
+      + "说明某次写单只落了台账、没落账户 —— <strong>此时重试同一笔下单可能重复成交</strong>。"
+      + "请先查 <code>ledger.jsonl</code> 末尾与 <code>status</code> 持仓，再决定如何修复"
+      + "（不要直接重试下单）。";
+    el.style.display = "block";
+    return;
+  }
+  // diverged === null 或 undefined（缺字段 / 不可判定）
+  el.className = "is-unknown";
+  el.innerHTML = "<strong>账实一致性：无法判定</strong> —— "
+    + esc((lc && lc.reason) || "响应里没有 ledger_consistency 字段")
+    + "。这不是「没问题」，只是**没查成**（通常是正有写事务在跑）；稍后刷新再看。";
+  el.style.display = "block";
+}
+
 function renderState(data) {
   var d = (data && data.state) || data || {};
+  renderDivergence(d);
   var ratio = pick(d, ["maintenance_ratio"]);
   var items = [
     ["交易日", d.trade_date], ["可用资金", num(d.available_cash)], ["总资产", num(d.total_assets)],
