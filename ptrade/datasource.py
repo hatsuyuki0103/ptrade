@@ -501,6 +501,13 @@ class DataSource:
         """
         try:
             base = self.latest_trade_date()
+        except NetworkForbiddenInLock:
+            # **守卫错误必须上抛**（第四轮复核 M2，MEDIUM）：本函数另外三处
+            # （`_has_quote` / `_has_window` / 快照探针）都加了同款前置穿透，
+            # **唯独这里漏了** → 会静默回退「今天」。
+            # 可达路径：`service.resolve_asof(ds, None)` 在 `state.trade_date` 为空时，
+            # 会**在锁内**走到这里（写命令的缺省交易日解析）。
+            raise
         except Exception:  # noqa: BLE001 - 无日历时交给调用方
             return self._today()
 
@@ -886,7 +893,12 @@ class DataSource:
         asof = str(payload.get("asof", ""))[:10] if isinstance(payload, dict) else ""
         fetched_at = str(entry.get("fetched_at", ""))
         today = self._today()
-        stale = bool(expired) or (bool(asof) and asof != today)
+        # **`asof` 缺失不得被当作新鲜**（第四轮复核 M4，MEDIUM）：
+        # 原写法 `bool(asof) and asof != today` 在 `asof` 为空串/缺键时为假 →
+        # `require_today=True` **拦不住**，实测会成交并记下
+        # `price_source='live'` + `price_asof=''` = 「贴着实时的标签、却不知道是哪天的价」。
+        # 「不知道是哪天」必须按**不可用**处理，而不是按新鲜处理。
+        stale = bool(expired) or (not asof) or (asof != today)
         if require_today and stale:
             when = f"asof={asof or '(未记录)'}、fetched_at={fetched_at or '(未记录)'}"
             raise DataUnavailable(

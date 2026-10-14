@@ -271,6 +271,14 @@ class Engine:
             # 陈旧时 `live_quote` 抛 DataUnavailable（**绝不静默退回陈旧价**）。
             try:
                 live = self.ds.live_quote(code)
+            except NetworkForbiddenInLock:
+                # **守卫错误必须上抛**（第四轮复核 M1，HIGH）：
+                # `NetworkForbiddenInLock` ⊂ `DataUnavailable`，若让它掉进下面的
+                # `except DataUnavailable`，就会被吞成 **200 + `NO_PRICE` 业务拒单** ——
+                # INV-45 里「守卫错误 → 409」**永远不可能发生**（网页端会告诉用户
+                # 「按实时价成交失败」，而真实原因是代码在锁内取数）。
+                # `datasource` 的三处过期缓存兜底已有同款前置穿透，这里是遗漏的一处。
+                raise
             except DataUnavailable as exc:
                 return self._reject(
                     req, ErrorCode.NO_PRICE,

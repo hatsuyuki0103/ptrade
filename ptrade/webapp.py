@@ -40,6 +40,7 @@ import json
 import math
 import os
 import sys
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -390,7 +391,7 @@ class WebApp:
             return Response(200, _envelope("watchlist", {"items": items, "count": len(items)}))
         if method == "POST":
             code = _require_text(body, "code")
-            with _store().state_lock(self.cfg.root, self.lock_timeout):
+            with self._state_lock():
                 doc = watchlist.add_to_watchlist(
                     self.cfg, code, name=str(body.get("name") or ""), note=str(body.get("note") or "")
                 )
@@ -408,7 +409,7 @@ class WebApp:
             code = str(raw_code).strip() if raw_code is not None else ""
             if not code:
                 raise _ParamError("缺少必填参数 code")
-            with _store().state_lock(self.cfg.root, self.lock_timeout):
+            with self._state_lock():
                 doc = watchlist.remove_from_watchlist(self.cfg, code)
             return Response(200, _envelope("watchlist", {"code": code, "items": doc.get("items", []),
                                                          "count": len(doc.get("items", []))}))
@@ -611,6 +612,23 @@ class WebApp:
         store = _store()
         try:
             return store.locked_update(self.cfg, mutate, source="web", timeout=self.lock_timeout)
+        except store.StateLockTimeout as exc:
+            raise _LockTimeout(str(exc)) from exc
+
+    @contextmanager
+    def _state_lock(self):
+        """只取锁不改 state 的临界区（自选池增删用）。
+
+        **为什么单独一层**（第四轮复核 M5，MEDIUM）：`/api/watchlist` 的 POST/DELETE
+        原先**直接**用 `store.state_lock`，锁超时抛的是原始 `store.StateLockTimeout` ——
+        它**不在 `map_exception` 的映射表里** → 落进兜底 **HTTP 500**，
+        而 INV-45 契约要求 **503 + `STATE_LOCK_TIMEOUT`**。
+        这与 `_locked_update` 是同一类错误（同一种超时，两种表现），所以在这里统一转换。
+        """
+        store = _store()
+        try:
+            with store.state_lock(self.cfg.root, self.lock_timeout):
+                yield
         except store.StateLockTimeout as exc:
             raise _LockTimeout(str(exc)) from exc
 

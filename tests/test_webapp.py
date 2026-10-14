@@ -1177,3 +1177,48 @@ class WebApp_MapProbe:
     def data_unavailable():
         from ptrade.datasource import DataUnavailable
         return DataUnavailable("离线模式缺少数据")
+
+
+# --------------------------------------------------------------------------- #
+# M5（第四轮复核 MEDIUM）：`/api/watchlist` 的锁超时也必须 503
+#
+# 修前：该端点的 POST/DELETE **直接用 `store.state_lock`**（不走 `_locked_update`），
+# 锁超时抛的是原始 `store.StateLockTimeout` —— 它**不在 `map_exception` 的映射表里**
+# → 落进兜底 **HTTP 500**，而 INV-45 契约要求 **503 + `STATE_LOCK_TIMEOUT`**。
+# 同一类错误（同一种锁超时）有两种表现，属于契约破裂。
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("method,query,body", [
+    ("POST", {}, {"code": "600519"}),
+    ("DELETE", {"code": ["600519"]}, None),
+])
+def test_m5_watchlist_lock_timeout_maps_to_503(web_cfg, method, query, body):
+    """**M5**：`/api/watchlist` 在锁被占用时返回 **503 + `STATE_LOCK_TIMEOUT`**。
+
+    做法：另一个线程持锁 1.5s，本请求把 `lock_timeout` 压到 0.4s。
+    """
+    import threading
+    import time
+
+    from ptrade import store
+
+    app = _app(web_cfg, lock_timeout=0.4)
+    ready = threading.Event()
+
+    def hold():
+        with store.state_lock(web_cfg.root, timeout=10):
+            ready.set()
+            time.sleep(1.5)
+
+    t = threading.Thread(target=hold, daemon=True)
+    t.start()
+    assert ready.wait(timeout=10), "未能取得锁"
+    try:
+        status, payload = _call(app, method, "/api/watchlist", query, body)
+    finally:
+        t.join(timeout=10)
+
+    assert status == 503, (
+        f"{method} /api/watchlist 锁超时应为 503（INV-45），实际 {status}: "
+        f"{payload.get('error')}"
+    )
+    assert "STATE_LOCK_TIMEOUT" in str(payload.get("error")), payload

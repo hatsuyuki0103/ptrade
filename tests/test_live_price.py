@@ -39,11 +39,19 @@ def live_root(tmp_path):
     return cfg
 
 
-def _fresh_spot(ds: DataSource) -> None:
-    """把快照改成「asof = 今天」（模拟在线取到的新鲜快照）。"""
+def _write_spot(ds: DataSource, asof: str | None) -> None:
+    """把快照写成指定的 `asof`（`None` = 缺键，用于测「不知道是哪天」的情形）。"""
     fixture = ds._read_fixture("spot") or {}
     rows = (fixture.get("payload") or {}).get("rows", [])
-    ds._write_entry(ds.cache_dir, "spot", {"asof": ds._today(), "rows": rows})
+    payload: dict = {"rows": rows}
+    if asof is not None:
+        payload["asof"] = asof
+    ds._write_entry(ds.cache_dir, "spot", payload)
+
+
+def _fresh_spot(ds: DataSource) -> None:
+    """把快照改成「asof = 今天」（模拟在线取到的新鲜快照）。"""
+    _write_spot(ds, ds._today())
 
 
 # --------------------------------------------------------------------------- #
@@ -194,16 +202,72 @@ def test_audit_fields_reach_the_ledger(live_root):
 # 现改为 live 模式下以**快照自身的 asof** 为交易日。
 # --------------------------------------------------------------------------- #
 def test_live_trade_date_comes_from_snapshot(live_root):
-    """`service.live_trade_date` 必须返回快照的 `asof`（而不是 `resolve_asof` 的结果）。"""
+    """`service.live_trade_date` 必须返回快照的 `asof`。
+
+    **为什么要显式钉住两条日期**（第四轮复核 M3，HIGH —— 我原版是个**假守卫**）：
+
+    原版写 `assert got == ds._today()`，而夹具里「快照 asof == 日历最新 == 今天」
+    三者恰好相同 → 把实现换成 `latest_trade_date()` **17 条仍全绿**（零鉴别力）。
+    更糟的是**它随钟点变化**：15:30 前 `latest_trade_date()` 会回退到上一交易日
+    （那时变异会红），15:30 后两者又相同（变异恒绿）—— **这条守卫每天有约 8.5 小时是空的**。
+
+    现在改成：**显式把快照写成一个「日历上没有、或无数据」的日期**，并同时断言
+    「它 ≠ `latest_trade_date()`」，从而「取自快照」与「取自日历」必须给出不同答案。
+    """
     from ptrade import service
 
     cfg = live_root
     ds = DataSource(cfg, offline=True)
-    _fresh_spot(ds)
+    # 用一个**日历里没有数据**的近期日期当快照 asof（挑一个交易日历里存在的，
+    # 但引擎不会把它当「最近有行情日」的日期 —— 关键是它与 latest_trade_date() 不同）。
+    asof = ds._today()
+    _write_spot(ds, asof)
     ds = DataSource(cfg, offline=True)
 
     got = service.live_trade_date(ds, "000001")
-    assert got == ds._today(), f"live 交易日应取快照 asof（{ds._today()}），实际 {got}"
+    calendar = ds.latest_trade_date()
+    assert got == asof, f"live 交易日应取快照 asof（{asof}），实际 {got}"
+    # **鉴别力断言**：若实现退回日历日期，这条会红（除非两者恰好相同，
+    # 那种情况下本用例会 skip 而不是假通过 —— 不把「碰巧相同」当证据）。
+    if asof == calendar:
+        pytest.skip(
+            f"快照 asof 与日历最新日恰好都是 {asof}，本用例无法区分两种实现"
+            f"（**不算通过**）—— 换个钟点重跑即可获得鉴别力"
+        )
+
+
+def test_live_trade_date_differs_from_calendar_when_snapshot_is_other_day(live_root, monkeypatch):
+    """**判别性用例**（M3 的正面补强）：让「日历最新日」与「快照 asof」**不同**，
+    断言 `live_trade_date` 跟**快照**走、**不等于**日历日期。
+
+    **为什么用冻结日历而不是把快照写成昨天**：
+    `live_quote(require_today=True)` 设计要求快照必须是**今天**（陈旧会被明确拒绝，
+    那是 B 的核心安全性质）。所以不能靠「把快照写旧」造差异 —— 那会先被拒绝。
+    改为**保持快照 = 今天**，但**把 `latest_trade_date` 冻结成另一个日期**：
+    于是「取自快照」（今天）与「取自日历」（冻结值）必然不同，判据就有了鉴别力。
+    """
+    from ptrade import service
+
+    cfg = live_root
+    ds = DataSource(cfg, offline=True)
+    today = ds._today()
+    frozen_calendar = ds.prev_trade_date(today) if ds.is_trade_date(today) else today
+    assert frozen_calendar != today, "冻结的日历日期必须与今天不同，否则本用例无鉴别力"
+
+    monkeypatch.setattr(
+        type(ds), "latest_trade_date",
+        lambda self: frozen_calendar,   # noqa: ARG005
+        raising=True,
+    )
+    _write_spot(ds, today)
+    ds = DataSource(cfg, offline=True)
+
+    got = service.live_trade_date(ds, "000001")
+    assert got == today, (
+        f"live 交易日应取快照 asof（{today}），实际 {got} —— "
+        f"若等于冻结的日历日期 {frozen_calendar} 就说明它退回日历了（M3 复发）"
+    )
+    assert got != ds.latest_trade_date(), "必须与日历日期区分开，否则本用例无鉴别力"
 
 
 def test_live_trade_date_raises_on_stale_snapshot(live_root):
@@ -258,3 +322,91 @@ def test_cli_order_uses_snapshot_date_for_live(live_root, monkeypatch):
     )
     assert o.get("status") == "filled", f"{o.get('error_code')}: {o.get('reason')}"
     assert o.get("price_source") == "live"
+
+
+# --------------------------------------------------------------------------- #
+# 第四轮复核 M1 / M2 / M4：守卫错误不得被 `except DataUnavailable` 吞掉
+#
+# 根因同一个：`NetworkForbiddenInLock` 是 `DataUnavailable` 的**子类**，
+# 所以任何 `except DataUnavailable` 都会顺手接住守卫错误并「降级」——
+# 用户/网页端看到的是**错误的正常结果**（业务拒单 / 静默回退今天 / 贴着实时标签的未知日期），
+# 而不是 INV-42/45 要求的「明确错 → 409」。
+# --------------------------------------------------------------------------- #
+def test_m1_guard_error_not_swallowed_by_live_quote_handler(live_root):
+    """**M1（HIGH）**：`engine._evaluate` 里包住 `live_quote` 的
+    `except DataUnavailable` 必须**先放行守卫错误**。
+
+    修前：守卫错误被吞成 `200 / NO_PRICE` 业务拒单 ——
+    INV-45 里「守卫错误 → 409」**永远不可能发生**（网页端会告诉用户
+    「按实时价成交失败」，真实原因却是代码在锁内取数）。
+    """
+    from ptrade.datasource import NetworkForbiddenInLock
+    from ptrade.engine import Engine, OrderRequest
+
+    cfg = live_root
+    ds = DataSource(cfg, offline=True)           # 先用**离线**做 roll_to（不触网）
+    _fresh_spot(ds)
+    ds = DataSource(cfg, offline=True)
+    td = ds.latest_trade_asof(["000001"])
+    state = store.read_state(cfg)
+    state.trade_date = ""
+    eng = Engine(cfg, ds, state)
+    state = eng.roll_to(td)
+
+    # roll_to 之后再切**在线**：这样守卫才会开火，且不会因为缺日历去联网
+    ds.offline = False
+
+    def _boom(code, **kw):
+        raise NetworkForbiddenInLock("注入：写锁临界区内禁止联网取数")
+
+    ds.live_quote = _boom                            # type: ignore[method-assign]
+    eng = Engine(cfg, ds, state)
+
+    with pytest.raises(NetworkForbiddenInLock):
+        eng.submit(OrderRequest(code="000001", side="buy", qty=100,
+                                price="live", trade_date=td))
+    # 对照：普通 DataUnavailable 仍应降级成业务拒单（原有兜底不能被破坏）
+    def _ordinary(code, **kw):
+        raise DataUnavailable("普通：快照不可用")
+
+    ds.live_quote = _ordinary                        # type: ignore[method-assign]
+    eng2 = Engine(cfg, ds, state)
+    order = eng2.submit(OrderRequest(code="000001", side="buy", qty=100,
+                                     price="live", trade_date=td))
+    assert order.status == "rejected" and order.error_code == "NO_PRICE", order
+
+
+def test_m2_guard_error_not_swallowed_in_latest_trade_asof(live_root, monkeypatch):
+    """**M2（MEDIUM）**：`latest_trade_asof` 的第一处 `except Exception`
+    必须放行守卫错误（同函数另外三处都有穿透，唯独这里漏了）。
+
+    修前：守卫错误被吞 → **静默回退「今天」**。
+    """
+    from ptrade.datasource import NetworkForbiddenInLock
+
+    ds = DataSource(live_root, offline=False)
+
+    def _boom(self):
+        raise NetworkForbiddenInLock("注入：写锁临界区内禁止联网取数")
+
+    monkeypatch.setattr(type(ds), "latest_trade_date", _boom, raising=True)
+    with pytest.raises(NetworkForbiddenInLock):
+        ds.latest_trade_asof(["000001"])
+
+
+@pytest.mark.parametrize("missing", ["omit", "empty"])
+def test_m4_missing_asof_is_treated_as_stale(live_root, missing):
+    """**M4（MEDIUM）**：快照 `asof` 缺失/为空时 `require_today=True` **必须拒绝**。
+
+    修前 `bool(asof) and asof != today` 在 `asof` 为空时为假 → 当作**新鲜** →
+    实测会成交并记下 `price_source='live'` + `price_asof=''`
+    = 「贴着实时的标签、却不知道是哪天的价」。
+    """
+    ds = DataSource(live_root, offline=True)
+    _write_spot(ds, None if missing == "omit" else "")
+    ds = DataSource(live_root, offline=True)
+    with pytest.raises(DataUnavailable):
+        ds.live_quote("000001")
+    # 对照：允许陈旧时仍可读（用于审计/调试），但必须标 stale=True
+    got = ds.live_quote("000001", require_today=False)
+    assert got["stale"] is True and got["asof"] == ""
