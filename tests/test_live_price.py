@@ -182,3 +182,79 @@ def test_audit_fields_reach_the_ledger(live_root):
     assert last["price_source"] == "live"
     assert last["price_asof"] == ds._today()
     assert last["price_fetched_at"], "台账里必须有抓取时刻"
+
+
+# --------------------------------------------------------------------------- #
+# 交易日必须取自**快照**（2026-10-14 修的设计缺陷）
+#
+# 修前：`--price live` 仍走 `resolve_asof`，而它在 15:30 前会回退到**上一交易日**；
+# 引擎的停牌检查看的是 `td` 那天的行情 → 「快照是今天、td 是昨天」→ 判 `SUSPENDED`。
+# 实测：不传 `--trade-date` 时 trade_date=2026-10-13 → rejected SUSPENDED；
+# 必须**同时**给 `--trade-date=今天` 才能用 —— 用户体验差。
+# 现改为 live 模式下以**快照自身的 asof** 为交易日。
+# --------------------------------------------------------------------------- #
+def test_live_trade_date_comes_from_snapshot(live_root):
+    """`service.live_trade_date` 必须返回快照的 `asof`（而不是 `resolve_asof` 的结果）。"""
+    from ptrade import service
+
+    cfg = live_root
+    ds = DataSource(cfg, offline=True)
+    _fresh_spot(ds)
+    ds = DataSource(cfg, offline=True)
+
+    got = service.live_trade_date(ds, "000001")
+    assert got == ds._today(), f"live 交易日应取快照 asof（{ds._today()}），实际 {got}"
+
+
+def test_live_trade_date_raises_on_stale_snapshot(live_root):
+    """陈旧快照时**抛错**，不得悄悄退回日历日期（那会让 live 变成「假实时」）。"""
+    from ptrade import service
+
+    ds = DataSource(live_root, offline=True)
+    today = ds._today()
+    spot_asof = str(((ds._read_fixture("spot") or {}).get("payload") or {}).get("asof", ""))[:10]
+    if spot_asof == today:
+        pytest.skip("夹具快照恰好是今天")
+    with pytest.raises(DataUnavailable):
+        service.live_trade_date(ds, "000001")
+
+
+def test_cli_order_uses_snapshot_date_for_live(live_root, monkeypatch):
+    """**端到端**：`--price live` 且**不传** `--trade-date` 时，交易日应取自快照。
+
+    这条是「用户不必再手写今天日期」的守卫 —— 修前它会落到 `resolve_asof`
+    的上一交易日并被判 `SUSPENDED`。
+    """
+    cfg = live_root
+    ds = DataSource(cfg, offline=True)
+    _fresh_spot(ds)
+    ds = DataSource(cfg, offline=True)
+    today = ds._today()
+
+    # 让 cli 用我们的 ds（它内部会 `_make_ds`）
+    monkeypatch.setattr(cli, "_make_ds", lambda c, offline: ds)
+    parser = cli.build_parser()
+    args = parser.parse_args(["order", "--code", "000001", "--side", "buy", "--qty", "100",
+                              "--price", "live", "--offline", "--json"])
+    captured: dict = {}
+    real_engine_for = cli._engine_for
+
+    def spy_engine_for(engine_cls, c, d, state, source="cli"):
+        captured["engine"] = real_engine_for(engine_cls, c, d, state, source=source)
+        return captured["engine"]
+
+    monkeypatch.setattr(cli, "_engine_for", spy_engine_for)
+    import io
+    import contextlib
+
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        cli.cmd_order(args, cfg)
+    payload = json.loads(buf.getvalue())
+    orders = (payload.get("data") or {}).get("orders") or [{}]
+    o = orders[0]
+    assert o.get("trade_date") == today, (
+        f"live 下单的交易日应取快照 asof（{today}），实际 {o.get('trade_date')!r}"
+        f"—— 修前这里会是上一交易日并判 SUSPENDED"
+    )
+    assert o.get("status") == "filled", f"{o.get('error_code')}: {o.get('reason')}"
+    assert o.get("price_source") == "live"

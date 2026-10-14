@@ -52,10 +52,15 @@ python -m pytest tests -q
 | 不传 | 行情 `last` ± 滑点（市价） | `""` |
 
 ```powershell
-python -m ptrade order --code 600519 --side buy --qty 100 --price live --trade-date 2026-10-14
+python -m ptrade order --code 600519 --side buy --qty 100 --price live
 ```
 
-**为什么需要 `live`**：`--trade-date` 缺省会用 `resolve_asof`，它在 **15:30 前会回退到
+**不必再手写 `--trade-date`**：live 模式下交易日**取自快照自身的 `asof`**
+（`service.live_trade_date`）。这一点很关键 —— `resolve_asof` 在 15:30 前会回退到
+**上一交易日**，而引擎的停牌检查看的是那一天有没有行情，两者不一致会让 live 下单被判
+`SUSPENDED`（实测：不传 `--trade-date` 时 `trade_date` 落到昨天 → 拒绝）。
+
+**为什么需要 `live`**：`--trade-date` 缺省走 `resolve_asof`，它在 **15:30 前会回退到
 上一交易日**（未来函数防护），于是盘中缺省下单会走到「日线推导」分支并**被判停牌**。
 `--price live` 是**显式**入口，不动回测语义。
 

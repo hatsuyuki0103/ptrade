@@ -318,6 +318,16 @@ def _coerce_price_arg(raw: Any) -> Any:
             f"--price 必须是数字或 'live'（按当前快照价成交），收到 {raw!r}"
         ) from exc
 
+
+def _is_live_price_arg(raw: Any) -> bool:
+    """``--price`` 是否为「按实时快照价成交」（B）。
+
+    与 ``Engine._is_live_price`` 同义；cli 里 `Engine` 是惰性导入，所以在这里独立判断。
+    两者的**取值**由 `tests/test_live_price.py` 的一致性断言守住，防止漂移。
+    """
+    return isinstance(raw, str) and raw.strip().lower() == "live"
+
+
 def _split_codes(text: str | None) -> list[str]:
     if not text:
         return []
@@ -488,7 +498,14 @@ def cmd_order(args: argparse.Namespace, cfg: AppConfig) -> int:
     def _mutate(state: AccountState | None) -> AccountState:
         if state is None:
             raise FileNotFoundError(f"未找到账户文件 {_state_path(cfg)}，请先执行 `python -m ptrade init`")
+        price_arg = _coerce_price_arg(args.price)
         trade_date = args.trade_date or state.trade_date or _resolve_asof(ds, None)
+        # **`--price live` 的交易日取自快照**（B，2026-10-14）：`resolve_asof` 在 15:30 前
+        # 会回退到上一交易日，而引擎的停牌检查看的是 `td` 那天的行情 ——
+        # 两者不一致会让 live 下单被判 SUSPENDED（实测），于是必须**同时**给
+        # `--trade-date=今天` 才能用。以快照日期为准就一步到位。
+        if _is_live_price_arg(price_arg) and not args.trade_date:
+            trade_date = service.live_trade_date(ds, args.code)
         engine = _engine_for(Engine, cfg, ds, state, source="cli")
         if state.trade_date != trade_date:
             state = engine.roll_to(trade_date)
@@ -496,7 +513,7 @@ def cmd_order(args: argparse.Namespace, cfg: AppConfig) -> int:
             code=args.code, side=args.side, qty=int(args.qty),
             # `--price live` 原样传给引擎（它认 LIVE_PRICE_SENTINEL）；
             # 其它值仍是数字。**不要**在这里 float() —— 那会把 "live" 变成 ValueError。
-            price=_coerce_price_arg(args.price), trade_date=trade_date,
+            price=price_arg, trade_date=trade_date,
         )
         order = engine.submit(request)
         generated["order"] = order

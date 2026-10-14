@@ -347,3 +347,30 @@ def risk_from_core(state: AccountState, cfg: AppConfig) -> dict[str, Any]:
         "positions": state_summary(state)["positions"],
         "source": "core",
     }
+
+
+# --------------------------------------------------------------------------- #
+# 实时价成交（B，2026-10-14）——交易日必须取自**快照**，不是 resolve_asof
+# --------------------------------------------------------------------------- #
+def live_trade_date(ds: DataSource, code: str) -> str:
+    """`--price live` 要用的**交易日** = 快照自身的 `asof`。
+
+    **为什么不能沿用 `resolve_asof`**（实测发现的设计缺陷）：
+    `resolve_asof` 在 15:30 前会回退到**上一交易日**（未来函数防护），
+    而引擎的停牌检查拿的是 **`td` 那天**的行情 ——「快照是今天、td 是昨天」
+    会被判 `SUSPENDED`，于是 `--price live` 必须**同时**显式给 `--trade-date=今天` 才能用。
+
+    实测（今天 2026-10-14、日历最新 2026-10-13、快照 asof 2026-10-14）：
+    ```
+    不传 --trade-date  → trade_date=2026-10-13 → rejected SUSPENDED   ← 用户体验差
+    --trade-date=今天  → trade_date=2026-10-14 → filled（source=live） ✅
+    ```
+
+    所以 live 模式下**以快照自身的日期为准**：它既是「有行情的日期」，
+    也天然满足「快照 asof == asof」（`quote()` 才会真的走快照分支）。
+
+    **它不放宽未来函数防护**：`live_quote(require_today=True)` 已要求快照必须是
+    **今天**的（陈旧直接抛错）；这里只是把那个日期明说出来。
+    """
+    live = ds.live_quote(code)          # require_today=True：陈旧会抛 DataUnavailable
+    return str(live.get("asof") or "") or ds.latest_trade_date()

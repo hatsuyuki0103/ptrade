@@ -49,7 +49,14 @@ def list_releases() -> list[dict]:
     out = []
     for rel in data:
         assets = [
-            {"name": a["name"], "url": a["browser_download_url"], "size": a["size"]}
+            {
+                "name": a["name"],
+                # `browser_download_url` 在 **objects.githubusercontent.com**（本机实测不可达）；
+                # `api_url` 在 **api.github.com**（本机可达）。优先用后者。
+                "url": a["browser_download_url"],
+                "api_url": a.get("url", ""),
+                "size": a["size"],
+            }
             for a in rel.get("assets", [])
         ]
         out.append({"tag": rel["tag_name"], "name": rel.get("name"), "assets": assets})
@@ -162,11 +169,26 @@ def main(argv: list[str] | None = None) -> int:
     asset = pick_asset(target) if target else None
     if asset:
         print(f"下载 {target['tag']} / {asset['name']} ({asset['size']:,} B) …")
-        try:
-            blob = _get(asset["url"], raw=True, timeout=300)
-        except (urllib.error.URLError, OSError) as exc:
-            print(f"⚠️ 下载失败：{exc}")
-            blob = None
+        blob = None
+        # **优先走 API 资产端点**（`api.github.com`，本机可达）：
+        # `browser_download_url` 在 `objects.githubusercontent.com`，本机实测**不可达**
+        # （`WinError 10060`）→ 用户会看到「下载失败」然后被回退到「现拉重建」，
+        # 那条路要求联网 + akshare，于是**最终什么也没拿到**。这是真实的可用性缺陷。
+        for label, url, raw in (
+            ("API", asset.get("api_url"), True),
+            ("浏览器直链", asset["url"], True),
+        ):
+            if not url:
+                continue
+            try:
+                blob = _get(url, raw=raw, timeout=300)
+                if blob:
+                    print(f"  （经 {label} 端点获取成功）")
+                    break
+            except (urllib.error.URLError, OSError) as exc:
+                print(f"  ⚠️ {label} 端点失败：{str(exc)[:110]}")
+        if not blob:
+            print("⚠️ 所有下载端点都失败")
         if blob:
             with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(asset["name"])[1]) as fh:
                 fh.write(blob)
