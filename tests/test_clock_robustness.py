@@ -179,3 +179,61 @@ def test_watchlist_score_survives_clock_jump(offline_cfg, monkeypatch):
         f"—— N4 复发（生产侧同样会让整个池子报 no_data）"
     )
     assert all(r["score"] is not None for r in rows)
+
+
+# --------------------------------------------------------------------------- #
+# M6（第四轮复核）：`latest_trade_asof` 的**第二段**会返回「本身没行情」的日期
+#
+# 触发条件：**所有探针在该日期都没有行情**（复核用合成 `daily_999001.json` 复现：
+# `asof=2026-08-28, suspended=true`）。
+# 第二段对「窗口消费者」（`score_watchlist`）够用，对「下单消费者」不够 ——
+# 边缘标的（长期停牌 / B 股 / 新上市）仍可能复发 P3-2 的同类症状。
+#
+# 本函数**无法**在第二段里再找出「本身有行情」的日期（那正是第一段找不到的），
+# 所以修法是**不假装成功**：留一条可见的痕。
+#
+# **用什么留痕**：先用了 `RuntimeWarning`，但实测它在离线夹具下**频繁触发**
+# （自选池打分就走第二段 → 全量测试报出 9 条 warnings、CLI/网页端输出被污染）。
+# 改为 **logger.info**：`caplog` 可断言、`--verbose` 可见，但不打扰正常使用。
+# --------------------------------------------------------------------------- #
+def test_m6_phase2_fallback_is_logged(offline_cfg, caplog):
+    """**M6 断言**：退到第二段（窗口判据）时必须**留痕**，不得静默返回次优日期。"""
+    import logging
+
+    import pandas as pd
+
+    from ptrade.datasource import DataSource
+
+    class _Phase2Only(DataSource):
+        """`quote()` 永远 suspended（第一段必失败），`daily()` 窗口非空（第二段命中）。"""
+
+        def quote(self, code, asof):                    # noqa: ARG002
+            return {"code": code, "name": code, "last": float("nan"), "prev_close": float("nan"),
+                    "limit_up": float("nan"), "limit_down": float("nan"), "suspended": True}
+
+        def daily(self, code, start, end):              # noqa: ARG002
+            return pd.DataFrame([{"date": "2020-01-02", "close": 1.0}])
+
+    ds = _Phase2Only(offline_cfg, offline=True)
+    with caplog.at_level(logging.INFO, logger="ptrade.datasource"):
+        got = ds.latest_trade_asof(["600519"])
+    assert got, "第二段应返回一个日期（即使它本身没行情）"
+    # 注意用 `r.getMessage()`（已做惰性 ``%`` 格式化），**不要**自己写 `r.message % r.args` ——
+    # 日志里的 ``%s`` 与 args 个数不总对应，会抛 `TypeError`（我第一版就这么错了）。
+    texts = [r.getMessage() for r in caplog.records]
+    assert any("退到「回看窗口非空」判据" in t for t in texts), (
+        f"退到第二段时必须留痕（不得静默返回次优日期）；实测日志={texts}"
+    )
+
+
+def test_m6_phase1_hit_does_not_log(offline_cfg, caplog):
+    """**对照**：第一段命中时**不该**留痕（否则上面那条没有鉴别力）。"""
+    import logging
+
+    ds = _ds_with_clock(offline_cfg, None)
+    with caplog.at_level(logging.INFO, logger="ptrade.datasource"):
+        ds.latest_trade_asof(["600519"])
+    texts = [r.getMessage() for r in caplog.records]
+    assert not any("退到「回看窗口非空」判据" in t for t in texts), (
+        f"第一段命中时不该留痕：{texts}"
+    )

@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import logging
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
@@ -27,6 +28,8 @@ import pandas as pd
 
 from . import store
 from .config import AppConfig
+
+_log = logging.getLogger(__name__)
 
 __all__ = ["DataSource", "DataUnavailable", "NetworkForbiddenInLock"]
 
@@ -570,10 +573,31 @@ class DataSource:
                 return day
             day = self.prev_trade_date(day)
 
-        # 第二段：退而求其次，只要回看窗口非空
+        # 第二段：退而求其次，只要回看窗口非空。
+        #
+        # **它会返回一个「本身没有行情」的日期**（第四轮复核 M6）——
+        # 触发条件是「**所有探针在该日期都没有行情**」，复核用合成 `daily_999001.json`
+        # 复现过（`asof=2026-08-28, suspended=true`）。
+        # 对「窗口消费者」（`score_watchlist`）够用；对「下单消费者」不够 ——
+        # 边缘标的（长期停牌 / B 股 / 新上市）仍可能复发 P3-2 的同类症状。
+        #
+        # 本函数**无法**在这一段里再找出「本身有行情」的日期（那正是第一段找不到的），
+        # 所以这里**不假装成功**：发一条 `RuntimeWarning` 让「退到了次优判据」**可见**，
+        # 而不是静默返回一个下游可能被判停牌的日期。
         day = base
         for _ in range(max(1, int(max_back))):
             if any(_has_window(code, day) for code in probes):
+                # 用 **logger** 而不是 `warnings.warn`：这条消息会**频繁出现**
+                # （实测离线夹具下自选池打分就走到第二段 → 全量测试报出 9 条 warnings），
+                # `warnings.warn` 会污染 CLI/网页端输出、并在测试里刷屏。
+                # 「留痕」的诉求仍在（`caplog` 可断言、`--verbose` 可见），但不打扰正常使用。
+                _log.info(
+                    "latest_trade_asof 退到「回看窗口非空」判据：返回 %s，"
+                    "但探针 %s 在该日都没有行情（第一段判据未命中）。"
+                    "对下单用途这可能不足（下游 quote() 会标 suspended）—— "
+                    "请显式指定 asof / --trade-date，或先补齐该标的的数据。",
+                    day, probes[:3],
+                )
                 return day
             day = self.prev_trade_date(day)
         return base
