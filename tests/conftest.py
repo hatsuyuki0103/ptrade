@@ -184,3 +184,59 @@ def write_state(offline_cfg):
         return path
 
     return _write
+
+
+# =========================================================================== #
+# V5-8 ★★★ 用户自选池**字节守卫**（会话级 autouse）
+#
+# 事故背景：本轮开发中 `data/watchlist.json` 被清空 **4 次**
+# （证据：`.omx/evidence/watchlist-polluted-20261019T1349.bak` / `watchlist-smoke.bak`
+#   / `watchlist-v4-probe.bak` / `watchlist-xss.bak`）。
+#
+# 设计要点（评审 R2-11 / test-spec V5-8）：
+# * **任何形态的写入都会红**（write_text / write_bytes / json.dump / rename / unlink 都改变字节）；
+# * **误报为零**：只比较会话开始 vs 结束的 `data/watchlist.json` 原始字节；
+# * 红之前**先字节级还原**（用户数据不能因为一次测试跑而丢）；
+# * 范围是**会话级**（不是 function 级）：能抓住「某个脚本在测试之外改了它」这类形态。
+#
+# ★ 本夹具只读仓库根的 `data/watchlist.json`；**测试自己的数据根一律用 tmp root**。
+# =========================================================================== #
+WATCHLIST_PATH = os.path.join(ROOT, "data", "watchlist.json")
+
+
+def _watchlist_bytes() -> bytes | None:
+    try:
+        with open(WATCHLIST_PATH, "rb") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError:                                     # pragma: no cover - 权限异常按不存在处理
+        return None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _watchlist_bytes_guard():
+    """会话级字节守卫：跑完整个 session 后 `data/watchlist.json` 必须**逐字节不变**。"""
+    before = _watchlist_bytes()
+    yield
+    after = _watchlist_bytes()
+    if after == before:
+        return
+    # ---- 有变化：先字节级还原，再响亮失败 ----
+    try:
+        if before is None:
+            if after is not None:
+                os.unlink(WATCHLIST_PATH)
+        else:
+            with open(WATCHLIST_PATH, "wb") as fh:
+                fh.write(before)
+    except OSError as exc:                              # pragma: no cover - 还原失败要更响亮
+        pytest.fail(
+            f"★ 有测试改写了用户自选池 {WATCHLIST_PATH}，且**还原失败**（{exc}）；"
+            f"原字节 {len(before or b'')} B / 现字节 {len(after or b'')} B"
+        )
+    pytest.fail(
+        f"★ 有测试改写了用户自选池 {WATCHLIST_PATH}"
+        f"（会话前 {len(before or b'')} B → 会话后 {len(after or b'')} B）—— **已字节级还原**。"
+        "测试/探针必须使用隔离 root（tmp_path），任何写仓库 `data/` 的行为都是事故（本轮已发生 4 次）。"
+    )

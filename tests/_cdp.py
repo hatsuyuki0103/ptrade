@@ -218,18 +218,24 @@ const MEASURE_JS = String.raw`(() => {
   const collapsed = { score: null, positions: null, analysis: null };
   const foldable = { score: false, positions: false, analysis: false };
   const summaryText = { score: null, positions: null, analysis: null };
-  const classify = (txt) => {
+  // ★ 多键分类：v5 INV-73 把「打分」并入「分析」成**一张卡**，summary 同时含
+  //   两者字样 ⇒ 必须返回**所有**命中的键（v4-L6 仍要 collapsed.score / .analysis 都有值）
+  const classifyAll = (txt) => {
     const t = String(txt || "");
-    if (/打分|评分|score/i.test(t)) return "score";
-    if (/持仓|position/i.test(t)) return "positions";
-    if (/分析|analysis/i.test(t)) return "analysis";
-    return null;
+    const keys = [];
+    if (/打分|评分|score/i.test(t)) keys.push("score");
+    if (/持仓|position/i.test(t)) keys.push("positions");
+    if (/分析|analysis/i.test(t)) keys.push("analysis");
+    return keys;
   };
+  const classify = (txt) => { const ks = classifyAll(txt); return ks.length ? ks[0] : null; };
   if (infoCol) {
     for (const d of infoCol.querySelectorAll("details")) {
       const sum = d.querySelector("summary");
       const sumTxt = sum ? String(sum.textContent || "").trim() : "";
-      const key = classify(sumTxt) || classify(String(d.className || "")) || classify(String(d.id || ""));
+      const keys = classifyAll(sumTxt).concat(classifyAll(String(d.className || "")))
+        .concat(classifyAll(String(d.id || "")));
+      const key = keys.length ? keys[0] : null;
       const body = d.querySelector(":scope > :not(summary)");
       const contentH = body ? body.offsetHeight : 0;
       // ★ R3-D 双判据的**可靠侧**：offsetHeight 在 Chrome 的 content-visibility 实现下
@@ -248,12 +254,15 @@ const MEASURE_JS = String.raw`(() => {
       }
       detailsInfo.push({ key, open: d.open, contentH, summary: sumTxt.slice(0, 160),
                          contentVisible: visible, contentDisplay: display, contentRects: rects });
-      if (key) {
+      if (keys.length) {
         // ★ R3-A/R3-D：闭合(**open is False**) 且 内容**不可见** 才算「折叠生效」；
         //   若 open=false 但内容仍可见（CSS 覆盖/实现缺陷）⇒ 判「没折叠」，可被抓到。
-        collapsed[key] = (d.open === false) && (visible === false || (visible === null && contentH === 0));
-        foldable[key] = true;
-        summaryText[key] = sumTxt;
+        const isCollapsed = (d.open === false) && (visible === false || (visible === null && contentH === 0));
+        for (const k of keys) {
+          collapsed[k] = isCollapsed;
+          foldable[k] = true;
+          summaryText[k] = sumTxt;
+        }
       }
     }
     // ★ 非 <details> 的卡片 = **永远展开**（例如「持仓」默认就不该折叠）
@@ -277,6 +286,47 @@ const MEASURE_JS = String.raw`(() => {
   }
   const analysisPanel = document.querySelector("#analysis-panel")
     || document.querySelector('[data-testid="analysis-panel"]');
+  // ---- V5：分析卡（单卡合并 + 五段 + 折叠态） ----
+  const analysisDetails = document.querySelector("#analysis-details");
+  const scoreDetails = document.querySelector("#score-details");
+  const secEls = analysisDetails ? [...analysisDetails.querySelectorAll("[data-section]")] : [];
+  const sectionOrder = secEls.map((el) => el.getAttribute("data-section"));
+  const secBy = {};
+  for (const el of secEls) secBy[el.getAttribute("data-section")] = el;
+  const textOf = (el) => (el ? String(el.textContent || "").replace(/\s+/g, " ").trim() : "");
+  const itemCount = (el) => {
+    if (!el) return 0;
+    const lis = [...el.querySelectorAll("li")];
+    const nodes = lis.length ? lis : [...el.children];
+    return nodes.filter((n) => String(n.textContent || "").trim().length > 0).length;
+  };
+  const analysisBodyText = analysisDetails
+    ? textOf(analysisDetails)
+    : textOf(document.querySelector("#analysis-panel"));
+  const stateEl = document.querySelector("#analysis-state");
+  const freshnessEl = document.querySelector('[data-testid="quote-freshness-hint"]');
+  // ---- V5：自选池 / 持仓卡（用 offsetTop，避免被右列滚动污染） ----
+  const wl = document.querySelector("#watchlist");
+  const wlStyle = wl ? window.getComputedStyle(wl) : null;
+  const cardByHeading = (word) => {
+    const heads = [...document.querySelectorAll("h2, h3, summary, .card-title")];
+    for (const h of heads) {
+      if (String(h.textContent || "").indexOf(word) >= 0) {
+        return h.closest("details, section, .card, article") || h.parentElement;
+      }
+    }
+    return null;
+  };
+  const positionsCard = cardByHeading("持仓");
+  const hasPagination = !!document.querySelector(
+    '.pagination, [data-testid="pagination"], .pager, .page-btn, [data-page]');
+  const infoColEl = document.querySelector(".info-col");
+  // 先滚到顶（读 offsetTop 前必须做，R3-C）
+  if (infoColEl) { try { infoColEl.scrollTop = 0; } catch (e) {} }
+  // ---- V5：运行时常量（前端轮询参数；顶层 var 会挂到 window） ----
+  const winVar = (name) => {
+    try { return (typeof window[name] !== "undefined") ? window[name] : null; } catch (e) { return null; }
+  };
   // ---- ECharts 实例尺寸 ----
   let echartsWidth = 0, echartsHeight = 0;
   try {
@@ -311,6 +361,36 @@ const MEASURE_JS = String.raw`(() => {
     summaryText,
     analysisPanelRect: rect(analysisPanel),
     echartsWidth, echartsHeight,
+    // ---- V5 字段 ----
+    hasAnalysisDetails: !!analysisDetails,
+    hasScoreDetails: !!scoreDetails,
+    analysisOpen: analysisDetails ? !!analysisDetails.open : null,
+    analysisSectionOrder: sectionOrder,
+    analysisBodyText: analysisBodyText,
+    analysisReasonItems: itemCount(secBy["reasons"]),
+    analysisRiskItems: itemCount(secBy["risks"]),
+    analysisReasonsText: textOf(secBy["reasons"]),
+    analysisRisksText: textOf(secBy["risks"]),
+    analysisAdviceText: textOf(secBy["advice"]),
+    analysisState: stateEl ? String(stateEl.getAttribute("data-state") || "") : null,
+    analysisStateText: stateEl ? String(stateEl.textContent || "").trim() : "",
+    analysisPanelText: textOf(analysisPanel),
+    freshnessHintText: freshnessEl ? String(freshnessEl.textContent || "").trim() : "",
+    watchlist: wl ? {
+      scrollH: wl.scrollHeight, clientH: wl.clientHeight, scrollTop: wl.scrollTop,
+      overflowY: wlStyle ? wlStyle.overflowY : null,
+      rows: wl.querySelectorAll("tr").length,
+      rect: rect(wl),
+    } : null,
+    positionsCardOffsetTop: positionsCard ? positionsCard.offsetTop : null,
+    hasPagination: hasPagination,
+    pollRuntime: {
+      POLL_ACTIVE_MS: winVar("POLL_ACTIVE_MS"),
+      ANALYSIS_POLL_MS: winVar("ANALYSIS_POLL_MS"),
+      ANALYSIS_POLL_MAX: winVar("ANALYSIS_POLL_MAX"),
+    },
+    netCalls: (window.__netCalls || {}),
+    visibility: { hidden: document.hidden, state: document.visibilityState },
     events: (window.__cdpEvents || []).slice(),
     now: Date.now(),
   };
@@ -381,6 +461,23 @@ async function waitFor(expression, timeoutMs, intervalMs = 200) {
 }
 
 async function measureOne(req) {
+  let initScriptId = null;
+  try {
+    if (req.initJs) {
+      const r = await send("Page.addScriptToEvaluateOnNewDocument", { source: req.initJs });
+      initScriptId = r && r.identifier;
+    }
+    return await measureOneInner(req);
+  } finally {
+    if (initScriptId) {
+      try {
+        await send("Page.removeScriptToEvaluateOnNewDocument", { identifier: initScriptId });
+      } catch (e) {}
+    }
+  }
+}
+
+async function measureOneInner(req) {
   const [vw, vh] = req.viewport;
   await send("Emulation.setDeviceMetricsOverride", {
     width: vw, height: vh, deviceScaleFactor: 1, mobile: false,
@@ -391,6 +488,12 @@ async function measureOne(req) {
     const u = new URL(req.url);
     await send("Storage.clearDataForOrigin",
                { origin: u.origin, storageTypes: "local_storage" });
+  } catch (e) {}
+  // ★ headless Chrome 默认可能把页面判为 hidden（`document.hidden=true`）⇒ 前端
+  //   「页面隐藏时暂停轮询」的逻辑会**误停在暂停态**，导致行为判据假红。
+  //   `Emulation.setFocusEmulationEnabled` 让页面处于 visible/focused（等价真实窗口）。
+  try {
+    await send("Emulation.setFocusEmulationEnabled", { enabled: true });
   } catch (e) {}
   await evaluate("window.__cdpEvents = []; window.__cdpHookedInst = null;");
   await send("Page.navigate", { url: req.url });
@@ -464,8 +567,50 @@ async function measureOne(req) {
     }
   }
   await evaluate(HOOK_JS);
+  // ---- V5：可注入的页面动作 / 等待 / 网络计数（判据用） ----
+  if (req.waitForJs) {
+    await waitFor(req.waitForJs, req.waitForJsTimeoutMs || 20000);
+  }
+  const snapNet = async () => {
+    try {
+      const raw = await evaluate("JSON.stringify(window.__netCalls || {})");
+      return JSON.parse(raw || "{}");
+    } catch (e) { return {}; }
+  };
+  let netBefore = null;
+  if (req.networkFromActions) { netBefore = await snapNet(); }
+  if (req.actionsJs) {
+    try {
+      await evaluate(req.actionsJs);
+    } catch (e) {
+      return { ok: false, error: "actions_js 抛错: " + String((e && e.message) || e).slice(0, 300) };
+    }
+  }
+  if (req.actionsWaitMs) await sleep(req.actionsWaitMs);
+
+  let netDelta = null;
+  if (req.networkWindowMs) {
+    const nb = netBefore || (await snapNet());
+    await sleep(req.networkWindowMs);
+    const na = await snapNet();
+    netDelta = {};
+    const keys = new Set([...Object.keys(nb), ...Object.keys(na)]);
+    for (const k of keys) netDelta[k] = (na[k] || 0) - (nb[k] || 0);
+  }
+
+  let extraEval = null;
+  if (req.extraEval) {
+    try {
+      extraEval = await evaluate(req.extraEval);
+    } catch (e) {
+      extraEval = { __err: String((e && e.message) || e).slice(0, 300) };
+    }
+  }
+
   const data = await evaluate(MEASURE_JS);
   data.legendClick = clickInfo;
+  data.netDelta = netDelta;
+  data.extraEval = extraEval;
   return { ok: true, data };
 }
 
@@ -549,6 +694,152 @@ def status(probe: bool = False) -> dict:
     return info
 
 
+def v5_init_js(
+    *,
+    spy: bool = True,
+    force_market_open: bool | None = None,
+    force_offline: bool | None = None,
+    force_cadence_ms: int | None = None,
+    poll_ms: int | None = None,
+    poll_max: int | None = None,
+    fake_analysis: dict | None = None,
+    fake_visibility: bool = False,
+) -> str:
+    """构造 ``Page.addScriptToEvaluateOnNewDocument`` 的注入脚本（**在页面任何脚本之前执行**）。
+
+    * ``spy=True``：包装 ``window.fetch`` 统计每个 path 的请求次数（``window.__netCalls``），
+      供「5.5s 内 /api/quote ≥1 次」这类**行为**判据使用（不用源码正则）。
+    * ``force_market_open``：伪造 ``/api/health`` 的 ``market_open``（客户端权威来自服务端，
+      判据要测「服务端说盘中 / 非盘中」两态）。
+    * ``poll_ms`` / ``poll_max``：把 ``ANALYSIS_POLL_MS`` / ``ANALYSIS_POLL_MAX`` **注入**到前端。
+      实现手法：在页面上定义 accessor property，顶层的 ``var X = 20000`` 赋值会被 setter 吞掉、
+      getter 返回注入值 —— 于是**不改产品代码**也能把轮询窗口压到毫秒级做假分析实验。
+      ★ 若实现改成了 ``let/const``（词法声明，不挂 window）则注入失效 ⇒
+      V5-6b 会以「常量不可注入」明确失败（这正是 spec 要求「必须可注入」的原因）。
+    * ``fake_analysis``：``{"code","readyAtTick","pollMs"}`` —— 拦截 ``/api/analysis``，
+      前 ``readyAtTick-1`` 次返回 pending（带 ``elapsed_s``），之后返回 ready。
+    * ``fake_visibility``：让 ``document.hidden/visibilityState`` 可被 ``window.__v5SetHidden()`` 控制
+      （V5-17 判据：页面隐藏时不得轮询）。
+    """
+    cfg = {
+        "spy": bool(spy),
+        "forceMarketOpen": force_market_open,
+        "forceOffline": force_offline,
+        "forceCadenceMs": force_cadence_ms,
+        "pollMs": poll_ms,
+        "pollMax": poll_max,
+        "fakeAnalysis": fake_analysis,
+        "fakeVisibility": bool(fake_visibility),
+    }
+    return r"""
+(() => {
+  const CFG = __CFG__;
+  window.__netCalls = window.__netCalls || {};
+  window.__v5 = window.__v5 || {};
+  window.__v5.fakeHidden = null;
+  const ORIG = window.fetch ? window.fetch.bind(window) : null;
+  const pathOf = (input) => {
+    try {
+      const u = (typeof input === "string") ? input : ((input && input.url) || "");
+      return new URL(u, location.href).pathname;
+    } catch (e) { return ""; }
+  };
+  const jsonResp = (obj) => new Response(JSON.stringify(obj),
+    { status: 200, headers: { "Content-Type": "application/json" } });
+  const nowMs = () => (window.performance && performance.now) ? performance.now() : Date.now();
+  if (ORIG && CFG.spy) {
+    window.fetch = function (input, init) {
+      const path = pathOf(input);
+      window.__netCalls[path] = (window.__netCalls[path] || 0) + 1;
+      if (CFG.fakeAnalysis && path === "/api/analysis") {
+        const st = window.__v5.fake = window.__v5.fake || { tick: 0, startedAt: nowMs() };
+        st.tick += 1;
+        const elapsed = Math.max(0, (nowMs() - st.startedAt) / 1000);
+        const ready = st.tick >= CFG.fakeAnalysis.readyAtTick;
+        const payload = ready
+          ? { ok: true, data: { state: "ready", code: CFG.fakeAnalysis.code, asof: "2026-10-09",
+              error: null, total: 55.5, signal: "watch",
+              factors: { C: 15, A: 63, N: 65, S: 35, L: 85, I: 60, M: 37 },
+              reasons: ["分析理由一：当季净利润同比上升", "分析理由二：营收环比改善",
+                        "分析理由三：行业景气度回升", "分析理由四：机构持仓增加",
+                        "分析理由五：价格突破年线", "分析理由六：相对强度领先",
+                        "分析理由七：估值处于中枢", "分析理由八：风险可控"],
+              risks: ["风险提示：换手率偏低"],
+              recommend: { action: "买入", side: "buy", entry: 10.5, stop_loss: 9.5,
+                           take_profit: 12.0, position_pct: 0.2, confidence: 0.7 },
+              elapsed_s: elapsed } }
+          : { ok: true, data: { state: "pending", code: CFG.fakeAnalysis.code, asof: null,
+              error: null, elapsed_s: elapsed } };
+        return Promise.resolve(jsonResp(payload));
+      }
+      if (CFG.forceMarketOpen !== null && CFG.forceMarketOpen !== undefined
+          && path === "/api/health") {
+        return ORIG(input, init).then((r) => r.clone().json()).then((j) => {
+          if (j && j.data) {
+            j.data.market_open = CFG.forceMarketOpen;
+            // ★ 同一读数派生 cadence（与服务端契约一致：盘中 5000 / 非盘中 0）
+            j.data.poll_cadence_ms = CFG.forceMarketOpen ? 5000 : 0;
+          }
+          return jsonResp(j);
+        });
+      }
+      if (CFG.forceOffline !== null && CFG.forceOffline !== undefined
+          && path === "/api/health") {
+        return ORIG(input, init).then((r) => r.clone().json()).then((j) => {
+          if (j && j.data) { j.data.offline = CFG.forceOffline; }
+          return jsonResp(j);
+        });
+      }
+      if (CFG.forceCadenceMs !== null && CFG.forceCadenceMs !== undefined
+          && path === "/api/health") {
+        return ORIG(input, init).then((r) => r.clone().json()).then((j) => {
+          if (j && j.data) {
+            j.data.market_open = true;
+            j.data.poll_cadence_ms = CFG.forceCadenceMs;
+          }
+          return jsonResp(j);
+        });
+      }
+      return ORIG(input, init);
+    };
+  }
+  // ★ 轮询参数注入：accessor 接管顶层 `var` 赋值
+  if (CFG.pollMs) {
+    try {
+      Object.defineProperty(window, "ANALYSIS_POLL_MS",
+        { configurable: true, get() { return CFG.pollMs; }, set() {} });
+    } catch (e) {}
+  }
+  if (CFG.pollMax) {
+    try {
+      Object.defineProperty(window, "ANALYSIS_POLL_MAX",
+        { configurable: true, get() { return CFG.pollMax; }, set() {} });
+    } catch (e) {}
+  }
+  // ★ PN_CONFIG：v5 前端读 `PN_CONFIG.analysisPollMs/Max`（优先于常量）—— 一并注入
+  if (CFG.pollMs || CFG.pollMax) {
+    window.PN_CONFIG = window.PN_CONFIG || {};
+    if (CFG.pollMs) { window.PN_CONFIG.analysisPollMs = CFG.pollMs; }
+    if (CFG.pollMax) { window.PN_CONFIG.analysisPollMax = CFG.pollMax; }
+  }
+  // ★ 可见性注入（V5-17）：document.hidden/visibilityState 由 __v5.fakeHidden 决定
+  if (CFG.fakeVisibility) {
+    try {
+      Object.defineProperty(Document.prototype, "hidden", {
+        configurable: true, get() { return window.__v5.fakeHidden === true; } });
+      Object.defineProperty(Document.prototype, "visibilityState", {
+        configurable: true,
+        get() { return window.__v5.fakeHidden === true ? "hidden" : "visible"; } });
+    } catch (e) {}
+    window.__v5SetHidden = function (hidden) {
+      window.__v5.fakeHidden = !!hidden;
+      try { document.dispatchEvent(new Event("visibilitychange")); } catch (e) {}
+    };
+  }
+})();
+""".replace("__CFG__", json.dumps(cfg, ensure_ascii=False))
+
+
 class _Session:
     """常驻 node 驱动 + Chrome（单例）。"""
 
@@ -615,6 +906,15 @@ class _Session:
             "settle_ms": "settleMs",
             "trigger_chart": "triggerChart",
             "timeout_ms": "timeoutMs",
+            # ---- V5 ----
+            "init_js": "initJs",
+            "actions_js": "actionsJs",
+            "actions_wait_ms": "actionsWaitMs",
+            "wait_for_js": "waitForJs",
+            "wait_for_js_timeout_ms": "waitForJsTimeoutMs",
+            "network_window_ms": "networkWindowMs",
+            "network_from_actions": "networkFromActions",
+            "extra_eval": "extraEval",
         }
         norm: dict = {}
         for key, value in opts.items():

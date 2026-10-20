@@ -49,7 +49,11 @@ SERIES_BASELINE = {0: 5, 1: 4, 2: 3, 3: 1, 4: 3, 5: 2}
 VIEWPORTS = [(1600, 900), (1920, 945), (1920, 1080), (2560, 1440)]
 
 #: 右列「折叠」判据针对的三张卡（按 summary 文案分类，见 _cdp 的 MEASURE_JS）
-FOLD_KEYS = ("score", "positions", "analysis")
+# ★ **V5 改写**：用户要求「打分和分析合并成一个模块」⇒ 原来的两张 `<details>`
+#   （`score-details` + `analysis-details`）合并成**一张**，`data-collapse="analysis"`。
+#   ⇒ 可折叠卡从 3 个变 1 个（`positions` 是普通 section，恒展开）。
+#   ★ 判据意图不变：「打分/分析默认折叠、持仓恒展开、折叠后摘要行有内容」。
+FOLD_KEYS = ("analysis",)
 
 #: 删掉的图例项（L3 的反向断言 —— 特别是重复的「微型K线」）
 GONE_LEGEND = ("微型K线", "BOLL上轨", "BOLL中轨", "BOLL下轨", "成交量", "成交额",
@@ -232,17 +236,25 @@ def _collapsed_flags(m: dict, tag: str) -> dict:
         value = flags.get(key)
         assert isinstance(value, bool), (
             f"{tag}：`collapsed[{key!r}]` = {value!r}（None 表示**没有找到对应的卡片**）"
-            f"—— 三张卡（打分/持仓/分析）必须都在右列。details={m.get('collapsedDetails')}"
+            f"—— ★ V5 起「打分 + 分析」合并成**一张**可折叠卡（`data-collapse=\"analysis\"`）"
+            f"，它必须在右列。details={m.get('collapsedDetails')}"
         )
     return flags
 
 
 def _check_collapsed_small(m: dict, tag: str) -> None:
+    """★ V5：小视口下**合并卡（打分+分析）默认折叠**、**持仓恒展开**、折叠后摘要行**有内容**。"""
     flags = _collapsed_flags(m, tag)
-    assert flags.get("score") is True, f"{tag}：打分应默认折叠"
-    assert flags.get("analysis") is True, f"{tag}：分析区应默认折叠"
+    assert flags.get("analysis") is True, (
+        f"{tag}：合并的「打分/CANSLIM 分析」卡应默认折叠（V5 起二者同卡，key = analysis）"
+    )
     assert flags.get("positions") is False, f"{tag}：持仓**不得**默认折叠"
-    assert (m.get("summaryText") or {}).get("score"), f"{tag}：折叠后摘要行没有关键值"
+    # ★ summaryText 的键与 `data-collapse` 一致 ⇒ 合并卡在 `analysis` 键下。
+    summary = (m.get("summaryText") or {}).get("analysis") or (m.get("summaryText") or {}).get("score")
+    assert summary, (
+        f"{tag}：折叠后摘要行没有关键值（V5 要求 summary 显示「总分 · 信号」，"
+        f"实际 summaryText={m.get('summaryText')!r}）"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -683,7 +695,9 @@ def test_v4_z2_canary_before_state_is_red():
         _check_legend(m)
     with pytest.raises(AssertionError, match="K 线面板"):
         _check_kline_height(m)
-    with pytest.raises(AssertionError, match="打分应默认折叠"):
+    # ★ V5：文案已从「打分应默认折叠」改成「合并的「打分/CANSLIM 分析」卡应默认折叠」
+    #   （因为两张卡合并成一张 ⇒ `data-collapse` 只剩 `analysis`）。canary 的 match 必须跟着走。
+    with pytest.raises(AssertionError, match="卡应默认折叠"):
         _check_collapsed_small(m, "1920x945")
 
 

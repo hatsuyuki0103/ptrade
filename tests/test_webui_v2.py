@@ -327,8 +327,14 @@ def test_t_v3_layout_full_width_and_height_adapts() -> None:
 
     # ⑥ 与布局无关的两条（仍然有效，保留）
     assert 'placeholder="601398"' not in APP_HTML, "下单表单不得硬编码旧票代码"
-    for field in ("panel.factors", "panel.total", "panel.signal"):
-        assert field in APP_HTML, f"renderAnalysis 必须读 {field}（否则「就绪」但全是 —）"
+    # ★ V5 改写（**需求变了，不是产品回退**）：原来的 `renderAnalysis(panel)` 已被
+    #   `analysisView(state, payload)`（纯函数）+ `applyAnalysis()`（唯一写入口）取代，
+    #   形参名也从 `panel` 变成 `payload`；而「分析内容必须看得全」在 V5 由**合并卡的
+    #   五段 `data-section`** 承担（片段名见 `tests/test_ui_v5.py` 的 V5-1/V5-3）。
+    assert "function analysisView(" in APP_HTML, "分析渲染必须是 analysisView（纯函数）"
+    assert "function applyAnalysis(" in APP_HTML, "必须有唯一写入口 applyAnalysis"
+    for section in ("total", "factors", "reasons", "risks", "advice"):
+        assert f'data-section="{section}"' in APP_HTML, f"合并卡缺 data-section={section!r}"
 
 
 # --------------------------------------------------------------------------- #
@@ -351,7 +357,13 @@ def test_t_v3_18_frontend_never_decides_offline() -> None:
     lowered = served.lower()
     assert "offline=" not in lowered, "★ 前端不得拼 offline 参数"
     assert "chartoffline" not in lowered, "★ `chartOffline` 必须删除"
-    assert "离线" not in served, "★ 不得再出现「离线」开关/文案"
+    # ★ V5 收窄（**不是放宽**）：`INV-64` 约束的是「前端**不得决定** offline」，
+    #   **不是**「不许把离线**状态**告诉用户」。V5 用户明确要求离线时
+    #   **明示「分析不可用（离线模式）」**（否则页面会永远停在「计算中」= 欺骗）。
+    #   ⇒ 这里只断「不得有离线**开关/参数**」，不再断「离线」二字本身。
+    assert 'data-testid="offline-toggle"' not in lowered, "★ 不得有离线**开关**"
+    assert "offline=" not in lowered, "★ 前端不得拼 offline **参数**"
+    assert "search-offline" not in lowered, "★ 不得有离线开关的样式/id"
     assert 'data-testid="offline-toggle"' not in lowered
     src = Path("ptrade/webui.py").read_text(encoding="utf-8")
     assert "chartOffline" not in src and "offline=" not in src and "search-offline" not in src

@@ -1039,13 +1039,30 @@ def test_g2_render_concurrency_is_bounded(cfg, monkeypatch) -> None:
 
 
 def test_pn_analysis_endpoint_is_small_json(cfg) -> None:
-    """`/api/analysis` 必须是**几百字节** JSON（Critic 反对「marker 驱动 1 MB 重渲染」）。"""
+    """`/api/analysis` 必须是**小 JSON**（Critic 反对「marker 驱动 1 MB 重渲染」）。
+
+    ★ v5（test-spec R2-7 / R3-I）：本用例原先**无条件**断言 `< 512 B`，而它只在 ``pending``
+    下成立 —— v5 的 ``ready`` 载荷要带 `recommend`（七字段）+ 8 条 reasons/risks，
+    天然 ~1.5 KB ⇒ 无条件上限会**间歇假红**。现按状态分档：
+
+    * ``pending``：仍应是「几百字节」⇒ 上限 **1024**（v5 新增 ``elapsed_s`` 是**用户可见的
+      进度**，不是泄漏，所以从 512 放宽到 1024 是**有理由的**而不是放水）；
+    * ``ready`` / ``failed``：分析正文本身就在载荷里 ⇒ 只守「远小于 1 MB 整页」的上限
+      （100 KB），**不是**「几百字节」的适用对象。
+    """
     status, payload = _call(_app(cfg), "GET", "/api/analysis", {"code": ["600519"]})
     assert status == 200 and payload["ok"] is True
-    assert set(payload["data"]) >= {"state", "error", "asof", "code"}, payload["data"]
-    assert payload["data"]["state"] in ("pending", "ready", "failed")
+    data = payload["data"]
+    assert set(data) >= {"state", "error", "asof", "code"}, data
+    assert data["state"] in ("pending", "ready", "failed")
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    assert len(raw) < 512, f"/api/analysis 返回了 {len(raw)} 字节（应为几百字节）"
+    if data["state"] == "pending":
+        assert len(raw) < 1024, f"pending 的 /api/analysis 返回了 {len(raw)} 字节（应为几百字节）"
+    else:
+        assert len(raw) < 100_000, (
+            f"/api/analysis（{data['state']}）返回 {len(raw)} 字节 —— 分析正文应留在小 JSON 里，"
+            "但绝不该接近 1 MB 整页（那说明又被塞了整页内容）"
+        )
 
 
 def test_pn_analysis_requires_code(cfg) -> None:
@@ -1176,18 +1193,34 @@ def test_pn_frontend_polling_is_bounded_and_never_reloads_the_page(tmp_path) -> 
     ready = result["ready"]
     assert ready["pollsThisRun"] >= 2, f"没有真的轮询：{ready}"
     assert ready["done"] is True and ready["timers"] == 0, "ready 之后**不得**再排下一次"
-    assert result["alwaysPending"]["pollsThisRun"] <= 6, (
-        f"一直 pending 时轮询了 {result['alwaysPending']['pollsThisRun']} 次（上限 6）"
-    )
-    assert result["max"] <= 6, result
-    assert result["totalBudgetMs"] <= 120_000, f"总时长预算 {result['totalBudgetMs']}ms > 2min"
-    assert result["failed"]["timers"] == 0, "failed 之后不得继续轮询"
-
+    # ★ **V5 改写（需求变更，不是放宽）**：`ANALYSIS_POLL_MAX` 6→60、`ANALYSIS_POLL_MS` 20000→10000。
+    #   原因：**实测 ready ≈132 秒**，旧窗口 `6×20000+1200 ≈ 101s` **覆盖不了** ⇒
+    #   用户永远看不到分析（＝用户报的「算完不刷新，要切股票再切回来」）。
+    #   ⇒ 上限**从源码读**（不写死），窗口改为「**必须覆盖真实耗时** 且 **仍然有界**」。
     from ptrade.webui import APP_HTML
+
+    m_max = re.search(r"ANALYSIS_POLL_MAX\s*=\s*(\d+)", APP_HTML)
+    m_ms = re.search(r"ANALYSIS_POLL_MS\s*=\s*(\d+)", APP_HTML)
+    assert m_max and m_ms, "前端必须仍有两个轮询常量（可注入但要有默认）"
+    poll_max, poll_ms = int(m_max.group(1)), int(m_ms.group(1))
+    assert result["alwaysPending"]["pollsThisRun"] <= poll_max, (
+        f"一直 pending 时轮询了 {result['alwaysPending']['pollsThisRun']} 次（上限 {poll_max}）"
+    )
+    assert result["max"] <= poll_max, result
+    # ★ 窗口必须**覆盖实测耗时**（132s 的 4 倍以上），但**仍然有界**（≤20 分钟）。
+    assert result["totalBudgetMs"] >= 600_000, (
+        f"轮询窗口 {result['totalBudgetMs']}ms < 600s ⇒ 覆盖不了实测 132s 的分析耗时"
+    )
+    assert result["totalBudgetMs"] <= 1_200_000, (
+        f"轮询窗口 {result['totalBudgetMs']}ms > 20min ⇒ 有界性失守"
+    )
+    assert result["failed"]["timers"] == 0, "failed 之后不得继续轮询"
 
     assert "refreshChartFrame" not in APP_HTML, "ready 后**不得**再重载图表（A5 已无框架可刷）"
     assert "CHART_FRAME" not in APP_HTML, "旧的框架句柄必须彻底删除"
-    assert "renderAnalysis(" in APP_HTML, "ready 时应渲染**小面板**（七因子）"
+    # ★ V5：`renderAnalysis` 已被 `analysisView`（纯函数）+ `applyAnalysis`（唯一写入口）取代。
+    assert "function applyAnalysis(" in APP_HTML, "ready 时必须经唯一写入口 applyAnalysis 渲染"
+    assert "function analysisView(" in APP_HTML, "analysisView 纯函数必须存在（可单测/无 DOM 依赖）"
     assert "setOption(" in APP_HTML, "图表必须通过同页 ECharts 更新"
     print(f"  [PN 前端] ready 路径 polls={ready['pollsThisRun']} 次（**零整页重载**）；"
           f"上限 {result['max']} 次 × {result['ms']}ms = {result['totalBudgetMs'] / 1000:.0f}s；"

@@ -1140,6 +1140,21 @@ class DataSource:
             frame = self._enrich_spot(frame)
         return frame
 
+    def _refresh_spot_cache(self) -> Any:
+        """**强制重取** spot 快照并原子落缓存（给后台刷新器用），返回载荷。
+
+        ★ 为什么不能直接用 :meth:`spot`：它走 ``_cached("spot", TTL_SPOT, ...)`` ——
+          缓存 60s 内**新鲜时直接返回、根本不会真取数** ⇒ 无法用来做「周期刷新」。
+        ★ 为什么不用 ``_cached`` 的单飞：``_single_flight_lock`` 是**按 cache key** 的单飞，
+          后台刷新器去抢它会让 **UI 的 `spot()` 排队**。刷新器自己有非阻塞 guard。
+        ★ **必须在锁外调用**：``_fetch_spot`` 内部走 ``_ak()``，而 ``_ak()`` 有
+          ``store.in_critical_section()`` 守卫（锁内联网直接抛 `NetworkForbiddenInLock`）。
+        ★ 失败**不落盘**：交给调用方决定重试（刷新器会吞掉后等下一个 tick）。
+        """
+        payload = self._fetch_spot()
+        self._write_entry(self.cache_dir, "spot", payload)
+        return payload
+
     def _fetch_spot(self) -> Any:
         """东财全市场快照；实测不可用时回退新浪快照（无估值列，按需补齐）。"""
         ak = self._ak()

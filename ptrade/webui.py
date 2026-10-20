@@ -88,6 +88,12 @@ tbody tr:hover{background:#1d2739;cursor:pointer}
 .toast-ok{border-left-color:var(--ok)}.toast-warn{border-left-color:var(--warn)}.toast-err{border-left-color:var(--err)}
 /* ★ V4：**删除**旧的高度上限（不是覆盖 —— 1440p 会卡在上限上 ⇒ 图变矮、ratio 必红）。
    现在高度由左列网格的第二行决定（`height:100%`），随视口真实伸缩。 */
+/* ★ V5（用户拍板）：自选池**卡内固定高度 + 内部滚，不分页**（十几二十只也能看全）。
+   行高用 CSS 变量 ⇒ 6.5 行可见，滚动条细、滚动不外溢（overscroll-behavior:contain）。 */
+:root{--wl-row-h:24px}
+#watchlist{height:calc(6.5 * var(--wl-row-h));max-height:calc(6.5 * var(--wl-row-h));overflow-y:auto;scrollbar-width:thin;overscroll-behavior:contain}
+#watchlist tr{min-height:var(--wl-row-h)}
+#watchlist th{position:sticky;top:0;background:var(--card);z-index:1}
 #chart-root{width:100%;height:100%;min-height:0;border:1px solid var(--line);border-radius:6px;background:#0d1524}
 .chart-period{cursor:pointer}
 .chart-period.active{outline:2px solid #58a6ff}
@@ -141,7 +147,11 @@ th,td{padding:2px 6px}
         <button id="period-weekly" class="chart-period" data-period="weekly">周线</button>
         <button id="period-monthly" class="chart-period" data-period="monthly">月线</button>
       </span>
-      <span id="analysis-state" data-testid="analysis-state" class="small muted">分析：未加载</span>
+      <span class="row">
+        <span id="last-updated" class="small muted">上次更新 —</span>
+        <span class="small muted" data-testid="quote-freshness-hint">行情每 60s 更新 · 界面每 5s 刷新</span>
+        <span id="analysis-state" data-testid="analysis-state" class="small muted">分析：未加载</span>
+      </span>
     </div>
     <div id="chart-root" data-testid="chart-root" class="chart-root">
       <div class="empty">在上方操作条输入代码后点「加载图表（日线）」</div>
@@ -215,16 +225,19 @@ th,td{padding:2px 6px}
       </form>
     </section>
 
-    <!-- ★ 打分：默认**折叠**（<details>）；summary 显示关键数字，展开才看明细 -->
-    <details class="card" id="score-details" data-collapse="score">
-      <summary>打分（七因子 C/A/N/S/L/I/M + 信号）<span id="score-summary" class="small">尚未打分</span></summary>
-      <div id="score-table"><span class="empty">尚未打分</span></div>
-    </details>
-
-    <!-- ★ CANSLIM 分析：从图表卡底部**搬到右列**并折叠成一行状态（左列放不下 180–260px） -->
+    <!-- ★ V5（用户拍板）：**打分 + CANSLIM 分析合并成一张卡**，顺序冻结：
+         总分 → 七因子 → 逐条解释 → 风险 → 建议。五段用 `data-section` 标识（判据按属性取，不靠文本猜）。
+         默认折叠（保 v4 的四档零滚动）。 -->
     <details class="card" id="analysis-details" data-collapse="analysis">
-      <summary>CANSLIM 分析（七因子）<span id="analysis-summary" class="small">未加载</span></summary>
-      <div id="analysis-panel" data-testid="analysis-panel" class="small"></div>
+      <summary>打分 / CANSLIM 分析（七因子） <span class="small" id="analysis-summary">未加载</span></summary>
+      <div data-testid="analysis-panel" id="analysis-panel" class="small">
+        <div data-section="total" class="empty">未加载</div>
+        <div data-section="factors"></div>
+        <div data-section="reasons"></div>
+        <div data-section="risks"></div>
+        <div data-section="advice" class="empty">未加载</div>
+        <div id="score-table"><span class="empty">尚未打分</span></div>
+      </div>
     </details>
   </section>
 </main>
@@ -494,37 +507,71 @@ function renderSearch(data) {
   }));
 }
 
+var WL_CODES = "";
 function renderWatchlist(data) {
   var rows = asRows(data && (data.items || data), ["items", "results", "rows"]);
-  if (!rows.length) { $("watchlist").innerHTML = '<div class="empty">自选池为空：用上方操作条输入代码后点「加自选」</div>'; return; }
-  $("watchlist").innerHTML = table(["代码 / 名称", "现价", "涨跌幅", "操作"], rows.map(function (r) {
+  var box = $("watchlist");
+  if (!box) { return; }
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">自选池为空：用上方操作条输入代码后点「加自选」</div>';
+    WL_CODES = "";
+    return;
+  }
+  var keepTop = box.scrollTop || 0;          /* ★ V5：整表重建时也要保住滚动位置 */
+  WL_CODES = rows.map(function (r) { return String(r.code); }).join(",");
+  box.innerHTML = table(["代码 / 名称", "现价", "涨跌幅", "操作"], rows.map(function (r) {
     var q = QUOTE_MAP[String(r.code)] || {};
     var last = (q.last === null || q.last === undefined) ? "—" : num(q.last, 2);
     var pct = (q.pct_chg === null || q.pct_chg === undefined) ? "—" : (num(q.pct_chg, 2) + "%");
     var pctCls = (q.pct_chg > 0) ? "warn-txt" : (q.pct_chg < 0 ? "down-txt" : "");
     var name = r.name || q.name || "";
-    return '<tr data-code="' + esc(r.code) + '"><td>' + esc(r.code) + " " + esc(name) + "</td><td>"
-      + last + '</td><td class="' + pctCls + '">' + pct + "</td><td>"
+    return '<tr data-code="' + esc(r.code) + '"><td>' + esc(r.code) + " " + esc(name) + "</td>"
+      + '<td data-role="last">' + last + "</td>"
+      + '<td data-role="pct" class="' + pctCls + '">' + pct + "</td><td>"
       + '<button type="button" data-act="chart" data-code="' + esc(r.code) + '">看图</button> '
       + '<button type="button" data-act="minute" data-code="' + esc(r.code) + '">分时</button> '
       + '<button type="button" class="danger" data-act="del" data-code="' + esc(r.code) + '">移除</button>'
       + "</td></tr>";
   }));
+  box.scrollTop = keepTop;
+}
+/* ★★ V5：5 秒刷新**只改数值单元格**（不整体重渲染 ⇒ 列表不跳回顶部、不打断用户操作） */
+function updateWatchlistQuotes() {
+  var box = $("watchlist");
+  if (!box || !box.querySelectorAll) { return; }
+  var trs = box.querySelectorAll("tr[data-code]");
+  for (var i = 0; i < trs.length; i++) {
+    var code = String(trs[i].getAttribute("data-code"));
+    var q = QUOTE_MAP[code] || {};
+    var lastTd = trs[i].querySelector('[data-role="last"]');
+    var pctTd = trs[i].querySelector('[data-role="pct"]');
+    if (lastTd) {
+      lastTd.textContent = (q.last === null || q.last === undefined) ? "—" : num(q.last, 2);
+    }
+    if (pctTd) {
+      pctTd.textContent = (q.pct_chg === null || q.pct_chg === undefined)
+        ? "—" : (num(q.pct_chg, 2) + "%");
+      pctTd.className = (q.pct_chg > 0) ? "warn-txt" : (q.pct_chg < 0 ? "down-txt" : "");
+    }
+  }
 }
 var QUOTE_MAP = {};
 /* ★ V3-A2：自选池每行要有 **名称 / 现价 / 涨跌幅** —— 一次 `/api/quote` 批量取（N 只票 1 次取数）。 */
 function refreshWatchlist() {
   return api(API.watchlist).then(function (b) {
     if (!b) { return; }
-    renderWatchlist(b.data);
-    var codes = asRows(b.data && b.data.items, ["items"]).map(function (r) { return String(r.code); });
+    var rows = asRows(b.data && (b.data.items || b.data), ["items", "results", "rows"]);
+    var codes = rows.map(function (r) { return String(r.code); });
+    var sameSet = (codes.join(",") === WL_CODES);     /* 首次/增删 ⇒ 集合变 ⇒ 整表重建 */
+    if (!sameSet) { renderWatchlist(b.data); }
     if (!codes.length) { return; }
     return api(API.quote + "?codes=" + encodeURIComponent(codes.join(","))).then(function (q) {
       QUOTE_MAP = {};
       asRows(q && q.data && q.data.items, ["items"]).forEach(function (item) {
         QUOTE_MAP[String(item.code)] = item;
       });
-      renderWatchlist(b.data);
+      /* ★★ V5：同一批代码的 5s 刷新 ⇒ **只改数值 td**（不重建 ⇒ scrollTop 不跳、点击不丢） */
+      if (sameSet) { updateWatchlistQuotes(); } else { renderWatchlist(b.data); }
     });
   });
 }
@@ -667,33 +714,99 @@ function setPeriodButtons(p) {
     btns[i].className = "chart-period" + (on ? " active" : "");
   }
 }
-function setAnalysisState(state, text) {
-  var el = $("analysis-state");
-  var summary = $("analysis-summary");
-  var label = text || ("分析：" + (state || "未加载"));
-  if (el) {
-    el.setAttribute("data-state", state || "idle");
-    el.textContent = label;
+/* ---- V5：分析卡（打分 + CANSLIM **合并**）--------------------------------------------
+ * ★★ **唯一写入口** `applyAnalysis(state, payload)`：一次同时写
+ *    `#analysis-state` / `#analysis-summary` / `#analysis-panel`（body）。
+ *    ⇒ 修掉 v4 的 **summary 双写** bug：`setAnalysisState` 写 summary、`renderAnalysis` 又写一次，
+ *      而 pending 只动 summary、不动 body ⇒「summary 说计算中、body 还是上一只股」。
+ * ★ `analysisView` 是**纯函数**（state+payload → {state, summary, bodyHtml}），判据可直接调用。
+ * ★ 四种空态：未加载 / 无数据 / **离线不可用**（绝不得显示「计算中」）/ 失败。
+ */
+function analysisView(state, payload) {
+  var p = payload || {};
+  var st = state || p.state || "idle";
+  var summary = "未加载";
+  var bodyHtml = '<div class="empty">未加载：在操作条输入代码后点「加载图表（日线）」</div>';
+  if (st === "pending") {
+    var secs = (p.elapsed_s === null || p.elapsed_s === undefined) ? "—" : p.elapsed_s;
+    summary = "已算 " + secs + " 秒…";
+    bodyHtml = '<div class="empty">分析计算中（已算 ' + esc(String(secs)) + ' 秒）…</div>';
+    if (p.give_up) {
+      summary = "仍在计算（已放弃自动刷新）";
+      bodyHtml = '<div class="empty">仍在后台计算… '
+        + '<button type="button" data-act="analysis-retry">仍在计算，点击重试</button></div>';
+    }
+  } else if (st === "offline") {
+    summary = "分析不可用（离线模式）";
+    bodyHtml = '<div class="empty warn-txt">分析不可用（离线模式）：七因子需要联网取数，'
+      + '离线模式下该功能被禁用 —— **不是**「计算中」，永远不会完成。</div>';
+  } else if (st === "no_data") {
+    summary = "该标的无数据";
+    bodyHtml = '<div class="empty">该标的无数据：缺少可用的行情/财务缓存，暂无法打分。</div>';
+  } else if (st === "minute") {
+    summary = "分时图无七因子分析";
+    bodyHtml = '<div class="empty">分时图不提供 CANSLIM 七因子分析（只对日线/周线/月线计算）。</div>';
+  } else if (st === "failed") {
+    summary = "分析失败：" + String(p.error || "未知原因");
+    bodyHtml = '<div class="empty err-txt">分析失败：' + esc(String(p.error || "未知原因")) + "</div>";
+  } else if (st === "ready") {
+    summary = "总分 " + num(p.total, 2) + " · " + String(p.signal || "—") + " · " + (p.reasons || []).length + " 条解释";
+    bodyHtml = analysisReadyHtml(p);
   }
-  /* ★ V4：分析区搬到右列并**折叠成一行状态** ⇒ 摘要行必须跟着状态走（否则折叠后什么也看不到） */
-  if (summary) { summary.textContent = label.replace(/^分析：/, ""); }
+  return {state: st, summary: summary, bodyHtml: bodyHtml};
 }
-function renderAnalysis(panel) {
-  var el = $("analysis-panel");
-  var summary = $("analysis-summary");
-  if (!el) { return; }
-  if (!panel) { el.innerHTML = ""; if (summary) { summary.textContent = "未加载"; } return; }
-  var f = panel.factors || {};
-  var cells = ["C", "A", "N", "S", "L", "I", "M"].map(function (k) {
-    var v = f[k];
-    return "<span>" + k + " <b>" + (v === undefined || v === null ? "—" : num(v, 0)) + "</b></span>";
-  }).join(" · ");
-  el.innerHTML = "<div>总分 <b>" + num(panel.total, 2) + "</b> · 信号 " + signalBadge(panel.signal)
-    + " · " + cells + "</div>";
-  if (summary) {
-    summary.textContent = "总分 " + num(panel.total, 2) + " · " + String(panel.signal || "—")
-      + " · " + cells.replace(/<[^>]+>/g, "");
+/* ★ 五段**冻结契约**：data-section = total / factors / reasons / risks / advice（判据按属性取） */
+function analysisSection(name, inner) { return '<div data-section="' + name + '">' + inner + "</div>"; }
+function analysisReadyHtml(p) {
+  var f = p.factors || {};
+  var adv = p.recommend || {};
+  var total = '<b>总分 ' + num(p.total, 2) + "</b> · 信号 " + signalBadge(p.signal)
+    + (adv.action ? " · 操作 <b>" + esc(String(adv.action)) + "</b>" : "")
+    + (adv.confidence === undefined || adv.confidence === null ? "" : " · 置信度 " + num(adv.confidence, 2));
+  var factors = FACTOR_KEYS.map(function (k) {
+    return '<span class="tag">' + k + " <b>"
+      + (f[k] === undefined || f[k] === null ? "—" : num(f[k], 0)) + "</b></span>";
+  }).join(" ");
+  var reasons = (p.reasons || []).map(function (t) { return "<li>" + esc(String(t)) + "</li>"; }).join("");
+  var risks = (p.risks || []).map(function (t) { return "<li>" + esc(String(t)) + "</li>"; }).join("");
+  /* ★ V5 修复：字段是 `position_pct`（0..1，来自 `strategy.recommend()`），不是 `position`。
+     `recommend` 是**透传自分析缓存**的（`webapp.analysis_status` 的 `data["recommend"]`），
+     所以**字段名必须与 `strategy.recommend()` 的返回键逐字对齐** —— 否则仓位永远显示 `—`（实测踩过）。 */
+  var positionText = null;
+  if (adv.position_pct !== undefined && adv.position_pct !== null) {
+    var pp = Number(adv.position_pct);
+    positionText = (isFinite(pp) && pp > 0) ? (Math.round(pp * 1000) / 10) + "%" : "—";
   }
+  var advicePairs = [["入场", adv.entry], ["止损", adv.stop_loss], ["止盈", adv.take_profit],
+                     ["仓位", positionText]];
+  var advice = advicePairs.map(function (pair) {
+    var v = pair[1];
+    return "<span class='k'>" + pair[0] + "</span>"
+      + (v === undefined || v === null || v === "" ? "—" : esc(String(v))) + " ";
+  }).join(" · ");
+  return analysisSection("total", total)
+    + analysisSection("factors", factors)
+    + analysisSection("reasons", "<h2>逐因子解释（" + (p.reasons || []).length + " 条）</h2>"
+      + (reasons ? "<ul>" + reasons + "</ul>" : '<div class="empty">无逐因子解释</div>'))
+    + analysisSection("risks", "<h2>风险</h2>"
+      + (risks ? "<ul>" + risks + "</ul>" : '<div class="empty">无风险提示</div>'))
+    + analysisSection("advice", "<h2>交易建议</h2><div>" + (advice || "—") + "</div>");
+}
+function applyAnalysis(state, payload) {
+  var view = analysisView(state, payload);
+  var st = $("analysis-state"), su = $("analysis-summary"), pan = $("analysis-panel");
+  if (st) { st.setAttribute("data-state", view.state); st.textContent = "分析：" + view.summary; }
+  if (su) { su.textContent = view.summary; }          /* ★ summary 的唯一写点 */
+  if (pan) { pan.innerHTML = view.bodyHtml; }         /* ★ body 的唯一写点 */
+  var retry = (pan && pan.querySelector) ? pan.querySelector('[data-act="analysis-retry"]') : null;
+  if (retry) {
+    retry.addEventListener("click", function () {
+      ANALYSIS.done = false; ANALYSIS.n = 0;
+      applyAnalysis("pending", {elapsed_s: null});
+      scheduleAnalysisPoll(ANALYSIS.code || currentCode());
+    });
+  }
+  return view;
 }
 function loadChart(period) {
   var code = currentCode();
@@ -711,10 +824,14 @@ function loadChart(period) {
     renderChart();
     if (p === "minute") {
       stopAnalysisPoll();
-      setAnalysisState("minute", "分时：无七因子分析");
-      renderAnalysis(null);
+      applyAnalysis("minute", {});
+    } else if (isOffline()) {
+      /* ★★ V5：`--offline` 下七因子永远算不完 ⇒ **必须**显示「分析不可用（离线模式）」，
+         绝不得显示「计算中…（后台）」（那是欺骗）；也不排轮询（省掉无意义的请求）。 */
+      stopAnalysisPoll();
+      applyAnalysis("offline", {});
     } else {
-      setAnalysisState("pending", "分析：计算中…（后台）");
+      applyAnalysis("pending", {elapsed_s: null});   /* ★ 同时刷新 summary + body（单一写入口） */
       scheduleAnalysisPoll(code);
     }
     toast("已加载 " + code + "（" + p + "）", "ok");
@@ -751,9 +868,26 @@ function refreshRisk() { return api(API.risk).then(function (b) { if (b) { rende
  * 基础节拍 POLL_TICK_MS 单位毫秒，∈ (0, 60) 秒。
  */
 var POLL_TICK_MS = 5000;
-var POLL_ACTIVE_MS = 15000;
-var POLL_PROBE_MS = 120000;
-var POLL = { marketOpen: null, delay: POLL_PROBE_MS, last: 0 };
+var POLL_ACTIVE_MS = 5000;      /* ★ V5：盘中 **5 秒**（用户要求「涨幅随时刷新」） */
+var POLL_PROBE_MS = 15000;      /* ★ V5：判不出时段时的探测频率 */
+var POLL = { marketOpen: null, delay: POLL_PROBE_MS, last: 0, cadence: null };
+var HEALTH = { offline: false, cadence: null };
+var PN_CONFIG = window.PN_CONFIG || {};
+function isOffline() { return HEALTH.offline === true; }
+/* ★★ V5：刷新节拍**只由服务端 `/api/health.poll_cadence_ms` 决定**
+ *   （盘中 5000 / 非盘中 0 / 判不出 15000）—— 前端**不许自己算时段**：
+ *   源码里没有任何本地交易时段常量，也没有本地时间取小时的家庭作坊（判据会 grep 源码）。
+ */
+function applyCadence(ms) {
+  if (typeof ms !== "number" || !isFinite(ms) || ms < 0) { return; }
+  HEALTH.cadence = ms;
+  POLL.cadence = ms;
+  if (POLL.marketOpen !== false) { POLL.delay = ms; }
+}
+function pollCadence() {
+  if (POLL.cadence !== null) { return POLL.cadence; }
+  return POLL.delay;
+}
 function pollDelayFor(marketOpen) {
   if (marketOpen === true) { return POLL_ACTIVE_MS; }
   if (marketOpen === false) { return 0; }
@@ -764,13 +898,31 @@ function applyMarketOpen(value) {
   POLL.marketOpen = (value === true || value === false) ? value : null;
   POLL.delay = pollDelayFor(POLL.marketOpen);
 }
+function markUpdated() {
+  /* ★ V5：「上次更新 HH:MM:SS」—— 用 `toLocaleTimeString` 取本地时刻（不含本地时段常量） */
+  var el = $("last-updated");
+  if (!el) { return; }
+  var now = new Date();
+  el.textContent = "上次更新 " + now.toLocaleTimeString("zh-CN", {hour12: false});
+}
 function autoRefreshTick() {
   if (!shouldPoll(POLL.marketOpen)) { return; }
+  if (document.hidden) { return; }                  /* ★ V5：页面隐藏时暂停（省流量/省电） */
+  var cadence = pollCadence();
+  if (cadence === 0) { return; }                    /* 服务端说 0 ⇒ 非盘中，不自动刷 */
   var now = Date.now();
-  if (POLL.last && (now - POLL.last) < POLL.delay) { return; }
+  if (POLL.last && (now - POLL.last) < cadence) { return; }
   POLL.last = now;
   refreshAll();
+  markUpdated();
 }
+/* ★ V5：切回页面**立即刷一次**（否则用户要等到下一个节拍） */
+document.addEventListener("visibilitychange", function () {
+  if (!document.hidden) {
+    POLL.last = 0;
+    autoRefreshTick();
+  }
+});
 function marketOpenLabel() {
   if (POLL.marketOpen === true) { return "盘中"; }
   if (POLL.marketOpen === false) { return "非盘中"; }
@@ -782,8 +934,12 @@ function marketOpenLabel() {
  * 为什么ready后只渲染小面板而不是整页：分析块不再嵌在整页里，重排整页是浪费。
  * ★ 只刷**一次**：拿到 ready 就 return，不再排下一次（不得形成循环）。
  */
-var ANALYSIS_POLL_MAX = 6;
-var ANALYSIS_POLL_MS = 20000;
+var ANALYSIS_POLL_MAX = 60;        /* ★ V5：60×10s = 600s 窗口 > 实测首算 132s */
+var ANALYSIS_POLL_MS = 10000;      /* ★ V5：10s 一次（原 20s 太钝，用户以为「不刷新」） */
+/* ★★ 两个常量**可注入**：判据用 `window.PN_CONFIG = {analysisPollMs:20, analysisPollMax:40}`
+ *   跑「假分析」而不必真等 100s。读不到就用默认值。 */
+function analysisPollMs() { return (PN_CONFIG && PN_CONFIG.analysisPollMs) || ANALYSIS_POLL_MS; }
+function analysisPollMax() { return (PN_CONFIG && PN_CONFIG.analysisPollMax) || ANALYSIS_POLL_MAX; }
 var ANALYSIS = { timer: null, n: 0, code: "", done: false };
 function stopAnalysisPoll() {
   if (ANALYSIS.timer) { clearTimeout(ANALYSIS.timer); ANALYSIS.timer = null; }
@@ -805,26 +961,52 @@ function analysisTick() {
     var st = d.state || "pending";
     if (st === "ready") {                    /* ★ 只渲染**一次**分析面板（不重排整页） */
       ANALYSIS.done = true;
-      setAnalysisState("ready", "分析：就绪（七因子）");
-      renderAnalysis(d);
+      applyAnalysis("ready", d);
       return;
     }
     if (st === "failed") {                   /* 失败：**带原因文案**告诉用户，不停在「永远在算」 */
       ANALYSIS.done = true;
-      setAnalysisState("failed", "分析失败：" + (d.error || "未知原因"));
+      applyAnalysis("failed", d);
       toast("分析失败：" + (d.error || "未知原因"), "warn");
       return;
     }
-    if (ANALYSIS.n < ANALYSIS_POLL_MAX) { ANALYSIS.timer = setTimeout(analysisTick, ANALYSIS_POLL_MS); }
-    else { setAnalysisState("pending", "分析：仍在后台计算（可稍后重新加载图表）"); }
+    if (st === "no_data") {                  /* ★ V5：无数据不是「计算中」 */
+      ANALYSIS.done = true;
+      applyAnalysis("no_data", d);
+      return;
+    }
+    if (isOffline()) {                       /* ★★ 离线：**永远算不完**，绝不得继续显示「计算中」 */
+      ANALYSIS.done = true;
+      applyAnalysis("offline", d);
+      return;
+    }
+    if (ANALYSIS.n < analysisPollMax()) {
+      applyAnalysis("pending", d);           /* ★ summary 与 body **同源**刷新（已算 N 秒） */
+      ANALYSIS.timer = setTimeout(analysisTick, analysisPollMs());
+    } else {
+      ANALYSIS.done = true;
+      applyAnalysis("pending", {elapsed_s: d.elapsed_s, give_up: true});   /* ★ 可点「点击重试」 */
+    }
   });
 }
 function refreshHealth() {
   return api(API.health).then(function (b) {
     var d = (b && b.data) || {};
-    if (b) { applyMarketOpen(d.market_open); }
+    if (b) {
+      applyMarketOpen(d.market_open);
+      /* ★★ V5：刷新节拍**消费服务端 cadence**（盘中 5000 / 非盘中 0 / 判不出 15000）——
+         前端不算时段；字段缺失时退回三态启发（仍不读本地时间）。 */
+      if (d.poll_cadence_ms === undefined || d.poll_cadence_ms === null) {
+        applyCadence(pollDelayFor(d.market_open));
+      } else {
+        applyCadence(d.poll_cadence_ms);
+      }
+      HEALTH.offline = (d.offline === true);
+      markUpdated();
+    }
     $("health").textContent = b
-      ? ("后端在线 · " + (d.root || "") + (d.trade_date ? " · 交易日 " + d.trade_date : "") + " · " + marketOpenLabel())
+      ? ("后端在线 · " + (d.root || "") + (d.trade_date ? " · 交易日 " + d.trade_date : "")
+         + " · " + marketOpenLabel() + (HEALTH.cadence === null ? "" : " · 界面每 " + (HEALTH.cadence / 1000) + "s 刷新"))
       : "后端不可达";
   });
 }

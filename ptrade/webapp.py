@@ -119,6 +119,19 @@ _ANALYSIS_SEM = threading.BoundedSemaphore(ANALYSIS_MAX_WORKERS)
 _RENDER_SEM = threading.BoundedSemaphore(RENDER_MAX_CONCURRENCY)
 _ANALYSIS_JOBS: dict[str, float] = {}          # job key → 启动时刻（``time.monotonic``）
 _ANALYSIS_JOBS_LOCK = threading.Lock()
+# ★ v5：**完成时也不删**的启动时刻表 —— 只服务于 `/api/analysis` 的 `elapsed_s`。
+#   为什么不能复用 `_ANALYSIS_JOBS`：它在 `_analysis_background` 的 `finally` 里被 pop
+#   （见该函数末尾），所以 `ready` 那一刻就查不到 ⇒ `elapsed_s` 永远 `null`（契约说谎）。
+#   语义：`pending` = 已算秒数（会变大）· `ready` = **本次耗时**（最终值）· `null` 仅「本进程从未起过 job」。
+_ANALYSIS_STARTED: dict[str, float] = {}
+_ANALYSIS_STARTED_LOCK = threading.Lock()
+
+# ★ v5：`/api/health` 下发给前端的**轮询节拍**（毫秒）。
+#   * 盘中：5s（用户拍板「5 秒」；UI 只读缓存 ≈62ms，不打上游 —— 上游由 spot 后台刷新器负责）
+#   * 非盘中：0（不轮询）
+#   * 判不出（交易日历不可用）：15s（低频探测；**不再**退到 120s，否则用户体感「不刷新」）
+POLL_CADENCE_MS: dict[bool | None, int] = {True: 5000, False: 0}
+POLL_CADENCE_UNKNOWN_MS = 15000
 
 #: G2：渲染并发已满时返回的**极小骨架页**（几百字节；不画图、不引图表库）
 _BUSY_HTML = (
@@ -363,14 +376,17 @@ def analysis_status(cfg, offline: bool, code: str, asof: str | None) -> dict:
         asof = discover_cached_asof(cfg, code)
     if not asof:
         _ensure_analysis_job(cfg, offline, code, None)
-        return {"state": "pending", "error": None, "asof": None, "code": code}
+        return {"state": "pending", "error": None, "asof": None, "code": code,
+                "elapsed_s": _elapsed_s(cfg, code)}   # ★ v5：进度（秒）
     cached = read_cached_analysis(cfg, code, asof)
     if cached is None:
         _ensure_analysis_job(cfg, offline, code, asof)
-        return {"state": "pending", "error": None, "asof": asof, "code": code}
+        return {"state": "pending", "error": None, "asof": asof, "code": code,
+                "elapsed_s": _elapsed_s(cfg, code)}   # ★ v5：进度（秒）
     state = chart_analysis_state(cached)
     error = None
-    data: dict = {"state": state, "error": None, "asof": asof, "code": code}
+    data: dict = {"state": state, "error": None, "asof": asof, "code": code,
+                  "elapsed_s": _elapsed_s(cfg, code)}
     if state == "ready":
         # ★ **V3 修复（Lead 真机发现）**：`ready` 时必须把**七因子**一起带上 ——
         #   否则前端显示「分析：就绪」但总分/因子全是 `—`（状态说就绪、数据是空的 = **契约说谎**）。
@@ -380,6 +396,12 @@ def analysis_status(cfg, offline: bool, code: str, asof: str | None) -> dict:
         data["signal"] = cached.get("signal")
         data["reasons"] = cached.get("reasons") or []
         data["risks"] = cached.get("risks") or []
+        # ★ v5（用户诉求「只给了分数没具体分析」的**真正修法**）：
+        #   `chart._score_analysis` 早把 `strategy.recommend()` 的结果写进了**分析缓存载荷**
+        #   （`payload["recommend"]`），CLI 的 HTML 页面也早已渲染它 —— **只有 Web 路径漏了**。
+        #   ⇒ 这里**只透传**，**绝不重算**（重算会与缓存出现两套口径，且 `test_perf_analysis`
+        #   的「缓存往返深等」会打红）。
+        data["recommend"] = cached.get("recommend")
     if state == "failed":
         # ★ G4：`failed` 的**原因文案必须非空**。载荷给了原因就**原样透出**（不覆盖生产路径的
         #   真实文案）；载荷没给（实测：注入的载荷只有 `ok=False`、没有 `error` 字段 →
@@ -399,6 +421,38 @@ def _job_key(cfg, code: str) -> str:
       落到**同一个**键，否则同一份工作会被起两次。
     """
     return f"analysis_job_{cfg.root}_{code}"
+
+
+def _note_ui_activity(app) -> None:
+    """★ v5：告诉 spot 后台刷新器「**有人在看**」—— 惰性门控的**唯一**输入。
+
+    刷新器只在最近 :data:`..spot_refresher.UI_ACTIVE_WINDOW_S` 秒内收到过本通知时才真的抓上游；
+    没人看的时候一次都不打（见 `spot_refresher` 模块 docstring）。
+    未启动（例如单测直接构造 `WebApp`、或 `create_server` 还没跑到那一步）时是 **no-op**，不得抛。
+    """
+    refresher = getattr(app, "spot_refresher", None)
+    if refresher is not None:
+        try:
+            refresher.note_ui_activity()
+        except Exception:                                  # noqa: BLE001 - 记账失败绝不能影响请求
+            pass
+
+
+def _elapsed_s(cfg, code: str) -> float | None:
+    """`/api/analysis` 的 `elapsed_s`：**分析开始至今的秒数**。
+
+    * `pending`：随着轮询**变大**（前端据此显示「已算 N 秒…」）；
+    * `ready`：**本次耗时**（最终值）—— 不是 `None`；
+    * `None`：**只在本进程从未为这只票起过 job** 时出现（例如刚重启）。
+    ★ 数据源是 `_ANALYSIS_STARTED`（**完成时不删**），不是 `_ANALYSIS_JOBS`
+      （后者在后台线程的 `finally` 里被 pop ⇒ 用它会在 `ready` 瞬间返回 `None`）。
+    """
+    key = _job_key(cfg, code)
+    with _ANALYSIS_STARTED_LOCK:
+        started = _ANALYSIS_STARTED.get(key)
+    if started is None:
+        return None
+    return round(time.monotonic() - started, 1)
 
 
 def _ensure_analysis_job(cfg, offline: bool, code: str, asof: str | None) -> bool:
@@ -422,6 +476,13 @@ def _ensure_analysis_job(cfg, offline: bool, code: str, asof: str | None) -> boo
         if not _ANALYSIS_SEM.acquire(blocking=False):
             return False                               # 超出并发上限 → 直接返 pending
         _ANALYSIS_JOBS[key] = now
+    # ★ v5：另记一份**不会被 finally 删掉**的起点（给 `elapsed_s` 用）。
+    #   ★ 刻意放在 `_ANALYSIS_JOBS_LOCK` 块**之外**，避免两把锁嵌套。
+    with _ANALYSIS_STARTED_LOCK:
+        _ANALYSIS_STARTED[key] = now
+        _stale_before = now - ANALYSIS_JOB_STALE_S
+        for _k in [k for k, t in _ANALYSIS_STARTED.items() if t < _stale_before]:
+            _ANALYSIS_STARTED.pop(_k, None)            # 有界：过期项顺手清掉
     threading.Thread(
         target=_analysis_background, args=(cfg, offline, code, asof),
         name=f"ptrade-analysis-{code}", daemon=True,
@@ -674,6 +735,10 @@ class WebApp:
         """
         addr = self.bound_address
         host, port = addr if addr else (DEFAULT_HOST, DEFAULT_PORT)
+        # ★ v5：算一次、两处用（`market_open` 与 `poll_cadence_ms` 必须来自**同一读数**，
+        #   否则两次 `datetime.now()` 跨过 9:30/15:00 边界时会出现自相矛盾的响应）。
+        _note_ui_activity(self)                            # ★ v5：惰性门控的输入之一
+        _market_open = _svc().market_open(datetime.now(), self._cached_trade_dates())
         consistency = _svc().consistency(self.cfg)
         diverged = consistency.get("diverged")
         if diverged is True:
@@ -691,7 +756,11 @@ class WebApp:
             # F5：盘中状态三态（True 盘中 / False 交易日但非盘中 / None 不可判定）。
             # **纯计算不取数**：日历只读缓存条目（`_cached_trade_dates`），
             # 前端据此决定自动刷新（True=轮询 / False=停 / None=固定低频探测）。
-            "market_open": _svc().market_open(datetime.now(), self._cached_trade_dates()),
+            "market_open": _market_open,
+            # ★ v5：**前端轮询节拍由服务端决定**（单一真源）。
+            #   为什么不让前端用本地时钟算交易时段：本地时钟**不懂 A 股节假日**
+            #   （节假日的工作日会被误判成盘中 ⇒ 空转轮询）。服务端 `market_open` 是**纯计算**。
+            "poll_cadence_ms": POLL_CADENCE_MS.get(_market_open, POLL_CADENCE_UNKNOWN_MS),
             # 扁平化顶层：便于脚本判定（不必知道 ledger_consistency 的内部结构）
             "diverged": diverged,
             "consistent": consistency.get("consistent"),
@@ -952,6 +1021,7 @@ class WebApp:
         codes = [c.strip() for c in str(raw).replace("，", ",").split(",") if c.strip()]
         if not codes:
             raise _ParamError("缺少必填参数 codes")
+        _note_ui_activity(self)                            # ★ v5：自选池 5s 轮询的主入口
         ds = self._ds()
         names: dict[str, str] = {}
         try:
@@ -1040,6 +1110,7 @@ class WebApp:
         from .store import StateLockTimeout
 
         if method == "GET":
+            _note_ui_activity(self)                        # ★ v5：自选池轮询（GET）是主入口
             items = watchlist.list_watchlist(self.cfg)
             return Response(200, _envelope("watchlist", {"items": items, "count": len(items)}))
         if method == "POST":
@@ -1625,6 +1696,36 @@ def create_server(
     #   `start_startup_maintenance` 只 `start()` 线程就返回 ⇒ **不阻塞端口就绪**（T-PN-12）。
     #   挂到 `app` 上是为了让判据能拿到它（线程计数器 + 「端口早于预热完成」）。
     app.startup_thread = start_startup_maintenance(cfg, offline)      # type: ignore[attr-defined]
+    # ★ v5：spot 快照的**周期刷新器**（用户诉求「盘中自选涨幅不刷新」的**真根因修法**）。
+    #   ★ 为什么是**独立**线程：`start_startup_maintenance` 是**一次性预热**（做完就退出），
+    #     而周期刷新必须**活过**它 ⇒ 生命周期不同。R11 的「不得两处各起一个线程」约束的是
+    #     **预热**（spot 与名称表别各起一个），不适用于这里 —— 别把它误判成违规。
+    #   ★ 在 `create_server` 里起的原因：① 拿得到 `app`（`should_run` 要用它的交易日历缓存）；
+    #     ② 端口已 `listen`（刷新器晚于端口就绪，不影响 `T-PN-12`「端口早于预热完成」）。
+    #   ★ 全部失败都不许影响启动（刷新器是**尽力而为**的后台服务）。
+    try:
+        from .spot_refresher import start_spot_refresher
+
+        def _spot_should_run() -> bool:
+            """★ 三重门控（服务端权威）：离线不刷 · 非盘中不刷 · 判不出交给惰性门控。"""
+            if offline:
+                return False                               # `--offline` 是硬闸（INV-10/35）
+            try:
+                mo = _svc().market_open(datetime.now(), app._cached_trade_dates())  # noqa: SLF001
+            except Exception:                              # noqa: BLE001 - 判不出就让它走惰性门控
+                return True
+            return mo is not False                         # True/None ⇒ 可以刷；False ⇒ 不刷
+
+        def _spot_refresh() -> None:
+            """★ **只在锁外**调 `_refresh_spot_cache()`（`_fetch_spot`→`_ak()` 有锁内禁网守卫）。"""
+            ds = _svc().make_ds(cfg, offline)
+            ds._refresh_spot_cache()                       # noqa: SLF001
+
+        app.spot_refresher = start_spot_refresher(          # type: ignore[attr-defined]
+            _spot_refresh, should_run=_spot_should_run
+        )
+    except Exception:                                      # noqa: BLE001 - 刷新器起不来也要能 serve
+        app.spot_refresher = None                          # type: ignore[attr-defined]
     return server
 
 
