@@ -38,10 +38,13 @@ __all__ = [
     "state_summary",
     "make_ds",
     "resolve_asof",
+    "viewer_asof",
     "consistency",
     "risk_from_core",
     "prewarm_for_write",
     "prewarm_before_write",
+    "live_trade_date",
+    "market_open",
     "MARGIN_SIDES",
 ]
 
@@ -374,3 +377,89 @@ def live_trade_date(ds: DataSource, code: str) -> str:
     """
     live = ds.live_quote(code)          # require_today=True：陈旧会抛 DataUnavailable
     return str(live.get("asof") or "") or ds.latest_trade_date()
+
+
+# --------------------------------------------------------------------------- #
+# 看盘路径的 asof（INV-52：含今天；与下单侧的 resolve_asof 分开）
+# --------------------------------------------------------------------------- #
+def viewer_asof(
+    ds: DataSource,
+    code: str,
+    asof: str | None = None,
+    notes: list[str] | None = None,
+) -> str:
+    """**看盘**路径的 asof（`INV-52` 的「含今天」那一半）。
+
+    与其他所有子命令不同，看盘必须看到**今天正在形成的那根 bar**（用户原话：
+    「交易日的时候看**我也是要看到最新的**」）—— 所以未显式给 asof 时走
+    :meth:`DataSource.chart_asof`（**数据驱动**：今天确有数据才是今天），
+    而**不是** :func:`resolve_asof`（那是**下单侧**的未来函数防护，15:30 前会回退到上一交易日）。
+
+    * 显式给 ``asof`` → 仍走 :func:`resolve_asof`（用户点名某天时要守未来函数防护）；
+    * 未给 → ``ds.chart_asof(code)``，并**在 notes 里写明原因**。
+
+    ★ **为什么抽出来（architect R4）**：这段策略原本**写了两遍**
+    （`cli.cmd_chart` 与 `webapp.api_chart`），而且**已经漂移** ——
+    CLI 那份会追加 ``notes`` 说明，web 那份不追加，于是同一个策略在两处的**可观测行为**不同。
+    抽到中立层后：调用方只负责取值，白名单也随之从「两个函数」收敛到「一个函数」。
+
+    ★ **诚实声明**：`getattr(ds, "chart_asof")` 与局部别名仍可绕过 `INV-52` 的 AST 白名单 ——
+    那是**防误用，不是防对抗**。
+    """
+    if asof:
+        return resolve_asof(ds, asof, notes)
+    day = ds.chart_asof(code)
+    if notes is not None:
+        notes.append(
+            "看盘路径：asof 取自「今天确有数据」的判定（非下单侧的 15:30 回退）"
+        )
+    return day
+
+
+# --------------------------------------------------------------------------- #
+# 是否处于盘中（webapp `/api/health` → 前端据此决定要不要轮询）
+# --------------------------------------------------------------------------- #
+
+_MORNING_OPEN = (9, 30)
+_MORNING_CLOSE = (11, 30)
+_AFTERNOON_OPEN = (13, 0)
+_AFTERNOON_CLOSE = (15, 0)
+
+
+def market_open(now: datetime, trade_dates: list[str] | None) -> bool | None:
+    """当前是否处于**盘中**。返回三态：``True`` / ``False`` / ``None``。
+
+    契约（PRD R3 §3 F5，`INV-52` 的同族；签名被 `tests/test_frozen_interfaces_v2.py` 钉住）：
+
+    * **纯计算** —— 只读传入的 ``trade_dates``，**绝不自取数**。
+      调用方（`webapp.api_health`）负责从**缓存条目**把日历读好传进来
+      （`DataSource._read_entry(cache_dir, "trade_dates")`，照 `search.py:156` 的跨模块直读先例），
+      **不得**调 `ds.trade_dates()`（那会在冷缓存时触发联网 → 健康端点变成取数端点）。
+    * **三态都要可观测**：
+      - ``True``  盘中（交易日 ∧ 09:30–11:30 ∨ 13:00–15:00）
+      - ``False`` 交易日历**覆盖今天**、但今天不是交易日或不在盘中
+      - ``None``  **不可判定**（日历为空 / 未覆盖今天）
+    * ★ **「日历可用」的定义 = 日历覆盖今天**（``now.date() <= max(trade_dates)``）。
+      不覆盖今天时**必须返回 `None`**，**不得**返回 `False`：
+      否则用户久未联网、日历停留在上月时，前端会「自信地」停掉轮询 →
+      **自动刷新静默失效**（用户第 6 项需求无声死掉）。
+    * 前端对 ``None`` 必须走**固定低频探测**，与 ``False`` 的「停」**不同** ——
+      否则这个区分永远验不到。
+
+    实测（2026-10-15，`data/cache/trade_dates.json` 8797 条，1990-12-19 ~ 2026-12-31）：
+    三态 10 个场景全部符合预期（见 `.omx/probe/w4_market_open_prototype.py`）。
+    """
+    if not trade_dates:
+        return None
+    try:
+        latest = max(str(d)[:10] for d in trade_dates)
+    except (TypeError, ValueError):
+        return None
+    if now.date().isoformat() > latest:
+        return None                      # 日历陈旧 → 不可判定（**不是** False）
+    if now.date().isoformat() not in {str(d)[:10] for d in trade_dates}:
+        return False                     # 日历覆盖今天，但今天不是交易日
+    hm = (now.hour, now.minute)
+    in_morning = _MORNING_OPEN <= hm <= _MORNING_CLOSE
+    in_afternoon = _AFTERNOON_OPEN <= hm <= _AFTERNOON_CLOSE
+    return bool(in_morning or in_afternoon)

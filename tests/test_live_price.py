@@ -339,6 +339,15 @@ def test_m1_guard_error_not_swallowed_by_live_quote_handler(live_root):
     修前：守卫错误被吞成 `200 / NO_PRICE` 业务拒单 ——
     INV-45 里「守卫错误 → 409」**永远不可能发生**（网页端会告诉用户
     「按实时价成交失败」，真实原因却是代码在锁内取数）。
+
+    ★ **setup 修正（2026-10-15，Lead 插桩定位）**：原先 `_fresh_spot(ds)` 把快照写成
+    **今天**，而 `td = latest_trade_asof(...)` 是**夹具最后交易日** → `quote(code, td)`
+    的新鲜快照分支不命中 → `offline=False` 下回落到 `daily()` → **试图联网** → 被
+    `conftest.block_real_network` 拦成**普通 `DataUnavailable`** → `_quote` 正常降级返回 None
+    → 在**抵达 live 分支之前**就以 `NO_MARKET_DATA` 拒单 → `live_quote` 被调用 **0 次**
+    → `pytest.raises(NetworkForbiddenInLock)` 因「根本没走到那里」而失败（DID NOT RAISE）。
+    → 现在把快照 asof **对齐到 `td`**，让前置行情检查命中快照（不联网）；并**断言
+    `live_quote` 真被调用过**，否则本用例会退化成空守卫（守卫错误根本没机会被吞）。
     """
     from ptrade.datasource import NetworkForbiddenInLock
     from ptrade.engine import Engine, OrderRequest
@@ -348,6 +357,8 @@ def test_m1_guard_error_not_swallowed_by_live_quote_handler(live_root):
     _fresh_spot(ds)
     ds = DataSource(cfg, offline=True)
     td = ds.latest_trade_asof(["000001"])
+    _write_spot(ds, td)                          # ★ 快照 asof 对齐 td → quote(td) 命中快照，不联网
+    ds = DataSource(cfg, offline=True)
     state = store.read_state(cfg)
     state.trade_date = ""
     eng = Engine(cfg, ds, state)
@@ -356,7 +367,10 @@ def test_m1_guard_error_not_swallowed_by_live_quote_handler(live_root):
     # roll_to 之后再切**在线**：这样守卫才会开火，且不会因为缺日历去联网
     ds.offline = False
 
+    calls = {"n": 0}
+
     def _boom(code, **kw):
+        calls["n"] += 1
         raise NetworkForbiddenInLock("注入：写锁临界区内禁止联网取数")
 
     ds.live_quote = _boom                            # type: ignore[method-assign]
@@ -365,8 +379,14 @@ def test_m1_guard_error_not_swallowed_by_live_quote_handler(live_root):
     with pytest.raises(NetworkForbiddenInLock):
         eng.submit(OrderRequest(code="000001", side="buy", qty=100,
                                 price="live", trade_date=td))
+    assert calls["n"] == 1, (
+        "live_quote 被调用 %d 次（期望 1）→ 本用例是**空守卫**：守卫错误根本没机会被吞。"
+        "多半是前置行情检查在抵达 live 分支前就拒单了（快照 asof / 停牌 / 窗口不匹配）。" % calls["n"]
+    )
+
     # 对照：普通 DataUnavailable 仍应降级成业务拒单（原有兜底不能被破坏）
     def _ordinary(code, **kw):
+        calls["n"] += 1
         raise DataUnavailable("普通：快照不可用")
 
     ds.live_quote = _ordinary                        # type: ignore[method-assign]
@@ -374,6 +394,7 @@ def test_m1_guard_error_not_swallowed_by_live_quote_handler(live_root):
     order = eng2.submit(OrderRequest(code="000001", side="buy", qty=100,
                                      price="live", trade_date=td))
     assert order.status == "rejected" and order.error_code == "NO_PRICE", order
+    assert calls["n"] == 2, "对照组也必须真的走到 live 分支（否则兜底断言是空的）"
 
 
 def test_m2_guard_error_not_swallowed_in_latest_trade_asof(live_root, monkeypatch):

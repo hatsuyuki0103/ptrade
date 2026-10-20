@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ptrade"
-version = "1.7.0"
+version = "1.8.0"
 description = "A 股 CANSLIM 模拟盘：T+1 / 融资融券 / 风控 / 七因子打分 / K 线图"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,7 +31,7 @@ packages = ["ptrade"]
 # `vendor/echarts.min.js` 是 chart 子命令的运行时必需资源：不显式声明的话
 # setuptools 只打包 *.py，装出来的 wheel 会在渲染图表时报「缺少 vendored ECharts」。
 [tool.setuptools.package-data]
-ptrade = ["vendor/*.js", "vendor/*.min.js", "*.html"]
+ptrade = ["vendor/*.js", "vendor/*.min.js", "*.html", "webui_assets/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

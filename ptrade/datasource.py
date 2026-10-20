@@ -17,10 +17,13 @@
 from __future__ import annotations
 
 import json
+import http.client
 import math
 import os
 import logging
+import threading
 import time
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
@@ -41,6 +44,100 @@ TTL_MARGIN = 24 * 3600
 TTL_FUNDAMENTAL = 24 * 3600
 TTL_HOLDERS = 24 * 3600
 TTL_INDEX = 6 * 3600
+#: F1(e) 分时：越短越好（盘中要能刷新），但同 URL 有 1s 限频 + 单飞兜底。
+TTL_INTRADAY = 60
+
+#: F1(b) 报告期充足性阈值（PRD 明令：不达标 → 不采用该期；全部不达标 → DataUnavailable）。
+REPORT_MIN_ROWS = 1000
+
+#: PN 补丁 R1/R10/R12：`chart_asof` **昂贵那一半**（`latest_trade_asof`，最多 30 次 daily 取数）
+#: 的结果缓存 TTL。**相位并进 key**（`pre_close`/`post_close`，以 15:30 为界）——
+#: 因为该结果在**收盘后会前进一格**，纯 TTL 复用会在收盘后给出「不含今天」的 asof（INV-52 违规）。
+#: ⚠️ **绝不缓存便宜那一半**（`spot_asof == today` 的判定）—— 那是用户核心需求所在。
+ASOF_CACHE_TTL = 6 * 3600
+
+#: INV-54：``industry_map`` 的行数下限（**必须**在生产调用点传下去）。
+#: 为什么是 100：全市场 5000+ 只票的行业映射，正常一期业绩报表有几千行；
+#: 实测未披露期 ``quarterly_report('20260930')`` 只有 **16 行** ——
+#: 那种残缺缓存一旦落盘就会**优先于**夹具并驻留 24h（TTL），
+#: 期间 ``industry_of()`` 全返回 `''` → **L 因子全量降级**（用户报的第 6 项）。
+#: ★ 与 :data:`ptrade.search.STOCK_LIST_MIN_ROWS` 对称。
+#: ⚠️ 教训：本常量曾只写在文档与 `_cached` 的 docstring 里，**生产调用点没传** →
+#: 有实现、有单测、有 INV，却是**空守卫**。现在由
+#: ``tests/test_datasource_v2.py::test_T_W1_5_production_call_sites_pass_min_rows`` 用 AST 钉住。
+INDUSTRY_MAP_MIN_ROWS = 100
+
+#: F1(a) 唯一裸 HTTP 出口的限频与重试上限（**不得**复制 akshare 的 1s/3s 退避节奏）。
+HTTP_MIN_INTERVAL = 1.0
+HTTP_MAX_RETRIES = 1
+
+#: F2b 锁外等待单飞结果的上限（锁内**绝不等待**）。
+SINGLE_FLIGHT_TIMEOUT = 60.0
+
+#: 查看路径**主查询**的日线窗口（自然日）——**单一真源**。
+#: ★ `chart.py` 的主查询（`daily(code, asof - VIEWER_DAILY_DAYS, asof)`）**必须 import 本常量**：
+#:   两边窗口一致才能共享同一个 `daily()` 缓存 key ⇒ 请求线程**真取数 2 → 1 次**
+#:   （ultraqa 线程级实测：50 天窗口 ⊂ 2 年窗口，同源数据取了两遍）。
+#: ★ **fail-safe（有意设计）**：两边窗口若**对不上**（例如图的 bars 配置改了），后果
+#:   **只是退回 2 次取数（变慢）**，**绝不会出错数据** —— key 不同 ⇒ 各自独立取数 ⇒ 语义不变。
+#: ⚠️ 「把 `daily()` 缓存键与窗口解耦（方案 b）」经推演**否决**：在当前调用顺序下（**窄窗口先来**），
+#:   解耦**不达成** 2→1（覆盖不到就得真取数 —— 这是纪律第 3 条）；且若为此给 `daily()` 加
+#:   「最小宽度」，多票路径（自选池 30 只）会从 ~1.29s/只 变成 ~4.75s/只 —— 明确不可接受。
+VIEWER_DAILY_DAYS = 730
+
+#: F1(e) 分时：主通道 = 新浪 ``scale=1``（单次覆盖 ~3 个交易日，实测 142/238/120 点）。
+#: ★ **完整日 = 238 点**（实测），所以**不能**用硬阈值 240 —— 那会永远判不出「完整」。
+#: 容差判据：``>= 0.95 × 240 = 228``（INV-55，**仅 1 分钟口径**）。
+INTRADAY_SCALE = 1
+INTRADAY_DATALEN = 500
+INTRADAY_MIN_POINTS = int(0.95 * 240)  # 228
+INTRADAY_URL = (
+    "https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_=/CN_MarketDataService.getKLineData"
+)
+
+
+def _parse_sina_jsonp(text: str) -> list[dict[str, Any]]:
+    """新浪 JSONP → bar 列表（``{day, open, high, low, close, volume, amount}``）。
+
+    ★ **解析失败必须抛 ``DataUnavailable``**（F1(e)）：空 points 与「用户投诉的形态」
+    一模一样 —— 画出来是空图，看不出是解析坏了还是真没数据。
+    """
+    start = text.find("(")
+    end = text.rfind(")")
+    if start < 0 or end <= start:
+        raise DataUnavailable(
+            f"分时 JSONP 解析失败：未找到 JSON 载荷（前 80 字：{text[:80]!r}）"
+        )
+    try:
+        data = json.loads(text[start + 1: end])
+    except ValueError as exc:
+        raise DataUnavailable(f"分时 JSONP 解析失败：{exc}") from exc
+    if not isinstance(data, list):
+        raise DataUnavailable(
+            f"分时载荷形状异常（应为 list，实为 {type(data).__name__}）"
+        )
+    return [row for row in data if isinstance(row, dict)]
+
+logger = logging.getLogger(__name__)
+
+#: F2b 同 key 单飞：``(cache_dir, key) → Lock``。跨 DataSource 实例共享，
+#: 因为并发请求通常各自 new 一个 DataSource，但写的是同一个缓存目录。
+_SINGLE_FLIGHT: dict[str, threading.Lock] = {}
+_SINGLE_FLIGHT_GUARD = threading.Lock()
+
+#: `_http_get` 的同 URL 最小间隔记账（单调时钟）。
+_HTTP_LAST_CALL: dict[str, float] = {}
+_HTTP_LAST_CALL_GUARD = threading.Lock()
+
+
+def _single_flight_lock(name: str) -> threading.Lock:
+    """取（或建）某个 key 的单飞锁。"""
+    with _SINGLE_FLIGHT_GUARD:
+        lock = _SINGLE_FLIGHT.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            _SINGLE_FLIGHT[name] = lock
+        return lock
 
 # ---- 统一列（契约） --------------------------------------------------------- #
 DAILY_COLUMNS = ["date", "open", "high", "low", "close", "volume", "amount", "pct_chg", "turnover"]
@@ -261,11 +358,33 @@ class DataSource:
         return None
 
     # ---- akshare 惰性加载（离线路径绝不 import） ---- #
-    def _ak(self) -> Any:
+    def _net_guard(self, kind: str = "akshare") -> None:
+        """**唯一网络守卫出口**（F1(a) / INV-53）。
+
+        ``offline=True`` → :class:`DataUnavailable`；锁内 → :class:`NetworkForbiddenInLock`
+        （**不吞**，由调用方上抛）。守卫实现只有这一处，``_ak()`` 与 ``_http_get()`` 共用。
+
+        ⚠️ **文案不得改**：``kind="akshare"`` 的两条消息被
+        ``tests/test_inlock_network_guard.py:101,115`` 与 ``tests/conftest.py:73-77`` **逐字**断言/复刻。
+        ``kind="http"`` 走自己的文案（分时走新浪，说「akshare」会误导排查）。
+        """
         if self.offline:
+            if kind == "akshare":
+                raise DataUnavailable(
+                    "offline=True：禁止访问 akshare（离线模式只读 data/cache 与 data/fixture）"
+                )
             raise DataUnavailable(
-                "offline=True：禁止访问 akshare（离线模式只读 data/cache 与 data/fixture）"
+                f"offline=True：禁止访问 {kind} 数据源"
+                "（离线模式只读 data/cache 与 data/fixture）"
             )
+        if store.in_critical_section():
+            raise NetworkForbiddenInLock(
+                "写锁临界区内禁止联网取数：请把该数据的获取移到锁外"
+                "（用 service.prewarm_before_write 预热），或改用 --offline。"
+                "详见 INTERFACES.md INV-42。"
+            )
+
+    def _ak(self) -> Any:
         # **锁内禁网**（架构评审 S-1 第 2 条；2026-10-13 落地）。
         #
         # BLOCK-1 的「锁外预热」只把**已知**的取数挪出了临界区；万一还有漏网的取数，
@@ -276,17 +395,64 @@ class DataSource:
         # 为什么判据是「进 _ak()」而不是「进 _cached()」：
         # `_cached` 的新鲜缓存命中 / 离线夹具读都**不需要** akshare，
         # 只有真正要联网时才走到这里 —— 所以这个位置既严格又不误伤缓存命中。
-        if store.in_critical_section():
-            raise NetworkForbiddenInLock(
-                "写锁临界区内禁止联网取数：请把该数据的获取移到锁外"
-                "（用 service.prewarm_before_write 预热），或改用 --offline。"
-                "详见 INTERFACES.md INV-42。"
-            )
+        self._net_guard("akshare")
         if self._ak_module is None:
             import akshare as ak  # 惰性导入
 
             self._ak_module = ak
         return self._ak_module
+
+    def _http_get(
+        self,
+        url: str,
+        *,
+        referer: "str | None" = None,
+        headers: "dict[str, str] | None" = None,
+        encoding: str = "utf-8",
+        timeout: float = 10.0,
+    ) -> str:
+        """**唯一的裸 HTTP 出口**（F1(a) / INV-53）。
+
+        * 内部先调 ``self._net_guard(kind="http")`` —— 离线/锁内都在这里 fail-fast；
+        * 同 URL 最小间隔 ``HTTP_MIN_INTERVAL``（1s），失败**不重试超过 1 次**；
+        * **不得**把 akshare 那条 1s/3s 退避节奏复制到这里（分时是直连源，节奏另算）。
+
+        返回**原始文本**（JSONP 的解析由调用方负责，解析失败必须抛
+        :class:`DataUnavailable`，不得产出空 points）。
+        """
+        self._net_guard("http")
+        request_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+        }
+        if referer:
+            request_headers["Referer"] = referer
+        if headers:
+            request_headers.update(headers)
+
+        last: Exception | None = None
+        for attempt in range(HTTP_MAX_RETRIES + 1):
+            with _HTTP_LAST_CALL_GUARD:
+                last_call = _HTTP_LAST_CALL.get(url, 0.0)
+                wait = HTTP_MIN_INTERVAL - (time.monotonic() - last_call)
+                if wait > 0:
+                    time.sleep(wait)
+                _HTTP_LAST_CALL[url] = time.monotonic()
+            try:
+                request = urllib.request.Request(url, headers=request_headers)
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return response.read().decode(encoding, errors="replace")
+            except NetworkForbiddenInLock:
+                raise
+            except (OSError, http.client.HTTPException) as exc:
+                # 只重试**网络层**错误。其它异常（含测试期 socket 拦截抛出的
+                # AssertionError）必须原样穿透 —— 否则「测试里偷偷联网」会被
+                # 包装成 DataUnavailable 而静默通过。
+                last = exc
+        raise DataUnavailable(f"HTTP 取数失败（{url}）：{last}") from last
 
     def _call(self, fn: Callable[..., Any], *args: Any, retries: int = 2, **kwargs: Any) -> Any:
         """节流 0.3s + 失败重试（退避 1s / 3s）。``retries=0`` 用于"快速失败再走兜底源"。"""
@@ -367,14 +533,50 @@ class DataSource:
                     pass
         return age > ttl
 
+    @staticmethod
+    def _payload_rows(payload: Any) -> Any:
+        """计数口径（PRD F2 逐字）：``payload["rows"] if isinstance(payload, dict) and "rows" in payload else payload``。"""
+        if isinstance(payload, dict) and "rows" in payload:
+            return payload["rows"]
+        return payload
+
+    @classmethod
+    def _row_count(cls, payload: Any) -> "int | None":
+        """行数；无法计数返回 ``None``（此时**不**按 min_rows 拒绝 —— 不猜）。"""
+        rows = cls._payload_rows(payload)
+        if isinstance(rows, (list, tuple)):
+            return len(rows)
+        if isinstance(rows, dict):
+            return len(rows)
+        return None
+
     def _cached(
         self,
         key: str,
         ttl: float,
         fetch: Callable[[], Any],
-        fixture_key: str | None = None,
+        fixture_key: "str | None" = None,
+        *,
+        min_rows: "int | None" = None,
     ) -> Any:
-        """新鲜缓存 → 联网 → 过期缓存兜底；离线：新鲜缓存 → 夹具 → 过期缓存 → 抛错。"""
+        """新鲜缓存 → 联网 → 过期缓存兜底；离线：新鲜缓存 → 夹具 → 过期缓存 → 抛错。
+
+        ⚠️ **``fixture_key` 必须留在第 4 位**（PRD F2 / Architect 第 2 轮 N-1）：
+        ``datasource.py:1145-1150`` 用关键字调用它，且
+        ``tests/test_asof_guard.py:410,442``（**位置传参**）与
+        ``tests/test_inlock_network_guard.py:340`` 复制了 4 参签名 —— 挪位即 ``TypeError``。
+
+        ``min_rows`` 为**关键字-only**（INV-54）：仅 ``industry_map``(100) / ``stock_list``(1000) 传值。
+        低于阈值 → **不写缓存** + ``logger.warning``；**返回值仍交给调用方**（不改变语义）。
+
+        **F2b 同 key 单飞**（``ThreadingHTTPServer`` + 前端自动刷新 → 同 key 会并发多路真联网）：
+        在**这里**做（而不是各取数函数里），否则 ``intraday`` 的直连路径不受保护。
+        与锁内禁网相容的规则（写死）：
+        * 锁内**绝不等待**：有人正在抓同一 key → **立即**抛 ``NetworkForbiddenInLock``（fail-fast）；
+          没人抓 → 照常走 ``fetch()``，而 ``fetch()`` 内部的 ``_net_guard`` 会在锁内抛错；
+        * 锁外才允许等待单飞结果（有上限 ``SINGLE_FLIGHT_TIMEOUT``）；
+        * 失败**不缓存负结果**（只在成功且达标时才 ``_write_entry``）。
+        """
         cached = self._read_entry(self.cache_dir, key)
         if cached is not None and not self._expired(cached, ttl):
             return cached["payload"]
@@ -388,19 +590,48 @@ class DataSource:
             raise DataUnavailable(
                 f"离线模式缺少数据 {key}（cache/fixture 均无；fixture 期望 {fixture_name}.json）"
             )
+        flight = _single_flight_lock(f"{os.path.abspath(self.cache_dir)}::{key}")
+        if store.in_critical_section():
+            # 锁内：**绝不等待、绝不联网**。拿不到单飞锁 = 有人正在为这个 key 联网 →
+            # 等它就是「持锁等网络」（INV-42 / BLOCK-1 要消灭的 fail-slow），故立即响亮报错。
+            if not flight.acquire(blocking=False):
+                raise NetworkForbiddenInLock(
+                    f"写锁临界区内禁止联网取数：缓存 {key} 正被其它请求抓取，"
+                    "锁内不得等待该结果。请改用 --offline，或先在锁外预热"
+                    "（service.prewarm_before_write）。详见 INTERFACES.md INV-42。"
+                )
+        else:
+            if not flight.acquire(timeout=SINGLE_FLIGHT_TIMEOUT):
+                raise DataUnavailable(
+                    f"等待同 key 取数超时（{SINGLE_FLIGHT_TIMEOUT:.0f}s）：{key}"
+                )
         try:
-            payload = fetch()
-        except NetworkForbiddenInLock:
-            # **守卫错误必须穿透**（INV-42）：若在这里回退过期缓存，「锁内禁网」就会被静默吞掉 ——
-            # 违规是否响亮会取决于缓存状态（有过期缓存就静默返回陈旧数据）。独立复核实测：同一锁内调用
-            # 有过期缓存 → 静默返回 5572 行陈旧数据、无异常；无缓存 → 才响亮报错。
-            raise
-        except Exception as exc:  # noqa: BLE001
-            if cached is not None:
-                return cached["payload"]
-            raise DataUnavailable(str(exc)) from exc
-        self._write_entry(self.cache_dir, key, payload)
-        return payload
+            # 双检：等锁期间别人可能已经把缓存填好了（避免重复联网）
+            again = self._read_entry(self.cache_dir, key)
+            if again is not None and not self._expired(again, ttl):
+                return again["payload"]
+            try:
+                payload = fetch()
+            except NetworkForbiddenInLock:
+                # **守卫错误必须穿透**（INV-42）：若在这里回退过期缓存，「锁内禁网」就会被静默吞掉 ——
+                # 违规是否响亮会取决于缓存状态（有过期缓存就静默返回陈旧数据）。独立复核实测：同一锁内调用
+                # 有过期缓存 → 静默返回 5572 行陈旧数据、无异常；无缓存 → 才响亮报错。
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if cached is not None:
+                    return cached["payload"]
+                raise DataUnavailable(str(exc)) from exc
+            count = self._row_count(payload)
+            if min_rows is not None and count is not None and count < min_rows:
+                # INV-54：低于阈值**不落盘**（防止「16 行的 industry_map」这类残缺缓存长期驻留）
+                logger.warning(
+                    "缓存写入被拒：key=%s rows=%s < min_rows=%s（不落盘）", key, count, min_rows
+                )
+            else:
+                self._write_entry(self.cache_dir, key, payload)
+            return payload
+        finally:
+            flight.release()
 
     @staticmethod
     def _frame(payload: Any, columns: list[str]) -> pd.DataFrame:
@@ -492,9 +723,24 @@ class DataSource:
         return latest
 
     def latest_trade_asof(
-        self, probe_codes: "list[str] | None" = None, *, max_back: int = 30
+        self,
+        probe_codes: "list[str] | None" = None,
+        *,
+        max_back: int = 30,
+        allow_fetch: bool = True,
     ) -> str:
         """最近一个**既有交易日历、又有实际行情**的交易日（asof 的安全默认值）。
+
+        ``allow_fetch``（**第二次全市场入口的修复**，关键字-only，默认**保持现行为**）：
+        第一段判据 ``_has_quote`` 走 :meth:`quote` —— 而 `quote()` 在**冷 spot 缓存**时会回退到
+        ``spot([code])`` ⇒ **抓全市场快照 59 页**（ultraqa 实测 ≈80s）。查看路径
+        （:meth:`chart_asof`）用 ``allow_fetch=False`` **跳过第一段**，直接用第二段的
+        ``_has_window``（**按票**取日线窗口，cache-only，不是全市场）——
+        于是查看路径的 ``spot()`` 调用次数为 **0**（修前实测 **6** 次）。
+        ★ 下单/引擎路径（``service.resolve_asof``）保持缺省 ``True``，**语义一行不动**。
+        ★ ``chart_asof`` 对 ``allow_fetch=True/False`` 必须返回**同一个 asof**
+        （由 ``test_T_PN_13_viewer_asof_is_unchanged_and_fetches_nothing`` 的等价性断言钉住：
+          两端都不命中时都会退到同一处兜底）。
 
         **为什么需要它**（独立复核第二轮 N4，且这是**生产**缺陷不只是测试问题）：
         ``latest_trade_date()`` 只读交易日历 —— 日历可以覆盖到未来（sina 日历到 2026-12-31），
@@ -536,7 +782,12 @@ class DataSource:
         probes: list[str] = [str(c).zfill(6) for c in (probe_codes or [])]
         if not probes:
             try:
-                frame = self.spot()
+                # ★ `allow_fetch=False`（查看路径）时**不得**调 `spot()`（会抓全市场 59 页）：
+                #   改用 cache-only 的 `_spot_frame_raw()`（拿得到就用、拿不到就当没有探针）。
+                if allow_fetch:
+                    frame = self.spot()
+                else:
+                    frame, _ = self._spot_frame_raw()
                 if frame is not None and len(frame) > 0:
                     for _, row in frame.iterrows():
                         last = row.get("last")
@@ -565,13 +816,78 @@ class DataSource:
         #     `quote(000001, 2026-10-12).suspended=True` 而窗口里其实有数据。
         # 第一版只用「窗口非空」判据，于是返回了 2026-10-12（本身无数据）→ 缺省下单全被判停牌。
         # 所以先按「那一天本身有行情」找，找不到再退到「窗口非空」。
+        def _has_same_day_bar(code: str, d: str) -> bool:
+            """cache-only 的「**那一天本身有行情**」判据（**按票**取日线，不碰全市场快照）。
+
+            语义等价于 :meth:`quote` 日线推导里的 ``same_day`` 那一步（再要求有成交量）：
+            即「该票在 ``d`` 有**当天**的 bar 且有量」。查看路径用它替代 ``quote()``
+            —— 后者在冷 spot 缓存时会回退到 ``spot([code])``（全市场 59 页）。
+            """
+            try:
+                frame = self.daily(code, d, d)
+            except NetworkForbiddenInLock:
+                raise  # 守卫错误上抛，不得当「该探针不行」吞掉
+            except Exception:  # noqa: BLE001 - 该票该日取不到
+                return False
+            if frame is None or len(frame) == 0:
+                return False
+            last = frame.iloc[-1]
+            if str(last["date"])[:10] != d:
+                return False
+            volume = last.get("volume")
+            return not (volume is not None and not pd.isna(volume) and float(volume) <= 0)
+
         def _has_quote(code: str, d: str) -> bool:
+            if not allow_fetch:
+                # ★ 查看路径：**不得**走 quote()（冷 spot 缓存 ⇒ 回退 spot([c]) ⇒ 全市场 59 页）。
+                #   改用按票、cache-only 的等价判据（见 _has_same_day_bar 的语义说明）。
+                return _has_same_day_bar(code, d)
             try:
                 return not self.quote(code, d)["suspended"]
             except NetworkForbiddenInLock:
                 raise
             except Exception:  # noqa: BLE001 - 该票该日取不到
                 return False
+
+        def _latest_bar_day() -> "str | None":
+            """**1 次**按票日线取数：窗口内**最近一个**「当天有 bar 且有量」的交易日。
+
+            ★ 为什么需要它（Lead 实测的真实冷启动 **12.06s** 的来源）：
+            查看路径上逐日调 `_has_same_day_bar`（`daily(code, d, d)`）虽然不抓全市场，
+            但**冷缓存下每天都是一次 akshare 取数**（最多 `max_back`=6 次 ≈ **12s**）。
+            而 `chart_payload` **本来就要取这只票的日线** —— 那 6 次里 5 次是白花的。
+            这里改成**取一次覆盖窗口的帧**，从帧里挑最近的那一天：
+            取数次数 6 → **1**，且与 `chart_payload` 的 `daily` **共享同一个缓存 key** ✓。
+
+            语义与逐日探测**等价**：都是「该票在某交易日 d 有**当天**的 bar 且有量」；
+            只是从「一天一次地问」变成「一次问一段、自己在帧里找」。
+
+            ★ **窗口必须与图的主查询一致**（都用 :data:`VIEWER_DAILY_DAYS`）——
+            这样图随后请求同一窗口时**命中同一个 `daily()` 缓存 key** ⇒ 请求线程真取数 2 → 1 次。
+            ★ **fail-safe**：两边若对不上，**只是退回 2 次取数**（变慢），**不会出错数据**。
+            """
+            start = self._offset(base, -VIEWER_DAILY_DAYS)
+            for code in probes:
+                try:
+                    frame = self.daily(code, start, base)
+                except NetworkForbiddenInLock:
+                    raise  # 守卫错误上抛
+                except Exception:  # noqa: BLE001 - 该票取不到
+                    continue
+                if frame is None or len(frame) == 0:
+                    continue
+                days: list[str] = []
+                for row in frame.to_dict("records"):
+                    d = str(row.get("date"))[:10]
+                    if not d or d > base:
+                        continue
+                    volume = row.get("volume")
+                    if volume is not None and not pd.isna(volume) and float(volume) <= 0:
+                        continue
+                    days.append(d)
+                if days:
+                    return max(days)
+            return None
 
         def _has_window(code: str, d: str) -> bool:
             try:
@@ -583,11 +899,24 @@ class DataSource:
                 return False
 
         # 第一段：那一天本身有行情（优先，因为它同时满足两个消费者）
-        day = base
-        for _ in range(max(1, int(max_back))):
-            if any(_has_quote(code, day) for code in probes):
-                return day
-            day = self.prev_trade_date(day)
+        #
+        # ★ allow_fetch=False（**查看路径**）时 `_has_quote` 内部换成 `_has_same_day_bar`
+        #   （按票、cache-only）—— **语义不变**，只是不再触发全市场快照。
+        #   ⚠️ 不要改成「整段跳过、直接用第二段的 `_has_window`」：实测那样会把 asof
+        #      从 `2026-10-09`（当天有 bar）漂到 `2026-10-16`（只是窗口非空）——
+        #      **换了语义**（§`_has_window` 的注释也写了它会返回「本身没有行情」的日期）。
+        if allow_fetch:
+            day = base
+            for _ in range(max(1, int(max_back))):
+                if any(_has_quote(code, day) for code in probes):
+                    return day
+                day = self.prev_trade_date(day)
+        else:
+            # ★ 查看路径：**1 次**取数替代最多 max_back 次逐日探测（实测 6 次 ≈12s → 1 次）。
+            #   语义不变（见 `_latest_bar_day` 的说明）；找不到再退到第二段（与默认路径同款兜底）。
+            found = _latest_bar_day()
+            if found:
+                return found
 
         # 第二段：退而求其次，只要回看窗口非空。
         #
@@ -960,10 +1289,66 @@ class DataSource:
         return {"quote": quote, "source": "live", "asof": asof,
                 "fetched_at": fetched_at, "stale": stale}
 
-    def quote(self, code: str, asof: str) -> dict:
+    def _cached_daily_frame(self, code: str, asof: str) -> pd.DataFrame:
+        """**cache-only** 的日线帧（截至 ``asof``）—— **绝不取数**（查看路径专用）。
+
+        为什么需要（Lead 实测的契约违反）：`quote(..., allow_fetch=False)` 原先**无条件**取
+        一次 60 天日线（``daily(c, asof-60d, asof)``）—— 那一处漏在 ``allow_fetch`` 判断
+        **之外**，与 `T-PN-13` 刚立的「查看路径不得触发多余取数」契约冲突。
+
+        做法：从 ``data/cache`` 里**已有的** ``daily_{code}_qfq_*`` 条目中挑一条**最长**的，
+        按日期切到 ``asof`` 为止。找不到 → **空帧**（调用方按「快照不可得」降级，仍不取数）。
+        只认 ``qfq`` 前缀：与 :meth:`daily` 的默认复权口径一致（混入不复权会让价格口径漂移）。
+        """
+        c = _norm_code(code)
+        best: list[dict[str, Any]] = []
+
+        def _consider(payload: Any) -> None:
+            nonlocal best
+            frame = self._frame(payload, DAILY_COLUMNS)
+            if frame is None or len(frame) == 0:
+                return
+            rows = [r for r in frame.to_dict("records") if str(r.get("date"))[:10] <= asof]
+            if len(rows) > len(best):
+                best = rows
+
+        # ① **缓存条目**（在线路径主用：图刚取过的宽窗口就在这儿）
+        try:
+            names = os.listdir(self.cache_dir)
+        except OSError:
+            names = []
+        for name in names:
+            if not (name.startswith(f"daily_{c}_qfq_") and name.endswith(".json")):
+                continue
+            entry = self._read_entry(self.cache_dir, name[: -len(".json")])
+            if isinstance(entry, dict):
+                _consider(entry.get("payload"))
+        # ② **夹具**（offline 夹具即数据源；`daily()` 的 offline 分支同口径）
+        #    ★ 少了这一步，夹具环境下 `allow_fetch=False` 会退化成「快照不可得」，
+        #      与 `allow_fetch=True` 的返回**不一致** = 换语义（实测抓到过）。
+        fixture = self._read_fixture(f"daily_{c}")
+        if isinstance(fixture, dict):
+            _consider(fixture.get("payload"))
+
+        if not best:
+            return pd.DataFrame(columns=DAILY_COLUMNS)
+        best.sort(key=lambda r: str(r.get("date"))[:10])
+        return pd.DataFrame(best, columns=DAILY_COLUMNS)
+
+    def quote(self, code: str, asof: str, *, allow_fetch: bool = True) -> dict:
         """单票快照：``{"code","name","last","prev_close","limit_up","limit_down","suspended"}``。
 
         优先用快照（asof 与快照日期一致）；否则由日线推导（历史 asof 也能工作）。
+
+        ``allow_fetch``（**ultraqa FAIL 的修复**，关键字-only，默认**保持现行为**）：
+
+        * ``True``（默认）＝下单/引擎路径，**一行不动**；
+        * ``False``＝**查看路径**（`chart.py` 的 `chart_payload`）：走到「日线推导」那条回退时
+          **不得**调 :meth:`spot` —— 那会抓**全市场 59 页快照**（ultraqa 实测 ≈**80.3–83.4s**，
+          却只是为了**一个** code 的名称）。降级：名称改用 **cache-only** 的 :meth:`name_of`
+          （取不到就是 code 本身）。
+          ★ **不改任何数字**：冷缓存时本来就没有今天的快照 ⇒ :meth:`with_today_bar` 也会
+          early-return（不加 bar、不改价）。
         """
         c = _norm_code(code)
         asof = str(asof)[:10]
@@ -992,14 +1377,30 @@ class DataSource:
                     "suspended": suspended,
                 }
         # 日线推导（历史 asof / 快照不可用）
-        window = self.daily(c, self._offset(asof, -60), asof)
+        # ★ allow_fetch=False（查看路径）：**不得**取数 —— 用**已有缓存**切片；
+        #   没有可用的缓存条目 → 空帧 → 走下面的「快照不可得」降级（仍然不取数）。
+        #   （Lead 实测的契约违反：这一行原先在 `allow_fetch` 判断**之外**，白花一次 60 天日线。）
+        if allow_fetch:
+            window = self.daily(c, self._offset(asof, -60), asof)
+        else:
+            window = self._cached_daily_frame(c, asof)
         name = c
-        try:
-            name = str(self.spot([c]).iloc[0]["name"])
-        except NetworkForbiddenInLock:
-            raise  # 守卫错误：上抛，**不得**把名称静默退回代码
-        except Exception:  # noqa: BLE001 - 名称非必需
-            pass
+        if allow_fetch:
+            try:
+                name = str(self.spot([c]).iloc[0]["name"])
+            except NetworkForbiddenInLock:
+                raise  # 守卫错误：上抛，**不得**把名称静默退回代码
+            except Exception:  # noqa: BLE001 - 名称非必需
+                pass
+        else:
+            # ★ 查看路径（allow_fetch=False）：绝不为了一个名称去抓**全市场 59 页**。
+            # 用 cache-only 的 name_of（INV-61 语义：取不到回退 code）。
+            try:
+                name = self.name_of(c)
+            except NetworkForbiddenInLock:
+                raise
+            except Exception:  # noqa: BLE001 - 名称非必需
+                name = c
         if len(window) == 0:
             pct = price_limit_pct(c, name)
             return {
@@ -1328,7 +1729,12 @@ class DataSource:
 
     # ---- 行业 ---- #
     def _industry_map(self) -> dict[str, str]:
-        payload = self._cached("industry_map", TTL_FUNDAMENTAL, self._fetch_industry_map)
+        payload = self._cached(
+            "industry_map",
+            TTL_FUNDAMENTAL,
+            self._fetch_industry_map,
+            min_rows=INDUSTRY_MAP_MIN_ROWS,   # INV-54：生产调用点必须真的传（G008 空守卫事故）
+        )
         if isinstance(payload, dict) and "rows" in payload:
             payload = payload["rows"]
         if isinstance(payload, list):
@@ -1337,7 +1743,7 @@ class DataSource:
 
     def _fetch_industry_map(self) -> list[dict[str, Any]]:
         """行业归属取自业绩报表的「所处行业」（单次全市场调用，口径统一）。"""
-        period = self._latest_report_period()
+        period = self.latest_report_period()   # F1(b)：数据驱动（≥1000 行），不再按日期回推
         frame = self.quarterly_report(period)
         if len(frame) == 0:
             return []
@@ -1347,17 +1753,321 @@ class DataSource:
         ]
         return rows
 
-    def _latest_report_period(self) -> str:
-        """最近一个已披露的报告期（按今天回推，避开未披露期）。"""
+    @staticmethod
+    def report_period_candidates() -> list[str]:
+        """候选报告期（降序，只含今天之前已到期的期）。"""
         today = date.today()
-        candidates = []
+        out: list[str] = []
         for year in (today.year, today.year - 1):
-            for month_day, _ in (("1231", 4), ("0930", 10), ("0630", 8), ("0331", 4)):
-                candidates.append(f"{year}{month_day}")
-        for period in sorted(candidates, reverse=True):
-            if period <= today.strftime("%Y%m%d"):
+            for month_day in ("1231", "0930", "0630", "0331"):
+                out.append(f"{year}{month_day}")
+        limit = today.strftime("%Y%m%d")
+        return sorted((p for p in out if p <= limit), reverse=True)
+
+    def latest_report_period(self) -> str:
+        """**数据驱动**的最近可用报告期（F1(b) / A6；替换原按日期回推的私有实现 —— Critic N9）。
+
+        之所以不能再按日期回推：``industry_map`` 曾取到只有 **16 行**的一期
+        （``fetched_at=2026-10-15T02:03Z``，仍在 TTL 内）→ `industry_of('600519')` 返回 `''`
+        → L 因子整列退化。日期回推**看不出**「这一期其实只有 16 行」。
+
+        规则（写死）：
+        * 候选期按降序遍历，取第一期货真价实 **≥ ``REPORT_MIN_ROWS``（1000）行**的；
+        * 取不到数据（``DataUnavailable``，例如夹具/缓存都没有）→ **跳过该期继续往前找**；
+        * **全部候选都不达标 → 抛 ``DataUnavailable``**（**不得** fail-open 返回一个空期）。
+        """
+        tried: list[str] = []
+        for period in self.report_period_candidates():
+            try:
+                frame = self.quarterly_report(period)
+            except NetworkForbiddenInLock:
+                raise  # 守卫错误上抛，不得静默降级
+            except DataUnavailable:
+                tried.append(f"{period}(不可得)")
+                continue
+            rows = len(frame)
+            if rows >= REPORT_MIN_ROWS:
                 return period
-        return f"{today.year - 1}1231"
+            tried.append(f"{period}({rows} 行<{REPORT_MIN_ROWS})")
+        raise DataUnavailable(
+            f"没有任何候选报告期达到 REPORT_MIN_ROWS={REPORT_MIN_ROWS}：{'、'.join(tried[:6])}"
+        )
+
+    def _now(self) -> datetime:
+        """当前时间（**唯一时钟入口**，便于注入 —— T-PN-11b 要 monkeypatch 它）。"""
+        return datetime.now()
+
+    def _asof_phase(self) -> str:
+        """asof 缓存的相位（**R12**）：以 **15:30** 为界。
+
+        为什么必须相位感知：`latest_trade_asof` 的结果在**收盘后会前进一格**
+        （>15:30 时「今天」已经有行情了）—— 若缓存不区分相位，
+        09:00 写入的 `10-15` 会在 16:00 被复用，图**不含今天** ⇒ INV-52 违规。
+        """
+        now = self._now()
+        return "post_close" if (now.hour, now.minute) >= (15, 30) else "pre_close"
+
+    def chart_asof(self, code: str) -> str:
+        """**看盘专用** asof（F1(c) / INV-52 / R10 / R12）—— 与下单 asof **必须分开**。
+
+        **R10：只缓存昂贵的那一半。** 结构写死为：
+
+        .. code-block:: text
+
+            today = self._today()
+            _, spot_asof = self._spot_frame_raw()     # ★ 每次都判，cache-only、不联网
+            if spot_asof == today: return today        # ★ 便宜分支，永不缓存
+            return <缓存的 latest_trade_asof(...)>     # ★ 只缓存这一步（最多 30 次 daily 取数）
+
+        为什么**不能**把整个返回值缓存：08:xx 盘前缓存了「昨天」→ 09:30 开盘后
+        **长达数小时图上不含今天** ⇒ 直接违背用户「交易日看最新」的核心需求。
+        「今天确有数据」的判定每次都实时执行（`_spot_frame_raw` 只读缓存/夹具），
+        所以这条语义**不可能**被缓存绕过。
+
+        **R12：相位并进 key**（`pre_close` / `post_close`，以 15:30 为界）。
+        把 phase 放进 **key** 而不是值的第三字段 —— 少一类「字段与 key 不同步」的 bug。
+
+        缓存走**既有** `_read_entry`/`_write_entry` **原子信封**（R7：不新增存取函数）；
+        **签名零变化**。不看盘的写命令**禁止**用它（AST 白名单只许
+        ``cli.cmd_chart`` / ``webapp.api_chart``）。
+
+        ★ **已知边界（如实记录，code-review F2；有界残留/WATCH，非新缺陷）**：
+        ``_spot_frame_raw`` 是 **cache-only 且不看新鲜度** ⇒「快照日期 == 今天、
+        但内容其实是**盘前**那一份」时，便宜分支会返回今天。这条**不由本函数兜住**：
+        它被 :meth:`with_today_bar` 的**两道闸**兜住（``suspended is False`` ∧ 快照 asof == asof，
+        陈旧快照**拒合成**），故影响面是「图头日期可能早于真实盘中数据」，不是错误数据。
+
+        ★ **TTL 的算术关系必须被钉住**：同相位内缓存**不得跨日**复用 ——
+        A 股最短的非交易间隔是 15:00 → 次日 09:30 = **8h30m**，故
+        ``ASOF_CACHE_TTL`` 必须**严格小于** 8h30m（当前 6h）。该不变量由
+        ``test_T_PN_11c_ttl_cannot_cross_a_day``（结构）+ 
+        ``test_T_PN_11c_backdated_envelope_is_not_reused``（行为）双重钉住 ——
+        code-review 实测：TTL 调到 12h 时行为会坏，而当时的 T-PN-11/11b 抓不到。
+        """
+        today = self._today()
+        try:
+            _, spot_asof = self._spot_frame_raw()
+        except NetworkForbiddenInLock:
+            raise  # 守卫错误上抛（与 latest_trade_asof 同款纪律）
+        except Exception:  # noqa: BLE001 - 快照不可得 → 交给交易日骨架
+            spot_asof = ""
+        if spot_asof and str(spot_asof)[:10] == today:
+            return today  # ★ 便宜分支：永不缓存
+
+        key = f"chart_asof_{_norm_code(code)}_{self._asof_phase()}"
+        entry = self._read_entry(self.cache_dir, key)
+        if entry is not None and not self._expired(entry, ASOF_CACHE_TTL):
+            cached = entry.get("payload")
+            if isinstance(cached, str) and cached:
+                return cached
+        resolved = self.latest_trade_asof(probe_codes=[code], allow_fetch=False)
+        self._write_entry(self.cache_dir, key, resolved)
+        return resolved
+
+    def name_of(self, code: str) -> str:
+        """股票名称 —— **与 asof 无关**（INV-61 / F1）。
+
+        取不到时**回退 ``code``**，且**绝不抛异常**。
+        只读缓存/夹具、**绝不联网**：
+        ① spot 快照缓存（:meth:`_spot_frame_raw`，cache-only）
+        ② 名称表缓存 ``stock_list``（:meth:`_read_entry`，只读）
+
+        ★ **作用域边界（有意取舍，T-PN-4b 钉住）**：真冷启动（既无 spot 又无名称表）
+        会**回退为 code** —— 宁可显示代码，也不为了名称去联网破坏 `--offline` 红线。
+        名称表的**预热**由启动任务负责（`search.load_name_table`），**不是**这里。
+        """
+        c = _norm_code(code)
+        if not c:
+            return str(code or "")
+        try:
+            frame, _ = self._spot_frame_raw()
+            if frame is not None and len(frame) and "name" in getattr(frame, "columns", []):
+                row = frame[frame["code"].astype(str).str.zfill(6) == c]
+                if len(row):
+                    name = str(row.iloc[0].get("name") or "").strip()
+                    if name:
+                        return name
+        except Exception:  # noqa: BLE001 - 名称绝不允许把调用方炸掉
+            pass
+        try:
+            entry = self._read_entry(self.cache_dir, "stock_list")
+            rows = entry.get("payload") if isinstance(entry, dict) else None
+            if isinstance(rows, list):
+                for item in rows:
+                    if isinstance(item, dict) and _norm_code(item.get("code")) == c:
+                        name = str(item.get("name") or "").strip()
+                        if name:
+                            return name
+        except Exception:  # noqa: BLE001
+            pass
+        return c
+
+    def with_today_bar(
+        self, frame: pd.DataFrame, code: str, asof: str
+    ) -> tuple[pd.DataFrame, bool]:
+        """把**当天的实时快照**合成成一根 bar（F1(d) / INV-57）—— **陈旧快照拒合成**。
+
+        实测教训：``quote()`` 对**无数据日会返回上一收盘价**。少了这里的检查，就会造出
+        「用 10-09 的收盘价做的 10-15 bar」—— 图上多一根假 bar，而数字看不出问题。
+
+        合成条件（**两条都必需**，其余情况一律不加 bar 并返回 ``False``）：
+        ① ``quote(code, asof)['suspended'] is False``（有成交、没停牌）；
+        ② 快照的 ``asof`` **就是** ``asof``（``_spot_frame_raw`` 的日期，不是「最近一次」）。
+        另外：``frame`` 末行已是 ``asof``（收盘后真实日线已含当天）→ 也不合成。
+
+        ★ ``provisional`` 由调用方按 ``(asof == today) and (now < 15:30)`` 计算 ——
+        这里**不**贴「未收盘」标签（否则会给已收盘日贴错标签）。
+        """
+        asof = str(asof)[:10]
+        if frame is None or len(frame) == 0 or "date" not in frame.columns:
+            return frame, False
+        last_day = str(frame["date"].iloc[-1])[:10]
+        if last_day >= asof:
+            return frame, False  # 真实日线已含当天 → 不合成
+        try:
+            spot_frame, spot_asof = self._spot_frame_raw()
+        except NetworkForbiddenInLock:
+            raise
+        except Exception:  # noqa: BLE001 - 快照不可得 → 不合成
+            return frame, False
+        if not spot_asof or str(spot_asof)[:10] != asof:
+            return frame, False  # ★ 快照不是这一天的 → 陈旧，拒合成
+        try:
+            info = self.quote(code, asof)
+        except NetworkForbiddenInLock:
+            raise
+        except DataUnavailable:
+            return frame, False
+        if bool(info.get("suspended")):
+            return frame, False  # 停牌/无成交 → 不合成
+        last = info.get("last")
+        try:
+            last_f = float(last)
+        except (TypeError, ValueError):
+            return frame, False
+        if not math.isfinite(last_f) or last_f <= 0:
+            return frame, False
+        prev = info.get("prev_close")
+        try:
+            prev_f = float(prev)
+        except (TypeError, ValueError):
+            prev_f = float("nan")
+        base = prev_f if math.isfinite(prev_f) and prev_f > 0 else last_f
+        volume = amount = float("nan")
+        try:
+            c = _norm_code(code)
+            row = spot_frame[spot_frame["code"].astype(str).str.zfill(6) == c]
+            if len(row):
+                item = row.iloc[0]
+                if item.get("volume") is not None and not pd.isna(item.get("volume")):
+                    volume = float(item.get("volume"))
+                if item.get("amount") is not None and not pd.isna(item.get("amount")):
+                    amount = float(item.get("amount"))
+        except Exception:  # noqa: BLE001 - 量额非必需
+            pass
+        bar = {
+            "date": asof, "open": last_f, "high": last_f, "low": last_f, "close": last_f,
+            "volume": volume, "amount": amount,
+            "pct_chg": (last_f / base - 1.0) * 100.0 if base else float("nan"),
+            "turnover": float("nan"),
+        }
+        out = pd.concat([frame, pd.DataFrame([bar])], ignore_index=True)
+        return out, True
+
+    # ---- 分时（F1(e)：唯一新数据源）---- #
+    def intraday(self, code: str, *, day: "str | None" = None) -> dict:
+        """分时数据（F1(e) / INV-55 / INV-56）。
+
+        返回 ``{"day", "points":[{"t","price","avg","vol","amount"}], "source",
+        "complete", "fetched_at", "asof"}``。
+
+        * 主通道：**新浪 ``scale=1``**（单次覆盖 ~3 个交易日）；
+        * ⚠️ **腾讯通道未实现**（本仓无腾讯分时代码，接口签名保留；如需加速通道须另开任务，
+          并在解析层对累计值做差分）；
+        * ``vol``/``amount`` 语义钉死为**增量**；
+        * ``avg`` = **累计 VWAP**（``Σamount / Σvol``）；
+        * ``complete`` = ``len(points) >= INTRADAY_MIN_POINTS``（228 = 0.95×240；
+          **不得**用硬阈值 240 —— 实测完整日就是 238 点）；
+        * ``day`` 缺省 = 载荷里**最近的**那一天；指定了但不存在 → ``DataUnavailable``。
+
+        走 ``_cached`` → 因此**自动获得**：单飞（同 key 只联网一次）、TTL、
+        离线/锁内守卫（``_http_get`` → ``_net_guard(kind="http")``）。
+        """
+        c = _norm_code(code)
+        payload = self._cached(
+            f"intraday_{c}",
+            TTL_INTRADAY,
+            lambda: self._fetch_intraday(c),
+            fixture_key=f"intraday_{c}",
+        )
+        if not isinstance(payload, dict):
+            raise DataUnavailable(f"分时缓存形状异常（应为对象）：{type(payload).__name__}")
+        bars = payload.get("bars")
+        if not isinstance(bars, list) or not bars:
+            raise DataUnavailable(f"分时数据为空：{c}")
+        by_day: dict[str, list[dict[str, Any]]] = {}
+        for bar in bars:
+            if isinstance(bar, dict) and bar.get("day"):
+                by_day.setdefault(str(bar["day"])[:10], []).append(bar)
+        if not by_day:
+            raise DataUnavailable(f"分时数据无有效交易日：{c}")
+        target = str(day)[:10] if day else max(by_day)
+        if target not in by_day:
+            raise DataUnavailable(
+                f"分时数据缺少 {target}（可得：{'、'.join(sorted(by_day))}）"
+            )
+        points: list[dict[str, Any]] = []
+        cum_vol = cum_amount = 0.0
+        for bar in sorted(by_day[target], key=lambda b: str(b.get("t") or "")):
+            vol = float(bar.get("volume") or 0.0)
+            amount = float(bar.get("amount") or 0.0)
+            cum_vol += vol
+            cum_amount += amount
+            points.append({
+                "t": str(bar.get("t") or "")[:5],
+                "price": bar.get("close"),
+                "avg": (cum_amount / cum_vol) if cum_vol else float("nan"),
+                "vol": vol,
+                "amount": amount,
+            })
+        return {
+            "day": target,
+            "points": points,
+            "source": str(payload.get("source") or "sina"),
+            "complete": len(points) >= INTRADAY_MIN_POINTS,
+            "fetched_at": str(payload.get("fetched_at") or ""),
+            "asof": target,
+        }
+
+    def _fetch_intraday(self, code: str) -> dict[str, Any]:
+        """新浪 ``scale=1`` 拉取并归一成 ``{"bars", "source", "fetched_at"}``。"""
+        url = (
+            f"{INTRADAY_URL}?symbol={_prefixed(code)}&scale={INTRADAY_SCALE}"
+            f"&ma=no&datalen={INTRADAY_DATALEN}"
+        )
+        text = self._http_get(url, referer="https://finance.sina.com.cn/")
+        bars: list[dict[str, Any]] = []
+        for row in _parse_sina_jsonp(text):
+            stamp = str(row.get("day") or "")
+            if len(stamp) < 16:
+                continue
+            try:
+                close = float(row.get("close"))
+                volume = float(row.get("volume") or 0.0)
+                amount = float(row.get("amount") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            bars.append({
+                "day": stamp[:10], "t": stamp[11:16], "close": close,
+                "volume": volume, "amount": amount,
+            })
+        if not bars:
+            raise DataUnavailable(f"分时载荷无有效 bar（{code}）：{url}")
+        return {
+            "bars": bars,
+            "source": "sina",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     def industry_of(self, code: str) -> str:
         """行业名；取不到返回空串（策略层据此退化到绝对 RS 分档）。"""

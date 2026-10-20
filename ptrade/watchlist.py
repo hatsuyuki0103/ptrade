@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -19,6 +20,8 @@ from typing import Any
 from .config import AppConfig
 from .datasource import DataSource, NetworkForbiddenInLock, _norm_code
 from . import store
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "FILE_NAME",
@@ -103,8 +106,64 @@ def list_watchlist(cfg: AppConfig) -> list[dict]:
     return [dict(item) for item in load_watchlist(cfg).get("items", [])]
 
 
-def add_to_watchlist(cfg: AppConfig, code: str, name: str = "", note: str = "") -> dict:
+def _name_from_cache_only(cfg: AppConfig, code: str) -> str:
+    """**cache-only** 的名称解析（默认兜底）：① `stock_list` 缓存 ② **夹具 spot**。
+
+    ★ **绝不联网**（INV-61 / T-V3-22 的前提）；取不到返回 `""`。
+    ★ 这个函数**不得**在 `with store.state_lock(...)` 块内被调用（P0-4：锁内联网会违 INV-42；
+      虽然本函数不联网，但保持「解析一律在锁外」的纪律更简单、更不容易被后人写坏）。
+    """
+    target = _norm_code(code)
+    if not target:
+        return ""
+    try:
+        cache_dir = os.path.join(str(cfg.root), "data", "cache")
+        entry = DataSource._read_entry(cache_dir, "stock_list")
+        rows = entry.get("payload") if isinstance(entry, dict) else None
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict) and _norm_code(row.get("code")) == target:
+                    name = str(row.get("name") or "").strip()
+                    if name:
+                        return name
+    except Exception:  # noqa: BLE001 - 名称非必需
+        pass
+    try:
+        fixture_dir = os.path.join(str(cfg.root), "data", "fixture")
+        entry = DataSource._read_entry(fixture_dir, "spot")
+        payload = entry.get("payload") if isinstance(entry, dict) else None
+        rows = payload.get("rows") if isinstance(payload, dict) and "rows" in payload else payload
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict) and _norm_code(row.get("code")) == target:
+                    name = str(row.get("name") or "").strip()
+                    if name:
+                        return name
+    except Exception:  # noqa: BLE001 - 名称非必需
+        pass
+    return ""
+
+
+def add_to_watchlist(
+    cfg: AppConfig,
+    code: str,
+    name: str = "",
+    note: str = "",
+    *,
+    resolve_name: "Callable[[str], str] | None" = None,
+    lock_timeout: float = 10.0,
+) -> dict:
     """加入自选池（**幂等**，INV-37）。返回写入后的完整文档。
+
+    ★★ **P0-4（V3-W3）：名称解析在锁外先做好，再进锁写盘。**
+    `webapp.api_watchlist` 的 POST 原先直接用调用方传的 `name`，**不传就存空** ⇒
+    自选池里只有代码、没有名称（用户抱怨「加进自选也没什么可看」的真根因之一）。
+
+    ``resolve_name`` 是**纯回调**（由调用方注入，例如
+    ``lambda c: ds.name_of(c)`` —— `name_of` 是 cache-only 的）。
+    ★ 解析在这里**调用一次、且严格在 `with store.state_lock(...)` 之前**
+      —— 若把它放进锁内，任何一次联网都会变成「锁内联网」= 违 INV-42。
+    ★ 调用方不传 `resolve_name` 时，退回 `_name_from_cache_only`（只读缓存/夹具，绝不联网）。
 
     **整个「读 → 改 → 写」在写锁内**（code-review H1）：此前这里是裸的
     read-modify-write，两个进程并发 add 会互相覆盖（实测 2 进程各 add 30 个不同
@@ -115,16 +174,40 @@ def add_to_watchlist(cfg: AppConfig, code: str, name: str = "", note: str = "") 
     target = _norm_code(code)
     if not target:
         raise ValueError("code 不能为空")
-    with store.state_lock(cfg.root, timeout=10.0):
-        return _add_locked(cfg, target, name, note)
+    # ★★ M4（code-review）：用**调用方给的**超时，而不是写死 10s ——
+    #   否则 `WebApp(lock_timeout=…)` 对 POST 分支形同虚设（配置项说谎）。
+    #   ★ POST 分支已把本函数移出 `WebApp._state_lock`（P0-4），锁**只在这里**取 ⇒ 这是唯一的超时来源。
+    # ★★ P0-4：解析**必须在锁外**（见 docstring）
+    resolved = str(name or "").strip()
+    if not resolved:
+        resolver = resolve_name or (lambda c: _name_from_cache_only(cfg, c))
+        try:
+            resolved = str(resolver(target) or "").strip()
+            if not resolved:
+                # ★ 注入回调返回空 ⇒ 回落默认 cache-only 解析（而不是存空名字）：
+                #   「传了 resolve_name 却什么都没拿到」= 契约说谎，与空守卫同罪。
+                resolved = _name_from_cache_only(cfg, target)
+        except NetworkForbiddenInLock:
+            raise      # 守卫错误上抛：不允许把「锁内联网」静默吞成「名称为空」
+        except Exception:  # noqa: BLE001 - 名称非必需，绝不因为取名失败而拒绝加入自选
+            logger.warning("解析 %s 的名称失败（将存空名称）", target, exc_info=True)
+            resolved = ""
+    explicit = bool(str(name or "").strip())   # 调用方**显式**给了名字（vs 服务端解析出来的）
+    with store.state_lock(cfg.root, timeout=float(lock_timeout)):
+        return _add_locked(cfg, target, resolved, note, overwrite=explicit)
 
 
-def _add_locked(cfg: AppConfig, target: str, name: str, note: str) -> dict:
+def _add_locked(
+    cfg: AppConfig, target: str, name: str, note: str, *, overwrite: bool = True
+) -> dict:
     doc = load_watchlist(cfg)
     items = list(doc.get("items") or [])
     for item in items:
         if _norm_code(item.get("code")) == target:
-            if name:
+            # ★ 幂等（INV-37）：**服务端解析**出来的名字只用于「补空」，
+            #   不得覆盖已有名称（否则每次重加都会把用户/上次的注入名改掉）；
+            #   调用方**显式**传 name 时才允许覆盖。
+            if name and (overwrite or not str(item.get("name") or "").strip()):
                 item["name"] = str(name)
             if note:
                 item["note"] = str(note)

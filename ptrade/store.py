@@ -250,12 +250,30 @@ def _unlock_os(fd: int) -> None:
 
 
 def _write_owner_hint(fd: int) -> None:
-    """把 pid/时间写在第 1 字节之后，便于诊断（第 0 字节是锁区，不动它）。"""
+    """把 pid/时间写在第 1 字节之后，便于诊断（第 0 字节是锁区，不动它）。
+
+    ★ **不 fsync**（2026-10-15，G008 rework：Lead 批准）：
+    这是**诊断**信息，fsync 保的是崩溃持久性，对诊断提示没有意义；
+    而它挂在**每次取锁**的路径上。实测（Windows，同一段代码）：
+
+    | 盘 | 单进程 60 次 ``append_jsonl`` | 每次 | 其中 hint 的 fsync |
+    |---|---|---|---|
+    | C:（默认 basetemp） | 0.50s | 8.4ms | — |
+    | D:（``--basetemp=D:\\…``） | **7.71s** | **128.4ms** | **74.2ms/次** |
+
+    **环境事实（务必记住）**：**D 盘的 fsync 比 C 盘慢约 15×**。
+    它是被「全量测试 basetemp 强制走 D 盘」这条纪律暴露出来的 ——
+    ``test_S8_concurrent_append_keeps_lines_intact`` 在 C 盘 1.94s 通过、D 盘 17.25s 失败
+    （3 进程 × 60 行 = 180 次取锁，串行成本 ≈23s > 每次取锁 10s 预算 → 有进程饿死）。
+
+    ⚠️ **不要**据此放宽产品锁预算（``state_lock`` / ``append_jsonl`` 的 ``timeout``）：
+    那是把「环境慢」伪装成「正确性参数」。正确做法 = 消掉无意义的代价（本条）
+    + 让「不丢行」这类用例给足**它自己的**预算。
+    """
     with contextlib.suppress(OSError):
         payload = f"pid={os.getpid()} at={datetime.now(timezone.utc).isoformat()}\n".encode("utf-8")
         os.lseek(fd, 1, os.SEEK_SET)
         os.write(fd, payload)
-        os.fsync(fd)
 
 
 def _reclaim_stale(path: str) -> bool:

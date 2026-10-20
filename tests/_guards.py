@@ -1,10 +1,13 @@
 """测试前置守卫：夹具 / 剧本缺失时**显式跳过**，而不是静默跑出错数据。
 
-夹具与剧本都不入 git（见 README「离线夹具与测试」）：
+夹具与剧本都不入 git（见 README「离线夹具与测试」）。**脚本的真实位置**（W6 修正）：
 
-    python tools/fetch-fixtures.py    # 从 release 下载（含剧本）
-    python tools/build_fixtures.py    # 用 akshare 现拉重建
-    python tools/build_scenario.py    # 重建剧本（SYNTHETIC）
+    python data/fixture/build_fixtures.py     # 用 akshare 现拉重建（需联网）
+    python data/scenario/build_scenario.py    # 重建剧本（SYNTHETIC）
+
+⚠️ **本文件原先指向 `tools/fetch-fixtures.py` / `tools/build_fixtures.py`，`tools/` 目录并不存在**
+（Architect 第 1 轮实测、Critic 复核确认）。那段指引会让读日志的人**跑一条不存在的命令**，
+所以在此改正 —— 并保留这条注释，说明「陈旧的路径指引」在本项目真实发生过。
 
 之所以要在测试里显式守卫，而不是让夹具缺失自然失败：夹具缺失时数据源返回空，
 断言会崩在**与夹具无关的位置**（例如「浮盈未进现金」这类不变量测试），
@@ -22,8 +25,8 @@ FIXTURE_DIR = os.path.join(ROOT, "data", "fixture")
 SCENARIO_DIR = os.path.join(ROOT, "data", "scenario")
 
 _FIX_HINT = (
-    "先跑 `python tools/fetch-fixtures.py`（从 release 下载）"
-    "或 `python tools/build_fixtures.py`（用 akshare 重建，需联网）"
+    "先跑 `python data/fixture/build_fixtures.py`（用 akshare 重建，需联网）"
+    "或 `python data/scenario/build_scenario.py`（重建剧本）"
 )
 
 
@@ -84,6 +87,6 @@ def require_scenario() -> None:
     """
     if not _has_json(SCENARIO_DIR):
         pytest.skip(
-            "缺少 data/scenario —— 先跑 `python tools/fetch-fixtures.py`"
-            "（夹具包内含剧本）或 `python tools/build_scenario.py`"
+            "缺少 data/scenario —— 先跑 `python data/scenario/build_scenario.py`"
+            "（重建剧本，SYNTHETIC）"
         )

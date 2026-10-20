@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import shutil
 import socket
 from pathlib import Path
 
@@ -62,15 +63,20 @@ UNKNOWN = "999999"
 # ---------------------------------------------------------------------------
 
 
-def make_cfg(**canslim_overrides) -> AppConfig:
-    """显式构造默认配置（不读 config.json，避免被 CLI init 写出的文件污染）。"""
+def make_cfg(root: str | None = None, **canslim_overrides) -> AppConfig:
+    """显式构造默认配置（不读 config.json，避免被 CLI init 写出的文件污染）。
+
+    ``root`` 缺省 = 仓库根（只适用于**纯 stub** 用例）；凡要读**真实数据**的用例都必须传
+    ``isolated_root`` —— 否则会被仓库 ``data/cache`` 里**新鲜缓存**压过夹具/剧本
+    （``_cached`` 顺序：新鲜缓存 → 夹具/剧本），用例会随在线活动随机变红。
+    """
     return AppConfig(
         account=AccountConfig(),
         fee=FeeConfig(),
         margin=MarginConfig(),
         risk=RiskConfig(),
         canslim=CANSLIMConfig(**canslim_overrides),
-        root=str(REPO_ROOT),
+        root=str(root or REPO_ROOT),
     )
 
 
@@ -690,7 +696,7 @@ def test_c_acceleration_actually_enters_the_formula(scenario_scorer):
     用剧本链条（20→35→68→72→75→78→80 **逐期加速**）—— 天然可判 ``accelerated=True``，
     不依赖真实数据恰好加速；只断言布尔标志无法证明加成真进了计算。
     """
-    cfg = make_cfg()
+    cfg = scenario_scorer.cfg          # ★ 用剧本通道自己的 cfg（隔离根），不碰仓库根
     factor = scenario_scorer.score(STRONG, SCENARIO_ASOF).factor("C")
     value = factor.value
     assert value["accelerated"] is True
@@ -1768,18 +1774,40 @@ from tests._guards import require_fixtures, require_scenario  # noqa: E402
 
 
 @pytest.fixture(scope="module")
-def fixture_scorer():
+def isolated_root(tmp_path_factory) -> str:
+    """**隔离数据根**：只复制 ``data/fixture`` + ``data/scenario``，**刻意不带 ``data/cache``**。
+
+    为什么必须隔离（本轮实测教训）：``DataSource._cached`` 的命中顺序是
+    **新鲜缓存 → 夹具/剧本**，而仓库 ``data/cache`` 里有我们自己的在线活动灌进去的
+    新鲜缓存（111 个文件里 110 个是同一天生成的）→ 剧本的 ``quarterly_*`` 永远读不到，
+    用例会随「今天有没有人跑过在线命令」随机变红。隔离后**确定性**与仓库缓存状态无关。
+    """
+    root = Path(tmp_path_factory.mktemp("strategy_isolated"))
+    for name in ("fixture", "scenario"):
+        source = REPO_ROOT / "data" / name
+        if not source.is_dir():
+            continue
+        target = root / "data" / name
+        target.mkdir(parents=True, exist_ok=True)
+        for item in source.glob("*.json"):
+            shutil.copy2(item, target / item.name)
+    assert not (root / "data" / "cache").exists(), "隔离根不得带 cache（否则守卫退化）"
+    return str(root)
+
+
+@pytest.fixture(scope="module")
+def fixture_scorer(isolated_root):
     require_fixtures()
-    cfg = make_cfg()
+    cfg = make_cfg(root=isolated_root)
     ds = DataSource(cfg, offline=True)
     return CanslimScorer(cfg, ds, offline=True)
 
 
 @pytest.fixture(scope="module")
-def fixture_pool_scorer():
+def fixture_pool_scorer(isolated_root):
     """真实夹具通道（scenario=False）—— 用于池级扫描，证明默认通道不读剧本。"""
     require_fixtures()
-    cfg = make_cfg()
+    cfg = make_cfg(root=isolated_root)
     ds = DataSource(cfg, offline=True)
     return CanslimScorer(cfg, ds, offline=True)
 
@@ -1869,14 +1897,15 @@ def test_tc_s22a_real_pool_buy_branch_is_reachable_but_rare(fixture_pool_scorer)
 
 
 @pytest.fixture(scope="module")
-def scenario_scorer():
+def scenario_scorer(isolated_root):
     """剧本通道：``scenario=True`` 显式叠加 ``data/scenario``（默认 DataSource 绝不读它）。
 
     剧本缺失时**跳过**而不是退回真实数据 —— 那些断言标定的是剧本形态，
     在真实数据上跑只会得到无意义的成败（见 conftest.require_scenario）。
+    ★ 必须用 ``isolated_root``：仓库根的**新鲜缓存**会压过剧本（见 isolated_root 的说明）。
     """
     require_scenario()
-    cfg = make_cfg()
+    cfg = make_cfg(root=isolated_root)
     ds = DataSource(cfg, offline=True, scenario=True)
     return CanslimScorer(cfg, ds, offline=True)
 
@@ -1905,7 +1934,7 @@ def test_tc_s22b_scenario_weak_stock_is_avoid_or_short(scenario_scorer):
 
 def test_tc_s22b_scenario_ranking_and_recommendation(scenario_scorer):
     """TC-S-22b：剧本通道下 rank/recommend 端到端可用（buy 进 buys、弱票进 shorts/avoid）。"""
-    cfg = make_cfg()
+    cfg = scenario_scorer.cfg          # ★ 隔离根（不读仓库缓存）
     results = scenario_scorer.score_many([STRONG, NEUTRAL, WEAK], SCENARIO_ASOF)
     grouped = rank(results, cfg)
     assert [item.code for item in grouped["buys"]] == [STRONG]
@@ -1917,15 +1946,17 @@ def test_tc_s22b_scenario_ranking_and_recommendation(scenario_scorer):
     assert recs[STRONG]["stop_loss"] == pytest.approx(recs[STRONG]["entry"] * 0.93)
 
 
-def test_scenario_data_never_leaks_into_default_channel(fixture_pool_scorer):
+def test_scenario_data_never_leaks_into_default_channel(isolated_root):
     """隔离保证：默认 DataSource 绝不读 data/scenario（否则用户 --offline 会看到伪造的 buy）。
 
-    这个用例在函数体内**另建** scenario 通道做对比，所以不能只靠 fixture 守卫 ——
+    这个用例在函数体内**另建**两个通道做对比，所以不能只靠 fixture 守卫 ——
     剧本缺失时它会把两个通道都当真实数据，得到 ``51.34 > 51.34`` 这种误导性失败。
+    ★ 两条通道都用 ``isolated_root``（无 cache）：否则仓库新鲜缓存会同时污染两边，
+    让「剧本 vs 真实」的对比失去意义。
     """
     require_scenario()
-    cfg = make_cfg()
-    real = fixture_pool_scorer.score(STRONG, SCENARIO_ASOF)
+    cfg = make_cfg(root=isolated_root)
+    real = CanslimScorer(cfg, DataSource(cfg, offline=True), offline=True).score(STRONG, SCENARIO_ASOF)
     assert real.signal != "buy"
     assert real.total < 75.0
     scen = CanslimScorer(cfg, DataSource(cfg, offline=True, scenario=True), offline=True)

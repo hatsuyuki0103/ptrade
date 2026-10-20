@@ -1287,8 +1287,18 @@ def state_document(state: AccountState, initial_cash: float | None = None) -> di
     }
 
 
-def state_from_document(doc: dict[str, Any], cfg: AppConfig | None = None) -> AccountState:
-    """解析 state.json 文档；``schema_version != 3`` 一律 ``ValueError``（不做静默迁移）。"""
+def state_from_document(doc: dict[str, Any], cfg: AppConfig) -> AccountState:
+    """解析 state.json 文档；``schema_version != 3`` 一律 ``ValueError``（不做静默迁移）。
+
+    ★ **``cfg`` 必填**（与 :func:`restore` 的 v3.1 决定一致）——
+    修前签名写的是 ``cfg: AppConfig | None = None``，但下面**无条件**把 ``cfg`` 传给
+    ``restore`` ⇒ **不传 cfg 会炸** ``AttributeError: 'NoneType' object has no attribute 'margin'``
+    （「签名说可选、实际必需」）。原先只有 `tests/test_core.py` 的版本拒绝用例没传 cfg ——
+    而那条路径在到达 ``restore`` **之前**就抛 ``ValueError`` 了，所以一直没暴露。
+    **为什么不改成「None 时 ``load_config()``」**：那会**重新引入** :func:`restore` 明令禁止的危害 ——
+    自定义 root 的账户会被**当前目录的**默认配置解析，``margin_ratio_long`` 一变
+    ``margin_required`` 就算错。
+    """
     if not isinstance(doc, dict):
         raise ValueError("state.json 非法：顶层不是对象")
     version = doc.get("schema_version")

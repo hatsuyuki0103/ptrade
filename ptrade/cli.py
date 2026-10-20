@@ -26,7 +26,7 @@ from . import service
 from . import store
 from .config import AccountConfig, AppConfig, load_config
 from .core import AccountState, Side
-from .datasource import DataSource, DataUnavailable
+from .datasource import DataSource, DataUnavailable, NetworkForbiddenInLock
 
 __all__ = ["main", "build_parser"]
 
@@ -246,6 +246,20 @@ def _import_chart():
     return build_chart
 
 
+def _period_choices() -> list[str]:
+    """周期清单的**单一真源**：`chart.PERIODS_WITH_INTRADAY`（PRD F3 / `INV-56`）。
+
+    为什么做成函数：`chart` 的导入保留**惰性**（非 chart 子命令不必加载它），
+    但 `argparse` 的 `choices` 在 `build_parser()` 时就要值 —— 于是在该时点惰性取一次。
+
+    历史上这里与 `webapp.VALID_PERIODS`、`chart.PERIODS` **各写一份**，
+    改一处漏一处（Architect 第 1 轮实测指出；PRD F3 要求收敛为单一真源）。
+    """
+    from .chart import PERIODS_WITH_INTRADAY
+
+    return list(PERIODS_WITH_INTRADAY)
+
+
 def _make_ds(cfg: AppConfig, offline: bool) -> DataSource:
     """转发到 :func:`ptrade.service.make_ds`。"""
     return service.make_ds(cfg, offline)
@@ -459,6 +473,13 @@ def cmd_sync(args: argparse.Namespace, cfg: AppConfig) -> int:
         try:
             frame = ds.daily(code, start, end, adjust=args.adjust, unadjust=bool(args.unadjust))
             result["codes"][code] = int(len(frame))
+        except NetworkForbiddenInLock:
+            # ★ **守卫错误必须上抛**（INV-42/45）—— 这是 `tests/test_wiring_invariants_v2.py::W1` 抓到的：
+            # `NetworkForbiddenInLock` 是 `DataUnavailable` 的**子类**，若让它掉进下面的
+            # `except DataUnavailable`，就会被**降级成「这条票没数据」**写进 `failed`，
+            # 然后**继续下一条**，最后可能 `return _emit(...)` 给出**退出码 0 + 只带部分结果** ——
+            # 用户看到「成功」，而数据是缺的。这比直接报错危险得多。
+            raise
         except DataUnavailable as exc:
             result["failed"][code] = str(exc)
     if result["failed"] and not result["codes"]:
@@ -639,10 +660,28 @@ def cmd_ledger(args: argparse.Namespace, cfg: AppConfig) -> int:
 
 
 def cmd_chart(args: argparse.Namespace, cfg: AppConfig) -> int:
+    """渲染 K 线/分时图。
+
+    ★ **看盘路径**（`INV-52`）：asof 走 :func:`ptrade.service.viewer_asof`（**含今天**）。
+
+    与其他子命令不同，看盘**必须**看到今天正在形成的那根 bar（用户明确要求：
+    「交易日的时候看我也是要看到最新的」）。策略本身已抽到中立层
+    （`service.viewer_asof`，architect R4）—— 本函数**只负责取值**：
+
+    * 显式 ``--asof`` → 那里走 `resolve_asof`（守未来函数防护）；
+    * 未给 ``--asof`` → 那里走 `DataSource.chart_asof`（今天**确有数据**时才是今天），并写明 notes。
+
+    ⚠️ **本函数不再直接调用 `chart_asof`** —— 收敛后，`INV-52` 的白名单应以
+    `service.viewer_asof` 为**唯一**入口（`webapp.api_chart` 是待收敛的第二处，见 architect R3/R4）。
+    """
     build_chart = _import_chart()
     ds = _make_ds(cfg, bool(args.offline))
     notes: list[str] = []
-    asof = _resolve_asof(ds, args.asof, notes)
+    # ★ 看盘 asof 策略**只有一处实现**（`service.viewer_asof`，architect R4）：
+    #   它内部对「显式 --asof」走 `_resolve_asof`（守未来函数防护），
+    #   对「未给 --asof」走 `ds.chart_asof(code)`（数据驱动、含今天）并写明 notes。
+    #   抽出来之前这段策略在 `cli.cmd_chart` 与 `webapp.api_chart` **各写一遍且已漂移**。
+    asof = service.viewer_asof(ds, args.code, args.asof, notes)
     out = args.out or os.path.join(cfg.root, "reports", f"chart_{args.code}_{asof}.html")
     path = build_chart(cfg, ds, args.code, asof, period=args.period, out=out)
     path = os.path.abspath(str(path))
@@ -732,7 +771,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("chart", "生成离线单文件 K 线图（HTML）")
     sp.add_argument("--code", required=True)
-    sp.add_argument("--period", default="daily", choices=["daily", "weekly", "monthly"])
+    sp.add_argument("--period", default="daily", choices=_period_choices())
     sp.add_argument("--asof", default=None)
     sp.add_argument("--out", default=None)
     sp.add_argument("--offline", action="store_true")
@@ -759,7 +798,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--offline", action="store_true")
 
     sp = add("serve", "启动本地网页端（默认绑 127.0.0.1，无鉴权）")
-    sp.add_argument("--host", default=None, help="监听地址（默认 127.0.0.1；改成其它值会让同网段可下单）")
+    sp.add_argument("--host", default=None, help="监听地址（默认 127.0.0.1；**非回环地址默认拒绝**，需再加 --allow-remote）")
+    sp.add_argument(
+        "--allow-remote", action="store_true", default=False,
+        help="显式放行非回环监听地址（**危险**：本服务无鉴权，同网段任何人都能查看账户、下单、平仓与结算）",
+    )
     sp.add_argument("--port", type=int, default=None, help="监听端口（默认 8765）")
     sp.add_argument("--lock-timeout", dest="lock_timeout", type=float, default=None)
     sp.add_argument("--offline", action="store_true",
@@ -819,8 +862,10 @@ def cmd_watchlist(args: argparse.Namespace, cfg: AppConfig) -> int:
 def cmd_serve(args: argparse.Namespace, cfg: AppConfig) -> int:
     """启动本地网页端（``python -m ptrade serve``）。
 
-    默认绑 ``127.0.0.1``（**无鉴权，这是唯一边界**）；``--host`` 改变时由
-    ``webapp.banner`` 打印警告。
+    默认绑 ``127.0.0.1``（**无鉴权，这是唯一边界**）。
+    ★ **非回环地址默认拒绝**（硬约束「仅本地监听」）：``--host 0.0.0.0`` 会**直接报错**，
+    必须**显式**再加 ``--allow-remote`` 才放行 —— 修前只打印一次警告就照常绑定
+    （ultraqa F-2 实测 `0.0.0.0` 绑成功、`('0.0.0.0', 60886)`）。
 
     .. note::
        这是**阻塞式**长驻命令，因此它返回服务退出码（``0`` 正常、``130`` Ctrl+C），
@@ -832,8 +877,22 @@ def cmd_serve(args: argparse.Namespace, cfg: AppConfig) -> int:
     port = int(getattr(args, "port", None) or webapp.DEFAULT_PORT)
     offline = bool(getattr(args, "offline", False))
     lock_timeout = float(getattr(args, "lock_timeout", None) or webapp.DEFAULT_LOCK_TIMEOUT)
-    return webapp.serve(cfg, host=host, port=port, offline=offline,
-                        lock_timeout=lock_timeout)
+    allow_remote = bool(getattr(args, "allow_remote", False))
+    if not webapp._is_loopback(host) and not allow_remote:      # noqa: SLF001 - 同一个包的守卫
+        # 在**解析参数后立刻**给出可操作的错误（而不是等到绑定那一刻抛 ValueError 栈）
+        print(
+            f"拒绝绑定非回环地址 {host!r}：本服务**无鉴权**，同网段的任何人都可以查看账户、"
+            f"下单、平仓与结算。\n"
+            f"若确实要暴露到局域网，请显式再加 `--allow-remote`（自行承担风险）。",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        return webapp.serve(cfg, host=host, port=port, offline=offline,
+                            lock_timeout=lock_timeout, allow_remote=allow_remote)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 _HANDLERS = {

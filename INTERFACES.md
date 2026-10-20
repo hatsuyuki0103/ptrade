@@ -1033,6 +1033,94 @@ python -m ptrade chart --code 600519 [--period daily|weekly|monthly] [--asof 202
 | INV-49 | **`data/cache/*.json` 的写者必须原子**（WATCH 项「缓存写者未归类」的收口）：`DataSource._write_entry` 用「**先在内存 `json.dumps`、再 `store.atomic_write_text`**」。**为什么**：原先 `open(path, "w")` + `json.dump(entry, fh)` —— **先截断目标、再序列化**；序列化一抛错（payload 混进脏对象）就留下**残缺的缓存文件** → `_read_entry` 的 `json.load` 抛 → 返回 `None` → 该 key 被当成**没有缓存**，直到重新联网重建。离线场景下这意味着「数据突然全没了」且**没有任何提示**。**不得**换成 `store.atomic_write_json`：那个 `allow_nan=False`，而行情里偶尔出现 NaN —— 为了「更严格」让 `quote()` 报「无数据」是更糟的取舍（该宽容度由测试锁住）。**写者归类**（三类，全部有据）：① **账户状态**（`state.json` / `ledger.jsonl`）→ **必须在写锁内**（INV-25/39）；② **缓存**（`data/cache/*.json`）→ 不取锁，靠原子写（后写者胜、值可互换）+ 只读消费者容错；③ **只写产物**（`reports/*.html`）→ 不取锁，靠原子写（INV-48） | `tests/test_chart_atomic.py::test_cache_write_is_atomic_on_serialize_failure`（序列化失败后文件逐字节不变 + 仍可读 + 无 tmp 残留）· `test_cache_write_keeps_nan_tolerance`（**对照**：NaN 宽容度不得被「顺手统一」掉）；变异实验：换回非原子写 → RED |
 | INV-50 | **`state.json` 的 ledger 水位允许 O(n) 全文件扫描**（`store._count_jsonl_lines`）——**这是有意的取舍，不是遗漏**。架构 S-4 提过 O(1) 化；**实测后决定不做**：`save_state` 的开销在 **1 000 行台账时水位只占 0.53 ms**（总 17.8 ms），**10 000 行 2.53 ms**（总 17.2 ms），**100 000 行 23.7 ms**。模拟盘台账到万级已属极端，而 O(1) 化要引入「持久化计数器 + 截断/轮转检测」——复杂度与出错面远超收益（本项目已因「顺手优化」出过问题）。**重新评估的触发条件**：若 `save_state` 实测超过 **50 ms**（实测 500 000 行时 141 ms 才越线），或出现「单账户台账 > 100 000 笔」的真实场景，再考虑。| 实测脚本 `.omx/probe/bench_watermark.py`（100 / 1k / 10k / 100k / 500k 行逐档计时） |
 | INV-51 | **「取锁超时」与「块体内异常」必须用异常*类型*区分**（第五轮复核 L3 的真正收口）：`store.locked_update_split` 里，**取锁阶段**失败抛 `store.AcquireTimeout`（`StateLockTimeout` 的**子类** —— 向后兼容，既有的 `except StateLockTimeout` 仍能接住，不会有人漏接而崩栈）；**`mutate` 体内**抛出的 `StateLockTimeout` 被包装成普通 `RuntimeError`，于是调用方的 `except StateLockTimeout -> 503` **不会**把它误判成「锁忙，请重试」。`webapp._locked_update()` 用 split 版本，块内异常因此走 **500**。**我第一版的修法是错的，记录在此以免重犯**：当时抽了 `locked_update_split` 只做「取锁阶段与块体分离」，但两个阶段抛的**仍是同一类型** → 调用点照样分不清。实测（`.omx/probe/verify_l3_real.py`，用**真实** store 只在 `mutate` 体内注入）显示块内异常仍返回 **503**；改成类型区分后为 **500**。修「错误分类」问题时，**光调结构不够，必须让阶段在类型上可辨** | `tests/test_chart_atomic.py::test_locked_update_split_marks_stage_by_exception_type`（块内异常不得是 `StateLockTimeout` 或其子类）· `test_acquire_timeout_is_a_state_lock_timeout_subclass`（向后兼容）· `test_locked_update_split_equivalent_on_normal_paths`（正常路径行为等价）· `test_l3_in_body_timeout_is_not_reported_as_lock_busy`（**端到端** 500）；变异实验：去掉块内包装（= 我第一版的错误修法）→ **2 条变红**，理由为 `块内异常必须走 500（实测 503）` |
+| INV-52 | **看盘 asof（含今天）与下单 asof（防未来函数）必须是两条语义，且由 AST 白名单守住**。实现分两层：**取值**在 `DataSource.chart_asof(code)`（**数据驱动**：`spot_asof == today` 才返回今天，否则返回最近有数据的交易日）；**策略入口**在 `service.viewer_asof(ds, code, asof=None, notes=None)`（显式 `asof` → 走 `resolve_asof` 守未来函数；未给 → 走 `chart_asof` 并写明 notes）。`service.resolve_asof(...)` = 下单/策略路径：15:30 前回退到上一交易日（未来函数防护），**一个字都不动**。★ **白名单的收敛目标**：`chart_asof(` **只允许**出现在 `service.viewer_asof` 体内（`architect R3/R4`）；**当前是过渡态**，`webapp.api_chart` 仍有一份待收敛的副本 —— 收敛完成后白名单应缩到**一个函数名**，且**扫描范围是全域 `ptrade/*.py`**（不再按文件枚举 —— 否则新看盘路径落在别的模块就完全不被看见）。`cmd_order`/`cmd_settle`/`cmd_close`/`api_order`/`api_close`/`api_settle`/`prewarm_before_write`/`cmd_plan`/`cmd_scan`/`cmd_recommend`/`_resolve_asof_query` **不得**出现 `chart_asof`。**诚实声明**：`getattr(ds, "chart_asof")` 与局部别名可绕过 —— 这是**防误用，不是防对抗**。**为什么必须分开**：看盘要「含今天」（用户明确要求），下单要「防未来函数」；本项目已**四次**栽在「用日历/理想值推最新」上（下单 asof → 报告期 → 图表今天 → 完整日阈值）| `tests/test_frozen_interfaces_v2.py`（AST 允许/禁止位置清单，**全域扫描**）· `tests/test_v2_e2e.py::T-W4-2`（含时钟**两处**注入：`ds._today` + `service.datetime`，10:30 与 16:00 各一组）· 变异：让 `chart_asof` 退化成 `resolve_asof` → 红；在 `cmd_plan` 里加一次调用 → 红 |
+| INV-53 | **分时数据源只有一个网络出口**：`DataSource._http_get()` 是**唯一**裸 HTTP 出口，内部**先**调 `_net_guard(kind="http")`（离线 → `DataUnavailable`；锁内 → `NetworkForbiddenInLock`）；`_ak()` 改调同一 `_net_guard()`（守卫实现只有一处，但**两条原文案逐字保留** —— `tests/test_inlock_network_guard.py:101,115` 与 `tests/conftest.py:73-77` 逐字复刻）。**AST 网络原语 deny-list**：`ptrade/*.py` 内 `urlopen|HTTPSConnection|HTTPConnection|create_connection|socket.socket|requests.` **只允许**出现在 `datasource.py::_http_get` 体内（实测初始为绿：`ptrade/` 内这些符号零出现）。**JSONP 解析失败必须抛 `DataUnavailable`，不得产出空 points**（空图与用户投诉的形态一模一样）。限频：同 URL 最小间隔 ~1s、失败不重试超过 1 次；**不得**把 akshare 那条 1s/3s 退避复制到 HTTP 出口 | `tests/test_datasource_v2.py::T-W1-3`（离线/锁内 + **正对照**：先证明计数器能涨，否则「计数==0」是恒真）· `T-W1-3b`（AST deny-list）· 变异：在别处加一行 `urlopen(` → 红 |
+| INV-54 | **缓存写入守卫**：`_cached(..., min_rows=)` **只在 `industry_map`(100) 与 `stock_list`(1000) 上开**；抓取结果低于阈值 → **不写缓存** + `logger.warning({key, rows, min_rows})`（返回值仍交给调用方）。`_write_entry` **保持 3 参签名与 `-> str` 不变**（实测调用点 14（ptrade+tests）/15（含 `data/fixture/build_fixtures.py:93`））—— **它是目录无关的静态方法，夹具流水线复用同一方法**，若把守卫放进 `_write_entry`，夹具（实测仅 31 行 < 100）会被**静默拦住重建**。**计数口径**：`payload["rows"] if isinstance(payload, dict) and "rows" in payload else payload`。**为什么需要**：`data/cache/industry_map.json` 只有 16 行却**优先于** 31 行夹具 → `industry_of('600519')` 返回 `''` → **L 因子全量降级** | `tests/test_datasource_v2.py::T-W1-5`（16 条不写 + warning；两形状都测）· `T-W1-6`（报告期数据驱动；**全不达标 → `DataUnavailable`，不得 fail-open**）· `T-W1-7`（注入**新鲜的** 16 行 → 忠实复现 `''`）· 变异：去掉守卫 → 红 |
+| INV-55 | **「完整交易日」用容差判据，不得用硬阈值**：分时 `points >= 228`（0.95 × 240）才 `complete=True`。**实测依据**：新浪 1 分钟序列的真实完整日是 **238 点**（无成交的那一分钟不产生数据点），**硬阈值 240 会永远判不出完整日** → 非交易日前一交易日场景直接失效。**该判据只在 1 分钟口径成立**（`scale=5` 的完整日是 48 点）。`datalen=500` 实测只装 **2 个完整交易日 + 今天一段**（142+238+120=500）→ 请求第 3 个完整交易日必须 **`DataUnavailable` + 明确提示**，**不是空图** | `tests/test_datasource_v2.py::T-W1-4`（238 → True；142 → False；**硬阈值 240 时 238 那侧必红**）· `tests/test_v2_e2e.py::T-W4-6`（第 3 天 → 明确报错）|
+| INV-56 | **分时是独立渲染分支**：`minute` **不在** `chart.PERIODS`（`resample_ohlc` 对非 daily/weekly/monthly **抛 ValueError** —— 把 minute 塞进去会让**所有出图路径 + 4 个既有测试一起红**）。对外周期清单是单一真源 `chart.PERIODS_WITH_INTRADAY = PERIODS + ("minute",)`，`webapp.VALID_PERIODS` 与 `cli` 的 `--period choices` **都导入它**（历史上三处各写一份）。分时走**独立入口** `chart.render_intraday(cfg, ds, code, day=None) -> (html, payload)` 与**独立载荷形状**；**落盘命名独立**：`reports/intraday_<code>_<day>.html` —— **不得**复用 `chart_out_path`（后者是 `chart_<code>_<asof>.html`，同日**会覆盖 K 线图**）。`/api/chart?period=minute` 必须**先路由**到 `render_intraday`，**不得**把 `"minute"` 交给 `render_chart` | `tests/test_chart_v2.py::T-W2-0`（minute 不在 PERIODS；遍历 PERIODS 不抛错）· `T-W2-1`（自包含 + 零外链 + 落盘名 `intraday_*`）· 变异：把 minute 加进 `PERIODS` → 既有 `tests/test_chart.py` 遍历用例随之红 |
+| INV-57 | **`with_today_bar` 陈旧快照拒合成**：**仅当** `quote(code, asof)["suspended"] is False` **且** spot 的 `asof == asof` 时才把当天 bar 并入日线；否则**不加 bar**，并在载荷里用一个**封闭枚举** `today_bar_reason` 显式标注原因 —— **恰好四个取值**：`not-requested`（未请求当天 bar）· `added-fresh-snapshot`（快照新鲜、已合成当天 bar）· `already-in-frame`（真实日线已含当天，**无需**合成）· `no-fresh-snapshot`（快照陈旧 / 停牌 / 不可得 —— 即 INV-57 要拒的那种）。该字段**恒在**且必须与布尔 `today_bar` **一致**（**只有** `added-fresh-snapshot` 才允许 `today_bar=True`，否则「停牌」会被错标成「已合成」）。`provisional = (asof == today) and (now < 15:30)` —— 否则会给**已收盘日**贴「未收盘」标签（值对、标签错）。收盘后（≥15:30）真实日线已含当天 → **不合成**（末行已是 asof 不重复添加）。**为什么必须**：实测 `quote()` 对**无数据日会返回上一收盘价** —— 不加这条检查，天真实现会造出「**用 10-09 收盘价做的 10-15 bar**」，违反 `--offline` 的「不得编造」红线。**当天 bar 必须在 `add_indicators` 之前并入**（否则 `tests/test_chart.py:378-381` 的「指标数组长度 == len(dates)」等长断言红），且 **`latest` 必须从合成后的 frame 重算**（否则图头显示昨天收盘价、图上多一根今天的 bar = 自相矛盾）| `tests/test_datasource_v2.py::T-W1-9`（删掉 `suspended` 检查 → 断言1 红）· `tests/test_chart_v2.py::T-W2-5`（`provisional` 决定是否含「未收盘」标注，**防恒标注**）· 变异：删掉 suspended 检查 → 红 |
+
+| INV-58 | **接线型不变量：机制必须真的接在它的生产调用点上**。任何「守卫 / 阈值 / 开关」类机制，除了**机制层单测**（证明参数有效）之外，**必须**另有一条**接线断言**证明**真实调用点真的传了它 / 真的用了它**；两者缺一即视为**空守卫**。**为什么必须**：本轮实测 —— `_cached(..., min_rows=)` 有实现、有单测（`test_datasource_v2.py` 里显式传参）、有 `INV-54` 文档，**唯独 `datasource.py` 的唯一生产调用点没传** → 16 行残缺 `industry_map` 照样落盘并**驻留 24h** → `industry_of('600519')` 返回 `''` → **L 因子全量降级**（正是用户报的第 6 项：「我看很多的股票，L 都是没法评判」）。**修复中已发现的同类第二处**：`cli.cmd_sync` 的 `except DataUnavailable` 顺手吞掉 `NetworkForbiddenInLock`（**子类**）→ 守卫错误被降级成「这条票没数据」并**继续下一条** → 可能给出**退出码 0 + 只带部分结果**（用户看到成功而数据是缺的）。**规则三条**：① 每条机制都要有接线断言；② 断言必须**全域扫描** `ptrade/*.py`，**不得按文件枚举**（否则新路径落在别的模块就完全不被看见）；③ 断言必须**非空洞** —— 要断言「**至少找到一个调用点**」，否则「没人调用它了」也会恒绿 | `tests/test_wiring_invariants_v2.py`（**8 条**：W1 守卫错误不被 `DataUnavailable` handler 吞 · W2 两个网络出口都调 `_net_guard` · W3/W3b 周期清单是单一真源（含 CLI `--period choices`）· W4 容差阈值是推导式且 `scale` 当前不可达 · W5 `with_today_bar` 的两个前置都在 · W6 `min_rows` 接在生产调用点 · 自检 ≥6 条且不得 skip）· `tests/test_datasource_v2.py::test_T_W1_5_production_call_sites_pass_min_rows`（**独立的第二实现** + 检测器自测）· 变异：删掉生产调用点的 `min_rows=` → **两条独立判据均红** |
+
+| INV-59 | **「仅本地监听」必须是硬闸，不是提示**。`create_server(cfg, host=...)` 对**非回环**地址**默认拒绝**并抛 `ValueError`；只有显式 `allow_remote=True`（CLI 的 `--allow-remote`）才放行。**回环白名单**：`127.0.0.1` / `localhost` / `::1` / 整个 `127.0.0.0/8`。**保守**：不做 DNS 解析 —— `example.com` 这类**名字**一律拒绝（能解析到非回环的名字不该被当作本地）。CLI 侧在**解析参数后立刻**返回**退出码 2** + 可操作提示（不抛栈）。**为什么必须**：ultraqa 实测修前 `create_server(host="0.0.0.0")` **真的绑成功**（`('0.0.0.0', 60886)`），只有启动横幅**警告一次** —— 而网页端**无鉴权**（`banner()` 自己写着「同网段的任何人都可以查看账户、下单、平仓与结算」）⇒ 用户级硬约束「仅本地监听」**只有一句提示、没有闸** | `tests/test_webapp_v2.py::T-W3-7`（**必须配正对照**：回环必须能绑成功 + `allow_remote=True` 时 `0.0.0.0` 也能绑 —— 否则「一律拒绝」也会过）· `T-W3-7b`（CLI rc=2 + 提示含 `allow-remote`；正对照断言 `--allow-remote` 透传到 `serve`）· 变异：把 `_is_loopback` 改成 `return True` → T-W3-7 ②③ 必红 |
+
+---
+
+## 8.2 v4 说明：为什么 INV-52..57 是「看盘 / 数据源 / 渲染」三类的分界
+
+`INV-52..57` 由 v4（网页端 v2）引入，起因是用户在实际使用中撞到的 8 个问题。三条主线的共同点：
+**它们都是「用日历或理想值推导当前状态」的变体**，而本项目已因此栽过四次
+（P3-2 下单 asof → `_latest_report_period` 报告期 → 图表不含今天 → 完整日硬阈值 240）。
+
+| 类别 | 不变量 | 一句话 |
+|---|---|---|
+| **看盘 vs 下单** | INV-52 | 看盘含今天（数据驱动），下单防未来函数；**由 AST 白名单守住** |
+| **数据源** | INV-53/54/55 | 单出口 + 缓存守卫 + 容差判据 |
+| **渲染** | INV-56/57 | 分时独立分支 + 陈旧拒合成 |
+
+**共同纪律**：每条判据都必须能证明「**违反时会红**」（变异验证），
+且必须声明**数据从哪来** —— 夹具环境（`conftest` 只复制 `data/fixture`）与仓库根
+（含 `data/cache`）的数字**完全不同**，本项目已因此写出过**空断言**
+（`industry_of('600519')` 在夹具环境**修前就绿**）。
+
+---
+
+## 8.3 v4 补充：判据失效的**五类形态**（必须逐条防）
+
+> ★ **本节自身的自洽由 architect 第 2 轮抓出**：标题原写「三种」而表内有五条 ——
+> **在专门固化「文档自洽」的小节里，标题与表体不一致**，且 A13 的 family g 只钉固定计数 token、没抓到。
+> 现按**对策的分野**分成两组：**1–3 是「变异过程」出错**（同一个对策族：让变异可证伪），
+> **4–5 是「判据设计」出错**（另一个对策族：让判据有语义 / 有上下文）。
+> 两组共 **5 类**。**计数不要写进散文**（会漂）；写进标题就必须同步维护。
+
+### A 组：变异**过程**出错（对策：让变异可证伪）
+
+本项目在 v4 期间这三类**全部真实出现过**，且表现**完全相同**（都是「测试仍然绿」）：
+
+| 形态 | 实例 | 对策 |
+|---|---|---|
+| ① **变异没应用**（脚本 no-op） | Lead 用了**文档里不存在**的行号作锚点，`replace` 静默成功但没改到东西 | `assert` 变异后**字节确实变了** **且**锚点文本已消失 |
+| ② **守卫被自己改弱** | Lead 改 A13 时把「符号就近」在实现期一律降为软判据 → 变异不再有效 | 变异脚本必须跑**严格模式**；断言**基线两条判据都是绿的**（否则实验无意义） |
+| ③ ★ **变异应用了但打偏了** | ① Lead 改了 `intraday` 里**另一条** `raise`；② plugin-author 的 `replace(...,1)` 命中了 `api_search` 里的**同款代码**；③ core-builder 只查 `Compare.left` 而常量在 `comparators` 一侧 | (a) **唯一性断言** `text.count(old) == 1`；(b) 锚点**必须来自实测源码**，不得凭记忆；(c) 断言**红的理由来自预期断言文案**（不只断言「红了」）；(d) 检测器配**自测**（喂已知违规必须报） |
+
+### B 组：**判据设计**出错（对策：让判据有语义 / 有上下文）
+
+| 形态 | 实例 | 对策 |
+|---|---|---|
+| ④ ★★ **只验「位置对」、不验「语义对」**（**该红不红**） | Lead 新建的接线判据 `test_W1_*` 原本**只检查 handler 顺序**。strategy-builder 做盲区取证：把 handler 改成 `except NetworkForbiddenInLock: return ds.intraday(code)`（**原地吞掉**）→ **判据照样绿**。**修的是「空守卫」，写的又是「空守卫」**。core-builder 第一版 `C1_C4` 新判据同样（**固定 1s 取样窗口**，被它自己的变异 M1 证明仍绿） | 接线类判据**必须再配一条语义/行为断言**：本例改成「handler 必须**显式呈现**错误（re-raise **或**返回 ≥400 的错误响应）」，而 `Response(200, ...)`（业务态）**不满足**。同理：覆盖类判据必须回答「**内容错了会不会红**」（`owner-hint` 用「pid 写成常量 999999」实证）；R6 除顺序外必须断言「**取数次数 == 1**」 |
+| ⑤ ★ **不区分上下文 → 对说明文字报警**（**不该红乱红**） | Lead 的硬约束检查器第一版**逐行扫文本**，把**注释与 docstring 里**解释守卫的示例（`<script src="https://cdn...">` —— 那两句正是在说明「真外链会被抹掉」）报成了 **3 处违规**，全是误报 | 判据必须**按上下文取值**：用 **AST 取真实字符串常量并排除 docstring**，而不是逐行文本扫描。★ **⑤ 与 ④ 是同一枚硬币的两面**（该红不红 / 不该红乱红）：**噪声会让判据失去信任，比没有判据更糟** |
+
+**★ 另有一个反复出现的「自指陷阱」，它是 ④/⑤ 的近亲，单列**：
+「**判据的正文/源码里含有它自己要禁的字符串**」——
+已发生 **4 次**：A13 的规则正文含被禁 token；`test_wiring_invariants_v2.py` 的自检用
+`getsource(me).count("pytest.skip(")` **数到了自己那行源码**（恒红）；Lead 的 A13 自检字符串；
+Lead 的声明式自检（把 5 条引用数成 29 条）。**对策**：按 **AST 数真实调用**，而不是数文本；
+断言里不要出现被断言的字符串字面量。
+
+**另外两条已固化的纪律**：
+
+1. **EOL 必须先探测**：`read_bytes().decode()` **不做换行转换**（`read_text()` 才会），
+   所以 CRLF 文件上用 `\n` 拼的锚点**永远匹配不上** —— 而表现与「锚点写错了」完全一样。
+   本项目已踩 **3 次**（`webapp.py` 是 CRLF、`webui.py` 是 LF）。
+2. **含引号 / 反引号 / 正则的脚本一律落成文件再跑**，不得用 `python -c` + PowerShell here-string
+   （here-string 会吃掉 `\"`，本项目已踩 **4 次**；其中一次直接导致 ledger 条目**没写进去**）。
+
+### 第三条纪律：**basetemp 与删除**（2026-10-16 由 architect code-review 验尸建议固化）
+
+> 起因：同一天**两次同款事故** —— engine-builder 对共享 `D:\pytest-bt` 用了过宽的
+> `Remove-Item -Recurse "$target\*"`，**误删 16 个同伴的 basetemp 目录**；
+> strategy-builder 清理时按**前缀 `^pn-`** 过滤，**误删了 `pn-p2*` / `pn-p3*`**。
+> 两次都已核实**无证据损失**（被删的都是可弃的 pytest 脚手架），但**不该靠运气**。
+
+1. **basetemp 必须唯一且用字面量**：`--basetemp=D:\pytest-bt\<member>-<task>`。
+   ★ **禁止**指向共享父目录本身 —— `pytest` 启动时会**清空 basetemp 的内容**，
+   把父目录当 basetemp 等于把所有人的临时目录一次清掉。
+2. **删除只允许「解析后的绝对路径」**：先 `Resolve-Path` 打印、**确认解析结果 == 目标字符串**，
+   **再删那一个目录**。★ **禁止** `*` / `?` / **前缀匹配** / 未确认的 `-Recurse` 批量删除
+   —— 前缀过滤在共享目录上**等价于**通配删除。
+3. **别人的目录只读不删**；确实需要清理他人产物时，先 `send_message` 确认再动。
+4. ★ 与 **A 组形态③「变异打偏」同源**：`str.replace(..., 1)` 与 `Remove-Item` 的前缀过滤
+   **都会静默命中你没打算动的目标** —— 所以**两者都必须先断言命中了什么**。
 
 ---
 
@@ -1101,3 +1189,93 @@ python -m ptrade chart --code 600519 [--period daily|weekly|monthly] [--asof 202
 | L15 | **行业排名路径在离线夹具下事实上不可达**（`industry_map.json` 仅 31 行、最大行业 4 只 → 全池 `competitors < 10` → 一律降级绝对分档） | 属**夹具覆盖度**限制而非实现缺陷；live 路径取 `quarterly_report(最新期)`（全市场 `stock_yjbb_em`），真实行业成员数足够触发百分位路径 | 百分位路径的覆盖由 11 只合成行业的用例保住（`test_l_gate_requires_ten_comparators` 等） |
 | L16 | **`chart.py` 的浏览器内实际渲染未验证** | 只验到 payload、指标数值与 HTML 自包含性；周/月线切换在真实浏览器中的渲染无浏览器面可验 | verifier 将以「三周期数据集齐全 + 切换绑定 + bars 数一致」的**静态等价断言**替代，并在 evidence 中显式标注**非浏览器验证** |
 | L17 | **未覆盖**：`offline=False` 真实联网路径、缓存 TTL 15:30 失效分支、多批次+部分卖出+跨日解冻组合、`close --ratio<1` 分批、`build_plan` 每种 binding 精确算例 | 安全边界（禁外网副作用）与时间旅行成本 | 原样记入最终摘要的「未覆盖」一节，不粉饰 |
+
+---
+
+## 8.4 v3（最小可行子集 / MVS）
+
+> 用户 2026-10-19 拍板：**不引入 Vue/Vite**，走最小可行子集（真源 `.omx/plans/prd-ptrade-web-v3.md` 的 **R2**）。
+> 本轮只动「搜索 / 自选 / 操作条 / 去离线开关 / 同页 ECharts / 共享 option 构建器」，**不改任何指标算法与打分口径**。
+
+### INV-63 名称表可用性
+
+`load_name_table` 读到**行数 < `NAME_TABLE_MIN_ROWS`(3000)** 或**内容锚点不全**
+（`600519→贵州茅台` · `000001→平安银行` · **`603009→北特科技`**）时，**必须**报「名称表不可用/已损坏」，
+**不得**静默返回 `[]`（那会被用户读成「没这只票」）。
+* 错误信息**必须**带：**行数 + `fetched_at` + 修复指引**（点刷新 / 删 `data/cache/stock_list.json`）。
+* **缓存缺失**时可用 `data/fixture/spot.json` 作**只读兜底**（**不得联网**）。
+* `--offline` 下**禁止**刷新（`refresh_name_table` 抛 `DataUnavailable`）。
+
+### INV-64 前端不得决定 offline（且服务端不被请求参数决定）
+
+* 前端**不得**出现「离线」开关、**不得**拼 `offline=` 查询参数。
+* 服务端：`offline = _as_bool(query.get("offline"), self.offline) or self.offline`
+  —— ★ **`or self.offline` 是下界**：进程级 `--offline` 为真时，请求**无法放宽**（只能收紧，收紧允许）。
+* ★ **`--offline` 的进程级语义不变**：绝不离线联网（`INV-10`/`INV-42` 不受影响）。
+
+### INV-65 图表单一数据真源 + 单一 K 线 option 构建器
+
+* Web 图表与 CLI/HTML 图**同源** `chart_payload`；K 线 option **只能有一份**构建器
+  （`ptrade/webui_assets/chart_option.js`）；`chart.py` 用**唯一一个** `_inline_js()`（剥行首 `export `）内联它，
+  前端经 `/static/chart_option.js` 加载**同一文件**。**这一半是「结构级」保证。**
+* **已知例外（有意，不是漏）**：分时渲染器 `buildOptionIntraday`（`chart.py`）形状不同（均价线/成交量柱/无 7 面板），
+  **保留独立**，由 `T-V3-19` 的**具名白名单**覆盖。
+* ★★ **迷你蜡烛 = 「结构级」单一真源（结构债已于 2026-10-19 结清）**：
+  **只有一份实现** —— `chart_option.js` 的 `miniCandlestick(axisIndex)`。
+  `chart.py` 的旧实现 `_miniCandlestick()` 与 `__CHART_OPTS__`「Python 生成 JSON 再注入」那套机制**已彻底删除**
+  （净删约 30 行）；页面胶水**直接调用**内联在同一 `<script>` 作用域里的 `miniCandlestick(1)` / `miniCandlestick(5)`。
+  * 判据：`T-V3-24`（**两路径** BOLL(grid1)/SAR(grid5) 各恰好 1 颗蜡烛，变异必红）+ `T-V3-24c`（**结构级**：
+    `chart.py` 无 `def _miniCandlestick`、三个旧字样 0 次、全仓仅一处 `function miniCandlestick(`，
+    ★ 且**非空洞** —— `chart.py` 仍必须真的有 `miniCandlestick(1)/(5)` 调用）。
+  * 原 `T-V3-24b`（跨语言全字段深等）**随之退役**：跨语言判据只能证明「两份相同」，
+    **不能证明「两份都对」**（BOLL/SAR 曾因 `yAxis` 缺 `scale:true` 完全不可见，两份一起错它就会绿）——
+    这正是当初必须消灭两份实现的理由。
+  * 真机复验（CDP）：结构改动后 `candlestickAxes` 仍为 `[0,1,5]`、`nonWhitePixels` 与改动前**完全相同（32,900）**。
+
+### 8.4.1 ★★ 两套「外链」定义（**必须分写，不得互相套用**）
+
+同一份 ECharts 有两种投递方式，**「外链」的含义不同**：
+
+| 场景 | 判据语义 | 谁判 |
+|---|---|---|
+| **CLI / `render_chart` 导出** | **单文件自包含**：任何资源引用（**含相对/绝对路径**）都算外链 | `chart.py` 的 `_is_external_url` / `no_external_refs` |
+| **Web 主页** | **同源多资源**：允许 `/static/*`、`/vendor/*`（**本机静态**）；禁止 `http(s)://`、`//`、CSS `url(http…)` | **CDP `Network` 域同源断言**（只允许 `127.0.0.1:<port>` / `data:` / `blob:`） |
+
+⚠️ **禁止**把 `no_external_refs` 套到 Web 页上（它会把 `/static/chart_option.js` 系统性误报成外链）。
+⚠️ **禁止**把「Web 页允许同源多资源」倒推成「CLI 导出也可带相对路径」。
+
+### 8.4.2 `webui.py` 的拆分触发条件（**现在不拆，到线再拆**）
+
+`webui.py` 现为 **857 行 / 约 42 KB 的单个 HTML+CSS+JS 字符串资产**（文件内**无任何 `def`**，Python 侧零逻辑），
+经 `api_root` 原样返回。**当前是可接受的 MVS 终态**（增长主因——图表 option/ECharts——已搬走）。
+
+**满足任一条件即拆**成 `webui_assets/app.js` + `<script type="module" src="/static/app.js">`
+（`/static/*` 路由已就绪）：
+
+1. `webui.py` > **55 KB** 或内嵌 JS > **900 行**；
+2. 需要**第二个** JS 模块；
+3. 单个新功能新增 JS > **100 行**；
+4. **再出一次 here-string 转义事故**（本项目已 3 次）。
+
+### 8.4.3 测试侧的「柔性层」（**可以存在，但必须能自证**）
+
+* **历史用例隔离**（`NAME_TABLE_MIN_ROWS` 临时放宽）**只能**用 **scoped `monkeypatch`**，
+  且**必须在同一用例内**加反向断言（`assert NAME_TABLE_MIN_ROWS == 3000`），否则红。
+  ⇒ 🔁 待办：收成 `lenient_name_table()` contextmanager（退出即断言恢复），把「判据级」升成「结构级」。
+* 任何「判据的判据」**不得**作为唯一防线超过一个版本。
+  （原 `T-V3-24b` 已按此退役 —— 迷你蜡烛改为**结构级单一实现**后它不再需要，见 INV-65。）
+
+### 8.4.4 ★ 判据对 **node** 的依赖（**交付/CI 必须保证 node 可用**）
+
+| 判据 | 需要 node？ | 无 node 时 |
+|---|---|---|
+| `T-V3-24`（**两路径** BOLL/SAR 各 1 颗蜡烛，**求值运行时 option**） | **需要** | **skip** |
+| `T-V3-24c`（**结构级**：`_miniCandlestick` 不存在 / 全仓仅一处 `function miniCandlestick(` / 旧字样 0 次 / ★ 非空洞：`chart.py` 仍必须真有 `miniCandlestick(1)/(5)` 调用） | **不需要**（纯文本 + AST） | **仍运行** ✓ |
+| `test_tw2_3_factory_change_moves_both_panels`（`barWidth` 取值唯一 + 两面板运行时蜡烛都取该值） | **部分需要** | 运行时那半边 skip |
+
+★ **所以：无 node 的机器上，「结构级」判据仍在（`T-V3-24c`），但「行为级」判据会静默消失。**
+⇒ **交付声明与 CI 必须写明 node 是构建/验证的前置**；若某次交付是在无 node 环境验证的，
+**不得声称「两路径蜡烛已验证」**（只能说「结构级单一实现已验证」）。
+
+★ 这条是 code-review **M3** 的直接产物：`skipif(NODE is None)` 本身没错（不能让无 node 机器全红），
+错在**没人写下来「哪一层防线会消失」** ⇒ 假绿的温床。

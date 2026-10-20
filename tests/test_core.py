@@ -851,10 +851,30 @@ def test_state_document_schema_version_is_3(state):
 
 
 @pytest.mark.parametrize("version", [1, 2, None, "3"])
-def test_state_from_document_rejects_other_versions(version):
+def test_state_from_document_rejects_other_versions(version, cfg):
     doc = {"schema_version": version, "app": {"initial_cash": 1.0}, "state": {}}
     with pytest.raises(ValueError):
-        core.state_from_document(doc)
+        core.state_from_document(doc, cfg)
+
+
+def test_state_from_document_requires_cfg(cfg):
+    """**`state_from_document` 的 `cfg` 也是必填** —— 与 `restore` 的 v3.1 决定对称。
+
+    ★ 修前签名写的是 `cfg: AppConfig | None = None`，但它**无条件**把 `cfg` 传给 `restore`
+      ⇒ 不传 cfg 会炸 `AttributeError: 'NoneType' object has no attribute 'margin'`
+      （「签名说可选、实际必需」）。这个瑕疵由 engine-builder 在做两融 E2E 矩阵时发现并上报。
+    ★ **为什么不改成「None 时 `load_config()`」**：那会重新引入 `restore` 明令禁止的危害 ——
+      自定义 root 的账户会被**当前目录的**默认配置解析，`margin_ratio_long` 一变
+      `margin_required` 就算错。所以正解是**让签名如实**。
+    """
+    doc = {"schema_version": core.SCHEMA_VERSION, "app": {"initial_cash": 1.0}, "state": {}}
+    with pytest.raises(TypeError):
+        core.state_from_document(doc)          # type: ignore[call-arg]
+
+    # 正对照：传了 cfg 就必须能解析（证明上一条不是「怎么都抛 TypeError」）
+    st = core.state_from_document(doc, cfg)
+    assert isinstance(st, core.AccountState)
+    assert st.initial_cash == 1.0
 
 
 def test_restore_requires_cfg():

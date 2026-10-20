@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """tests/test_webapp.py —— W3 网页服务契约测试（test-spec §4 的 W1–W11）。
 
 测试策略
@@ -690,6 +690,37 @@ def test_w9_chart_inlines_html(web_cfg):
 # --------------------------------------------------------------------------- #
 # W2（顺带）：search / watchlist / score 端点（W2 模块未落地时 skip）
 # --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _legacy_small_tables(request, monkeypatch):
+    """**历史用例隔离**（V3-W3）：本文件里的旧用例用 2/4 行 mock 名称表，
+    它们的**被测语义**是 offline 红线 / 查询参数解包 / INV-36 语义，**不是「坏表检测」**。
+
+    ⇒ 这些用例在 `search.load_name_table` 引入**读路径守卫**（行数 ≥3000 + 内容锚点）后会被拦下，
+    但那是**守卫生效的必然结果**，不是它们的被测目标。
+    本 fixture 只给 `test_T_V3_*` **以外**的用例**临时**放宽阈值。
+
+    ★★ **这不是「为变绿放宽断言」**：守卫的**鉴别力**由 `test_search.py` 的 `T_V3_1/1b` 在
+    **真实阈值**下钉住（本文件的 `_v3_keeps_true_thresholds` 负责反向断言）。
+    """
+    if request.node.name.startswith("test_T_V3"):
+        return
+    from ptrade import search as _search
+
+    monkeypatch.setattr(_search, "NAME_TABLE_MIN_ROWS", 1)
+    monkeypatch.setattr(_search, "NAME_TABLE_ANCHORS", {})
+
+
+@pytest.fixture(autouse=True)
+def _v3_keeps_true_thresholds(request):
+    """**反向断言**：`test_T_V3_*` 若出现在本文件，必须看到**真实阈值**（隔离 fixture 不得漏进来）。"""
+    if not request.node.name.startswith("test_T_V3"):
+        return
+    from ptrade import search as _search
+
+    assert _search.NAME_TABLE_MIN_ROWS == 3000, "T_V3_* 竟被历史用例的宽松 fixture 影响（静默失守）"
+    assert _search.NAME_TABLE_ANCHORS.get("603009") == "北特科技"
+
+
 def _write_name_cache(cfg, rows: list[dict]) -> str:
     """写一份新鲜的全市场名称表缓存（search 的离线数据源）。"""
     from datetime import datetime, timezone
@@ -729,6 +760,12 @@ def test_api_search_no_hit_is_empty_not_error(web_cfg):
 def test_api_search_without_cache_is_business_error(web_cfg):
     """INV-36：「拿不到数据」必须是显式失败（ok=false），不得静默返回空列表。"""
     pytest.importorskip("ptrade.search", reason="search.py（W2）尚未就绪")
+    # ★ V3-W3：`load_name_table` 现在**缓存缺失时会用 spot 夹具兜底**（T-V3-2 的明确要求），
+    #   所以「无缓存 ⇒ 报错」这个旧前提在本夹具环境**不再成立**。
+    #   要测 INV-36 的「拿不到数据 ⇒ 显式失败」，必须**同时**去掉兜底数据源（删除夹具 spot）。
+    spot = os.path.join(str(web_cfg.root), "data", "fixture", "spot.json")
+    if os.path.isfile(spot):
+        os.remove(spot)
     status, payload = _call(_app(web_cfg), "GET", "/api/search", query={"q": ["600519"]})
     assert status == 200, payload
     assert payload["ok"] is False
@@ -1025,9 +1062,7 @@ def test_v1_process_offline_cannot_be_relaxed_by_request(web_cfg, requested):
     status, payload = _call(app, "GET", "/api/search", {"q": ["600"], "offline": [requested]}, None)
     assert status == 200, payload
     assert payload["ok"] is True, payload.get("error")
-    assert payload["data"]["offline"] is True, (
-        f"?offline={requested} 解除了进程级 --offline：data.offline={payload['data']['offline']}"
-    )
+    assert payload["data"]["offline"] is True
 
 
 def test_v1_process_online_allows_request_to_tighten(web_cfg):
@@ -1039,7 +1074,7 @@ def test_v1_process_online_allows_request_to_tighten(web_cfg):
     app = _app(web_cfg, offline=False)
     status, payload = _call(app, "GET", "/api/search", {"q": ["600"], "offline": ["true"]}, None)
     assert status == 200
-    assert payload["data"]["offline"] is True, "进程在线时请求级 ?offline=true 未生效"
+    assert payload["data"]["offline"] is True
 
 
 # --------------------------------------------------------------------------- #
@@ -1246,7 +1281,7 @@ class WebApp_MapProbe:
     ("POST", {}, {"code": "600519"}),
     ("DELETE", {"code": ["600519"]}, None),
 ])
-def test_m5_watchlist_lock_timeout_maps_to_503(web_cfg, method, query, body):
+def test_m5_watchlist_lock_timeout_maps_to_503(web_cfg, method, query, body, monkeypatch):
     """**M5**：`/api/watchlist` 在锁被占用时返回 **503 + `STATE_LOCK_TIMEOUT`**。
 
     做法：另一个线程持锁 1.5s，本请求把 `lock_timeout` 压到 0.4s。
@@ -1257,6 +1292,30 @@ def test_m5_watchlist_lock_timeout_maps_to_503(web_cfg, method, query, body):
     from ptrade import store
 
     app = _app(web_cfg, lock_timeout=0.4)
+
+    # ★★ v3 修订（P0-4 之后 POST 分支的形态变了）：
+    #   `add_to_watchlist` 已**整体移出** `WebApp._state_lock()`、改为**在它内部自己取写锁**
+    #   （目的是让名称解析发生在写锁**之前**，见 INV-42 / Architect P0-4）。
+    #   因此「外部持锁 1.5s」**不再能让它超时** —— 它自己那次取锁有 10s 预算，1.5s 等不到
+    #   ⇒ 会正常返回 200（**这是正确行为**，本用例原写法因此变成环境性假红）。
+    #   ⇒ POST 分支改为**直接注入锁超时**，断言点保持**不变**：
+    #   webapp 必须把它映射成 `503 + STATE_LOCK_TIMEOUT`（INV-45）。
+    #   DELETE 分支仍在 `WebApp._state_lock()` 内，沿用「外部持锁」的做法。
+    if method == "POST":
+        from ptrade import store as _store_mod
+        from ptrade import watchlist as _wl_mod
+
+        def _boom(*_a, **_k):
+            raise _store_mod.StateLockTimeout("injected-by-test", root=str(web_cfg.root), timeout=0.4)
+
+        monkeypatch.setattr(_wl_mod, "add_to_watchlist", _boom)
+        status, payload = _call(app, method, "/api/watchlist", query, body)
+        assert status == 503, (
+            f"POST /api/watchlist 锁超时应为 503（INV-45），实际 {status}: {payload.get('error')}"
+        )
+        assert "STATE_LOCK_TIMEOUT" in str(payload.get("error")), payload
+        return
+
     ready = threading.Event()
 
     def hold():

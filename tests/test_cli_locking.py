@@ -58,7 +58,7 @@ def prepare_root(root: pathlib.Path) -> None:
         else:
             missing.append(name)
     if missing:
-        pytest.skip("缺少夹具 " + ", ".join(missing) + " —— 先跑 python tools/fetch-fixtures.py")
+        pytest.skip("缺少夹具 " + ", ".join(missing) + " —— 先跑 python data/fixture/build_fixtures.py")
 
 
 def run_cli(root: pathlib.Path, *args: str, timeout: float = 120.0) -> subprocess.CompletedProcess:
@@ -157,15 +157,32 @@ WRITE_COMMANDS: list[tuple[str, tuple[str, ...]]] = [
 ]
 
 
+def _read_owner_hint(lock_file: pathlib.Path) -> str:
+    """读锁文件里的 owner-hint（诊断线索）。
+
+    ⚠️ **必须跳过第 0 字节**：那是锁区，Windows 的字节范围锁**连另一个进程的句柄**
+    都不允许读它 —— 直接 ``read_text()`` 会 ``PermissionError: [Errno 13]``
+    （本用例第一版就这么红的，正好也证明了「锁区真的被锁住了」）。
+    """
+    with open(lock_file, "rb") as fh:
+        fh.seek(1)
+        return fh.read().decode("utf-8", errors="replace")
+
+
 @pytest.mark.parametrize("label,args", WRITE_COMMANDS, ids=[c[0] for c in WRITE_COMMANDS])
 def test_C1_C4_write_command_waits_for_lock(tmp_path, label, args):
     """**C1/C4**：外部进程持写锁时，每个写命令都必须**等**到锁释放。
 
-    判据（不依赖机器速度的绝对值，用**同一命令自身的无争用基线**做对照）：
-    ``持锁时长 - 基线耗时`` 必须显著大于 0 —— 说明它真的在等锁，而不是无视锁直接写。
+    ★ **G011：判据已从「墙钟差值」改成确定性判据**（原写法在并发负载下必然假红）：
+    原判据是 ``争用耗时 − 基线耗时 > 1.5s`` —— 基线会被负载抬高（实测 ~1s → 1.93s），
+    差值被压缩到 1.44s → 假红。**墙钟谓词与产品行为无关**，已彻底删除。
 
-    实测（Critic 独立复现）：修复前 4 个命令相对基线分别只多等 0s（完全不等），
-    修复后多等 2.78–3.04s。
+    现在的三条判据（全部与机器速度/负载无关，且**更强**）：
+    1. **持锁期间 ``state.json`` 一个字节都没变** —— 这是「绕过锁直接写」的**直接 falsifier**
+       （原判据只能从"多花了时间"**推断**它等了锁，推断不出"它没偷写"）；
+    2. **持锁期间命令进程仍在运行** —— 它没有"不等锁就把活干完"；
+    3. **释放后命令确实取到了锁** —— 锁文件的 owner-hint 换成该命令的 pid
+       （G011 同时给 owner-hint 补了覆盖；这条把"等待"升级为"确实获得了锁"）。
     """
     root = tmp_path
     prepare_root(root)
@@ -175,35 +192,72 @@ def test_C1_C4_write_command_waits_for_lock(tmp_path, label, args):
         cli_json(root, "order", "--code", CHEAP_CODE, "--side", "buy", "--qty", "10000",
                  "--price", CHEAP_PRICE, "--trade-date", TRADE_DATE)
 
-    # 1) 无争用基线
-    t0 = time.monotonic()
-    base = run_cli(root, *args, timeout=180)
-    baseline = time.monotonic() - t0
-    assert base.returncode in (0, 1), base.stderr[:400]
+    from ptrade import store as store_mod
+    from ptrade.config import load_config
 
-    # 2) 有争用：另起进程独占锁 3s
+    cfg = load_config(str(root))
+    state_file = pathlib.Path(store_mod.state_path(cfg))
+    before = state_file.read_bytes()
+    lock_file = pathlib.Path(store_mod.lock_path(cfg))
+    use_hint = store_mod._OS_BACKEND is not None   # 退化后端把 hint 写在 .excl 里，本用例不覆盖
+
+    # ── 外部进程持锁 ──
     import multiprocessing as mp
 
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
     hold_seconds = 3.0
-    proc = ctx.Process(target=_holder_process, args=(str(root), hold_seconds, queue))
-    proc.start()
+    holder = ctx.Process(target=_holder_process, args=(str(root), hold_seconds, queue))
+    holder.start()
     assert queue.get(timeout=60)[0] == "held", "持锁进程未能取得锁"
 
-    t0 = time.monotonic()
-    contended = run_cli(root, *args, timeout=180)
-    waited = time.monotonic() - t0
+    if use_hint:
+        hint_held = _read_owner_hint(lock_file)
+        assert f"pid={holder.pid}" in hint_held, (
+            f"owner-hint 没记录持锁者 pid（{holder.pid}）—— 锁争用现场将失去唯一诊断线索"
+        )
 
-    proc.join(timeout=60)
-
-    assert contended.returncode in (0, 1), contended.stderr[:400]
-    extra = waited - baseline
-    assert extra > hold_seconds * 0.5, (
-        f"{label} 没有在等锁：基线 {baseline:.2f}s，争用时 {waited:.2f}s，"
-        f"多等 {extra:.2f}s（预期 >= {hold_seconds * 0.5:.2f}s）—— "
-        "说明该命令绕过了 store 的写锁（Architect B1 回归）"
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONPATH": str(REPO_ROOT)}
+    child = subprocess.Popen(
+        [sys.executable, "-m", "ptrade", *args, "--root", str(root), "--offline", "--json"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", env=env,
     )
+    try:
+        # ★ 判据 1/2：**在整个持锁窗口内持续观测** —— 状态文件一个字节都不能变、进程必须还活着。
+        #   ⚠️ 不要用「固定 1s 取样窗口」：CLI 启动 + import + 读夹具要 1~2s，
+        #   1s 窗口会**漏掉**「等锁逻辑坏了、命令到达锁点后立刻偷写」的场景
+        #   （G011 变异 M1 实测：固定窗口下该变异**仍绿** = 空守卫）。
+        #   循环条件绑定 `holder.is_alive()`：窗口 = 真实持锁期，长度由持锁方决定，
+        #   与机器速度/负载无关；负载高只会让观测**更不容易**抓到违规（不会假红）。
+        while holder.is_alive():
+            assert child.poll() is None, (
+                f"{label} 在锁被他人持有时就结束了（rc={child.returncode}）—— 它没有等锁"
+            )
+            assert state_file.read_bytes() == before, (
+                f"{label} 在锁被他人持有时改写了 state.json —— 它绕过了 store 的写锁（B1 回归）"
+            )
+            time.sleep(0.02)
+
+        # 等持锁方释放
+        holder.join(timeout=hold_seconds + 30)
+        assert not holder.is_alive(), "持锁进程没有按时退出"
+
+        # ★ 判据 3：命令最终**确实取到了锁**（owner-hint 记录的是它自己的 pid）
+        out, err = child.communicate(timeout=180)
+        assert child.returncode in (0, 1), err[:400]
+        if use_hint and child.returncode == 0:
+            hint_after = _read_owner_hint(lock_file)
+            assert f"pid={child.pid}" in hint_after, (
+                f"{label} 从未取得写锁（owner-hint 里始终没有它的 pid={child.pid}）—— "
+                "说明它绕过了锁，或根本没走 store.locked_update"
+            )
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.communicate(timeout=30)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(timeout=30)
 
 
 def test_C1_guard_without_lock_does_not_wait(tmp_path, monkeypatch):

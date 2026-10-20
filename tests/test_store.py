@@ -107,7 +107,10 @@ def _worker_hold_lock(root, hold_seconds, queue):
         time.sleep(hold_seconds)
 
 
-def _worker_atomic_writer(path, versions, barrier, queue):
+def _worker_atomic_writer(path, versions, barrier, queue, budget=None):
+    """并发原子写（S4）。``budget`` 给**写方**一个够用的重试预算（见 S4 的说明）。"""
+    if budget is not None:
+        store.WRITE_RETRY_BUDGET_SECONDS = budget
     barrier.wait()
     try:
         for i in range(versions):
@@ -134,7 +137,12 @@ def _worker_nonatomic_halfwrite(path, queue):
 def _worker_append_lines(path, count, barrier, queue):
     barrier.wait()
     for i in range(count):
-        store.append_jsonl(path, {"pid": os.getpid(), "i": i, "pad": "y" * 120})
+        # timeout=60（G008 rework，Lead 批准）：本用例的断言是「**不丢行**」，
+        # 不是「每次追加 <10s」。全量测试的 basetemp 现在强制走 D 盘，
+        # 而 **D 盘的 fsync 比 C 盘慢约 15×**（实测：单进程 60 次 append
+        #   C 盘 0.50s / D 盘 7.71s）→ 默认 10s 取锁预算会饿死第三个进程。
+        # ★ 放宽的是**预算**，不是**判据**：下面仍然要求 180 行且每行 JSON 完整。
+        store.append_jsonl(path, {"pid": os.getpid(), "i": i, "pad": "y" * 120}, timeout=60)
     queue.put("done")
 
 
@@ -376,7 +384,12 @@ def test_S4_atomic_write_is_never_observed_partial(tmp_path):
                 transient.append(repr(exc))
 
     threads = [threading.Thread(target=reader)]  # 1 个紧循环读者（PRD §9.2 的标定场景）
-    proc = CTX.Process(target=_worker_atomic_writer, args=(path, 25, barrier, queue))
+    # ★ 给写方一个够用的预算（G008 rework，同 S9 的授权原则：放宽预算、不放宽判据）：
+    #   本用例的判据是「**读者永远看不到半截 JSON**」（errors == []，未放宽），
+    #   不是「400ms 一定够」。D 盘 fsync 比 C 盘慢约 15× → 默认 400ms 会在
+    #   25 次 200KB 原子写 + 紧循环读者的组合下偶发 StateWriteTimeout（实测 1 次/4 次运行，
+    #   单独跑 3/3 通过 = 负载敏感型 flake）。产品默认预算仍由 S10 钉住（<=500ms）。
+    proc = CTX.Process(target=_worker_atomic_writer, args=(path, 25, barrier, queue, 3.0))
     try:
         for thread in threads:
             thread.start()
@@ -600,6 +613,37 @@ def test_fallback_backend_excludes_across_processes(tmp_path, monkeypatch):
     assert not os.path.exists(store.lock_path(str(tmp_path)) + store.EXCL_LOCK_SUFFIX)
 
 
+def test_owner_hint_records_the_holder_for_diagnostics(tmp_path):
+    """**owner-hint 覆盖**（G011）：取锁后，锁文件第 1 字节之后必须能读到**持有者 pid + 时间**。
+
+    为什么值得一条测试：它是**锁争用现场唯一的诊断线索** —— 我们排查
+    「D 盘 fsync 慢 15×」时正是靠它看到「谁的 pid 持着锁」。
+    G008 实测它**零覆盖**（删掉 ``os.write`` 没有任何测试变红）→ 删掉也不会有人发现。
+
+    ★ **同进程读回即可**：``os.write`` 之后**故意不 fsync**（诊断信息不需要崩溃持久性，
+    见 ``store._write_owner_hint`` 的 docstring）。**不要**为了「让测试更稳」把 fsync 加回来。
+    变异：删掉 ``os.write(fd, payload)`` → 本条必须红。
+    """
+    cfg = make_cfg(tmp_path)
+    init_account(cfg)
+    lock_file = store.lock_path(cfg)
+    with store.state_lock(cfg, timeout=5.0):
+        # ⚠️ **必须从第 1 字节开始读**：第 0 字节是锁区，Windows 的字节范围锁
+        # 连**本进程的另一个句柄**都不允许读它（实测 PermissionError 13）。
+        with open(lock_file, "rb") as fh:
+            fh.seek(1)
+            text = fh.read().decode("utf-8", errors="replace")
+        assert f"pid={os.getpid()}" in text, (
+            f"owner-hint 没写出持有者 pid（{os.getpid()}）—— 锁争用现场将失去诊断线索"
+        )
+        assert "at=" in text, "owner-hint 没写出获取时间"
+    # 释放后可以整读：第 0 字节必须是 NUL（锁区不被 hint 覆盖）
+    raw = pathlib.Path(lock_file).read_bytes()
+    assert raw[:1] == b"\0", "第 0 字节是锁区，不得被 hint 覆盖"
+    assert raw[1:], "hint 内容为空"
+    assert pathlib.Path(lock_file).is_file(), "常驻锁文件不得被删除"
+
+
 def test_fallback_backend_is_lossless_across_processes(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "_OS_BACKEND", None)
     cfg = make_cfg(tmp_path)
@@ -724,8 +768,18 @@ def _drive_writes_under_tight_reader(cfg, writes=200):
     return failures, reads
 
 
-def test_S9_all_writes_succeed_under_tight_reader(tmp_path):
-    """S9：1 个紧循环读者 + 写方 200 次 save_state → **成功率 100%**。"""
+def test_S9_all_writes_succeed_under_tight_reader(tmp_path, monkeypatch):
+    """S9：1 个紧循环读者 + 写方 200 次 save_state → **成功率 100%**。
+
+    ★ 给**写方**一个够用的预算（G008 rework，同一授权原则：放宽预算、不放宽判据）：
+    产品默认预算是 **400ms**（PRD §9.2 的 200–500ms，由 S10 第 776 行钉住，**未改**）；
+    但全量测试的 basetemp 现在走 **D 盘**，而 **D 盘的 fsync 比 C 盘慢约 15×**
+    （实测单进程 60 次 append：C 0.50s vs D 7.71s）→ 400ms 在 D 盘上连一两次
+    「写 tmp + fsync + replace」都不够，会出现 1/200 的 `StateWriteTimeout`。
+    本用例要验的是「**争用下不失败**」（判据：`failures == []`，未放宽），
+    不是「400ms 一定够」——后者是 S10 的职责。
+    """
+    monkeypatch.setattr(store, "WRITE_RETRY_BUDGET_SECONDS", 3.0)
     cfg = make_cfg(tmp_path)
     init_account(cfg)
     failures, reads = _drive_writes_under_tight_reader(cfg, writes=200)
@@ -769,7 +823,21 @@ def test_S10_retry_is_bounded_and_raises_explicit_error(tmp_path, monkeypatch):
     assert excinfo.value.error_code == "STATE_WRITE_TIMEOUT"
     assert isinstance(excinfo.value, OSError)  # 兼容按 OSError 捕获的调用方
     assert store.WRITE_RETRY_BUDGET_SECONDS <= 0.5, "预算必须 <= 500ms（PRD §9.2）"
-    assert elapsed <= store.WRITE_RETRY_BUDGET_SECONDS + 0.25, f"耗时 {elapsed:.3f}s 超出预算"
+    # ★ 原为**墙钟**断言 `elapsed <= budget + 0.25`（G008 rework 改掉）：
+    #   它测的其实是「每次尝试的 I/O 有多快」——D 盘 fsync 慢 15×，于是
+    #   3 次尝试就把 1.066s 花掉了，而「有界重试」这个**判据本身**并没有被违反。
+    #   本项目纪律也明确：不用墙钟谓词（CI flaky）。
+    #   换成两条**与盘速无关**、且更贴判据的断言：
+    #     ① 尝试次数有上界（预算 / 退避间隔 + 余量）；
+    #     ② 目标文件**原封不动**（这才真正证明「不得退化为非原子写」）。
+    max_attempts = 2 + int(store.WRITE_RETRY_BUDGET_SECONDS / store.WRITE_RETRY_INTERVAL)
+    assert len(attempts) <= max_attempts, (
+        f"重试 {len(attempts)} 次 > 上界 {max_attempts}（预算 {store.WRITE_RETRY_BUDGET_SECONDS}s"
+        f" / 间隔 {store.WRITE_RETRY_INTERVAL}s）"
+    )
+    assert open(store.state_path(cfg), encoding="utf-8").read() == before, \
+        "持续失败后目标文件被改动了 —— 退化成非原子写"
+    assert elapsed < 60.0, f"耗时 {elapsed:.1f}s 远超任何合理上界（有界重试失效）"
     assert len(attempts) >= 2, "只尝试了一次 —— 没有重试"
     # 底线：绝不退回非原子写 → 原文件完好、无 tmp 残留
     assert open(store.state_path(cfg), encoding="utf-8").read() == before

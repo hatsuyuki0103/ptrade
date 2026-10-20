@@ -181,10 +181,16 @@ def test_l4_atomic_write_leaves_no_tmp(offline_cfg):
 def test_l5_path_under_root(offline_cfg):
     expected = os.path.join(str(offline_cfg.root), "data", "watchlist.json")
     assert watchlist.watchlist_path(offline_cfg) == expected
+    # ★ 快照式污染检查（V3-W3 修）：
+    repo_file = os.path.join(str(ROOT), "data", "watchlist.json")
+    before = os.path.getmtime(repo_file) if os.path.isfile(repo_file) else None
     watchlist.add_to_watchlist(offline_cfg, GOOD)
     assert os.path.isfile(expected)
-    # 不得污染仓库主数据根
-    assert not os.path.isfile(os.path.join(str(ROOT), "data", "watchlist.json"))
+    # 不得污染仓库主数据根：**仓库根那份文件不得被本次调用改写**
+    after = os.path.getmtime(repo_file) if os.path.isfile(repo_file) else None
+    assert after == before, (
+        "向 tmp 数据根 add 竟然改动了仓库根的 data/watchlist.json（污染！）"
+    )
 
 
 def test_l5_two_roots_are_isolated(tmp_path, offline_cfg):
