@@ -50,8 +50,17 @@ export function buildOption(payload, period, opts) {
   const o = opts || {};
   const d = payload.periods[period];
   const d0 = d.dates.length;
-  /* 默认只显示最近 ~120 根（可缩放/平移） */
-  const startPct = d0 > 120 ? (1 - 120 / d0) * 100 : 0;
+  /* ★★ v6：**按周期**的默认可见根数（用户拍板：日线近半年 · 周线/月线近 5 年）。
+     旧实现是写死 `120` 并用**百分比**（`startPct`）。为什么改成**索引**：
+       ① 6023 根时 1% ≈ 60 根 ⇒ 百分比表达不出「≈120 根」；
+       ② 用日期字符串又会在 `dates` 有重复时按名字匹配、行为依赖实现；
+       ③ 用索引用确定：`startIndex = max(0, d0 - visible)`。
+     ★ 注意 `dataZoom` 两个组件（inside/slider）**必须用同一对索引** —— 只设一处会不同步。
+     ★ `filterMode:"filter"` 显式写：ECharts 5.5.1 的默认确实是 filter，但**显式才叫契约**。 */
+  const DEFAULT_VISIBLE_BARS = { daily: 120, weekly: 260, monthly: 60 };
+  const visible = DEFAULT_VISIBLE_BARS[period] || d0;
+  const startIndex = Math.max(0, d0 - visible);
+  const endIndex = Math.max(0, d0 - 1);
   /* 图例项（分组 → 扁平）：分组真源在 Python 的 `legend_groups()`，这里只展平 */
   /* ★ V4（用户诉求 4）：图例只留 6 条 —— MA12/24/48/96 + VOL MA5/MA10。
      **series 一条都不删**（只过滤图例条目）；面板标题里的说明（②⑤⑥）也不动，
@@ -198,8 +207,11 @@ export function buildOption(payload, period, opts) {
     axisPointer:{link:[{xAxisIndex:"all"}], label:{backgroundColor:"#1f6feb"}},
     grid:grids, xAxis:xAxis, yAxis:yAxis, series:series,
     dataZoom:[
-      {type:"inside", xAxisIndex:[0,1,2,3,4,5], start:startPct, end:100},
-      {type:"slider", xAxisIndex:[0,1,2,3,4,5], bottom:2, height:16, start:startPct, end:100}
+      /* ★ v6：**索引** + 显式 filterMode；两个组件同一对 startValue/endValue ⇒ 天然同步 */
+      {type:"inside", filterMode:"filter", xAxisIndex:[0,1,2,3,4,5],
+       startValue:startIndex, endValue:endIndex},
+      {type:"slider", filterMode:"filter", xAxisIndex:[0,1,2,3,4,5], bottom:2, height:16,
+       startValue:startIndex, endValue:endIndex}
     ]
   };
 }

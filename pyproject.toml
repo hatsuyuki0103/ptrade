@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ptrade"
-version = "1.9.0"
+version = "1.10.0"
 description = "A 股 CANSLIM 模拟盘：T+1 / 融资融券 / 风控 / 七因子打分 / K 线图"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,4 +36,5 @@ ptrade = ["vendor/*.js", "vendor/*.min.js", "*.html", "webui_assets/*.js"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = ["slow: 需真实长历史 / 真机性能 / 可能联网；默认不进 CI，发布前用 `pytest -m slow` 跑一次"]
 

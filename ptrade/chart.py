@@ -72,21 +72,13 @@ PERIODS_WITH_INTRADAY: tuple[str, ...] = PERIODS + ("minute",)
 PERIOD_LABEL = {"daily": "日线", "weekly": "周线", "monthly": "月线", "minute": "分时"}
 VENDOR_ECHARTS = Path(__file__).resolve().parent / "vendor" / "echarts.min.js"
 
-#: 取多少自然日的历史（保证 MA96 / BOLL20 / SAR 有足够预热）。
+#: ★★ **v6：`LOOKBACK_DAYS` 已删除**。
 #:
-#: ★ **单一真源**：值来自 :data:`ptrade.datasource.VIEWER_DAILY_DAYS` —— 查看路径的 asof 解析
-#: （``latest_trade_asof._latest_bar_day``）用**同一个跨度**取日线，这样 ``daily()``
-#: 的缓存 key（含窗口 ``(start, end)``）**才有命中可能**（ultraqa 实测：同源数据被取两遍）。
-#: ⚠️ 读的是**模块属性**（调用时解析），所以改真源会立刻传导过来，便于判据用 monkeypatch 验证。
+#: 它是 `LOOKBACK_DAYS = datasource.VIEWER_DAILY_DAYS` —— **全仓零使用的死别名**，而且
+#: **在导入时就冻结**了值：有人 monkeypatch 真源时它不跟着变 ⇒ 是「单一真源最隐蔽的失效形态」
+#: （注释写着"调用时解析"，实际是导入时快照）。判据 `V6-8` 断言它**不得存在**。
 #:
-#: ★★ **fail-safe（有意设计，务必保留）**：若两边窗口对不上（例如取数**锚点**不同、
-#: 或将来图的预热需求变了），后果**只是退回 2 次取数（变慢）**，**绝不会出错数据** ——
-#: key 不同 ⇒ 各自独立取数 ⇒ 每个调用方拿到的仍是自己那份完整数据。
-#: 「赚不到（省不下那一次取数）就退回原状，绝不为了省一次取数去动语义」是这条改动的原则。
-#: ⚠️ **已知且有意保留的残余**：两边的**锚点**不同（图用 `asof` = 有数据的那天；
-#: asof 解析用 `latest_trade_date()` = 日历末日，可能在**未来**）⇒ 当前**仍是 2 次取数**。
-#: 改锚点会砍掉窗口前段的 K 线并改变 MA/BOLL 早期值 ⇒ 明确**不做**（见 `chart_payload` 里的长注释）。
-LOOKBACK_DAYS = datasource.VIEWER_DAILY_DAYS
+#: 窗口起点现在由 :data:`ptrade.datasource.VIEWER_START_DATE` 说了算（见 `_start_of`）。
 
 #: 图例分组（**面板序 == yAxis 面板序**）—— 页面图例由 Python 生成后注入，
 #: 因此「Python 视图」与「页面实际图例」不可能漂移。``微型K线`` 是 BOLL/SAR 面板的
@@ -354,18 +346,24 @@ def _frame_payload(frame: pd.DataFrame) -> dict:
 
 
 def _start_of(asof: str, days: int | None = None) -> str:
-    """``asof`` 往前 ``days`` 个自然日；``days=None`` → **调用时**取真源
-    :data:`ptrade.datasource.VIEWER_DAILY_DAYS`（而不是导入时冻结的值 ——
-    后者会让「改真源」不再传导，是单一真源最隐蔽的失效形态）。
+    """图的时间窗口**起点**。
+
+    * ``days is None``（★ **默认，也是唯一生产路径**）→ 返回 :data:`ptrade.datasource.VIEWER_START_DATE`
+      （**A 股开市日 1990-12-19**，永久不变的锚）⇒ 数据源返回的第一根就是该票 **IPO 那天**；
+    * ``days=N``（**仅测试/兼容**）→ ``asof`` 往前 ``N`` 个自然日。
+
+    ★ **为什么不再用「N 天」当默认**（v6）：用户原话「不要算多少天，因为这个不都是天天变的么」——
+    「N 天」的起点会**随当前日期漂移**，而「A 股开市日」是**固定锚**；
+    且「从上市那天算起」这件事**不需要**上市日字段：锚点放早 ⇒ 数据源自然只从 IPO 开始返回。
     """
     from datetime import date, timedelta
 
     if days is None:
-        days = datasource.VIEWER_DAILY_DAYS
+        return datasource.VIEWER_START_DATE
     try:
         start = date.fromisoformat(str(asof)[:10]) - timedelta(days=int(days))
     except ValueError:
-        return "1990-01-01"
+        return datasource.VIEWER_START_DATE
     return start.isoformat()
 
 
@@ -527,7 +525,8 @@ def chart_payload(
     #   ⇒ **锚点分歧是已知的、有意的取舍（记入 backlog），不在这里修**。
     #     要么等 `daily()` 的缓存键与窗口解耦（core-builder 已推演：窄请求先到时**不达成** 2→1），
     #     要么由 Lead 在「省一次取数」与「前段根数不变」之间另行裁决。
-    start = _start_of(asof, datasource.VIEWER_DAILY_DAYS)
+    # ★ v6：不再传天数 —— 默认走**固定锚点** `VIEWER_START_DATE`（「从上市那天算起」）
+    start = _start_of(asof)
     if use_qfq:
         daily = ds.daily(code, start, asof, adjust="qfq")
         adjust_label = "前复权"
@@ -584,7 +583,19 @@ def chart_payload(
         periods[period] = _frame_payload(enriched)
 
     daily_dates = periods["daily"]["dates"]
+    # ★★ v6：**数据覆盖范围**（诚实标注）—— 让前端能说「数据从 2001-08-27 开始」。
+    #   ★ 位置刻意放在 `periods` 建好**之后**：`periods["daily"]["dates"]` 就是**图上真正画出来的那批日期**
+    #     （已含 `today_bar` 的合成 bar），用它算 `first/last` 才与用户看到的图严格一致。
+    #   ★ **刻意不给 `complete` 布尔**：从 `daily()` 的返回**无法区分**「这只票上市就是晚」
+    #     与「取数被上游截断/限流」（两者都表现为"第一根比较晚"）⇒ 给个假布尔比如实给三个可观测值更糟。
+    #     UI 显示「数据从 {first} 开始（请求窗口自 {requested_start}）」即可让用户自己判断。
+    coverage = {
+        "first": daily_dates[0] if daily_dates else None,
+        "last": daily_dates[-1] if daily_dates else None,
+        "requested_start": start,
+    }
     return {
+        "coverage": coverage,
         "code": str(code),
         "name": str(quote.get("name") or code),
         "asof": asof,
@@ -986,6 +997,11 @@ def option_data(payload: dict, period: str) -> dict:
         "initial_period": period,
         "code": payload["code"],
         "legend": legend_groups(payload),
+        # ★ v6：**数据覆盖范围**（`{first, last, requested_start}`）—— 前端据此明示
+        #   「数据从 2001-08-27 开始」；`--offline` 时明示「数据仅到 …（离线）」。
+        #   透传而不是重算：真源在 `chart_payload` 的 `coverage`（那里 `first/last`
+        #   取自 `periods["daily"]["dates"]`，即**图上真正画出来的那批日期**）。
+        "coverage": payload.get("coverage"),
     }
 
 

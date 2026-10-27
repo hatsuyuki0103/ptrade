@@ -1034,7 +1034,8 @@ def test_T_PN_13c_request_thread_fetches_daily_once(tmp_path, monkeypatch):
 
     **修前实测：请求线程 2 次** —— ultraqa 线程级 trace：50 天窗口 `2026-08-27~2026-10-16`
     ⊂ 2 年窗口 `2024-10-16~2026-10-16`，同源数据取了两遍（缓存 key 含窗口、互不命中）。
-    **修后 1 次**：asof 解析直接用与图相同的窗口 :data:`VIEWER_DAILY_DAYS` ⇒ 图随后**命中同一 key**。
+    **修后 1 次**：asof 解析直接用与图相同的窗口 —— ★ v6 起该窗口是**固定锚点** :data:`VIEWER_START_DATE`
+    （A 股开市日），图随后**命中同一 key**。
 
     数据来源：夹具当「假 akshare」（`_fetch_daily` 按请求窗口切片夹具行）+ 冷根（cache 为空）。
     → 测的是**真取数路径与缓存 key 是否共享**；离线读夹具**不经过** `_fetch_daily`，所以必须在
@@ -1044,7 +1045,8 @@ def test_T_PN_13c_request_thread_fetches_daily_once(tmp_path, monkeypatch):
     import pathlib
     import threading
 
-    from ptrade.datasource import VIEWER_DAILY_DAYS
+    # ★ v6：窗口真源从「N 天」换成**固定锚点**（A 股开市日）—— 单一真源的**语义没变**，只是真源换了
+    from ptrade.datasource import VIEWER_START_DATE
 
     repo = pathlib.Path(__file__).resolve().parent.parent
     payload = json.loads((repo / "data" / "fixture" / "daily_600519.json").read_text("utf-8"))
@@ -1100,10 +1102,10 @@ def test_T_PN_13c_request_thread_fetches_daily_once(tmp_path, monkeypatch):
         f"asof 解析的**请求线程**真取数 = {counts['req']}（应 ≤1；修前为 2）"
     )
     # ★ 模拟图的主查询：**同一窗口** ⇒ 必须命中缓存、不得再取数
-    ds.daily("600519", ds._offset(asof, -VIEWER_DAILY_DAYS), asof)
+    ds.daily("600519", VIEWER_START_DATE, asof)
     assert counts["req"] == 1, (
         f"图的主查询又取了一次（请求线程真取数 {counts['req']}）—— "
-        "asof 解析与图的主窗口没共享缓存 key（两边都要用 VIEWER_DAILY_DAYS）"
+        "asof 解析与图的主窗口没共享缓存 key（两边都要用 VIEWER_START_DATE）"
     )
     assert counts["spot"] == 0, f"请求线程触发了 {counts['spot']} 次 _fetch_spot（全市场快照）"
     assert counts["bg"] == 0, "本用例不应有后台线程取数"
@@ -1120,7 +1122,7 @@ def test_T_PN_13c_request_thread_fetches_daily_once(tmp_path, monkeypatch):
 
 def test_T_PN_13d_stale_snapshot_shares_viewer_window(tmp_path, monkeypatch):
     """★ **T-PN-13d**（补 code-review **M5** 的缺口）：**陈旧快照**形态下，
-    asof 探测与图的主查询必须**共享同一个 `VIEWER_DAILY_DAYS` 窗口**（只真取数 **1** 次）。
+    asof 探测与图的主查询必须**共享同一个窗口** —— ★ v6 起是**固定锚点 `VIEWER_START_DATE`**（只真取数 **1** 次）。
 
     ### 为什么必须单独一条（而不是靠 `T_PN_13c`）
 
@@ -1142,7 +1144,8 @@ def test_T_PN_13d_stale_snapshot_shares_viewer_window(tmp_path, monkeypatch):
     import pathlib
     import threading
 
-    from ptrade.datasource import VIEWER_DAILY_DAYS
+    # ★ v6：窗口真源从「N 天」换成**固定锚点**（A 股开市日）—— 单一真源的**语义没变**，只是真源换了
+    from ptrade.datasource import VIEWER_START_DATE
 
     repo = pathlib.Path(__file__).resolve().parent.parent
     payload = json.loads((repo / "data" / "fixture" / "daily_600519.json").read_text("utf-8"))
@@ -1186,10 +1189,10 @@ def test_T_PN_13d_stale_snapshot_shares_viewer_window(tmp_path, monkeypatch):
     )
 
     # ② ★ 图的主查询：**同一窗口** ⇒ 必须命中缓存
-    ds.daily("600519", ds._offset(asof, -VIEWER_DAILY_DAYS), asof)
+    ds.daily("600519", VIEWER_START_DATE, asof)
     assert counts["req"] == 1, (
         f"图的主查询又取了一次（请求线程真取数 {counts['req']}）—— "
-        "asof 探测与图的主窗口**没有共享** VIEWER_DAILY_DAYS 缓存 key"
+        "asof 探测与图的主窗口**没有共享** VIEWER_START_DATE 缓存 key"
     )
 
     # ③ 请求线程不得触发全市场快照
@@ -1198,7 +1201,7 @@ def test_T_PN_13d_stale_snapshot_shares_viewer_window(tmp_path, monkeypatch):
     assert counts["bg"] == 0, "本用例不应有后台线程取数"
 
     # ⑤ ★ 正对照：窗口**改小 1 天** ⇒ 缓存 key 不同 ⇒ 必须再取一次
-    ds.daily("600519", ds._offset(asof, -(VIEWER_DAILY_DAYS - 1)), asof)
+    ds.daily("600519", "1990-12-20", asof)   # ★ 与锚点差 1 天 ⇒ key 不同（fail-safe：退回 2 次取数，不错数据）
     assert counts["req"] == 2, (
         f"正对照失败：窗口改小 1 天后仍取数 {counts['req']} 次（应为 2）—— "
         "说明上面的「命中」不是因为「怎么查都不取数」，判据是空的"

@@ -423,35 +423,38 @@ def _record_daily(monkeypatch) -> list[tuple[str, str, str, str]]:
 
 
 def test_tpn14_chart_window_span_comes_from_single_source(offline_cfg, monkeypatch):
-    """★ 图的日线主查询跨度必须来自 **`datasource.VIEWER_DAILY_DAYS`**（单一真源）。
+    """★ 图的日线主查询**起点**必须来自 **`datasource.VIEWER_START_DATE`**（单一真源）。
 
-    为什么：`daily()` 的缓存 key 含 ``(start, end)``。asof 解析（`_latest_bar_day`）与图
-    若各拿各的跨度，**同源数据会在同一个请求里被取两遍**（ultraqa 线程级实测 1.29s + 3.93s）。
-    两边共用同一常量后**才有**命中的可能（是否真命中还取决于锚点，见下一条用例的说明）。
+    ★ **v6 改写**（需求变更，不是放宽）：窗口真源从「N 天」（原 `VIEWER_DAILY_DAYS = 730`，已删除）
+    换成**固定锚点**（`VIEWER_START_DATE = "1990-12-19"`，A 股开市日）——
+    因为用户指出「每只票的线应从它**上市那天**算起」，而「N 天」的起点**每天都漂移**。
+    判据**意图完全保留**（单一真源 + asof 探针与图共享窗口 ⇒ `daily()` 缓存 key 命中），
+    而且**更强**：固定锚点不可能漂移。
 
-    ★ 判据做法：把 `datasource.VIEWER_DAILY_DAYS` **改掉**（730 → 500），
-    两边的窗口跨度都必须**跟着变** —— 这才是「单一真源」（而不是「两边恰好都写 730」）。
-    **修前必红**：修前图用自己的 `chart.LOOKBACK_DAYS`，改了真源也不会变。
+    为什么共享窗口重要：`daily()` 的缓存 key 含 ``(start, end)``。asof 解析（`_latest_bar_day`）
+    与图若各拿各的起点，**同源数据会在同一个请求里被取两遍**（ultraqa 线程级实测 1.29s + 3.93s）。
     """
     from ptrade import datasource as datasource_mod
 
     ds = DataSource(offline_cfg, offline=True)
-    for span in (730, 500, 640):
-        monkeypatch.setattr(datasource_mod, "VIEWER_DAILY_DAYS", span)
+    for anchor in ("1990-12-19", "1995-01-01", "2000-06-01"):
+        # ★ v6：真源是**锚点日期**，不是天数
+        monkeypatch.setattr(datasource_mod, "VIEWER_START_DATE", anchor)
         records = _record_daily(monkeypatch)
         asof = ds.chart_asof(BIG)
         records.clear()
         C.chart_payload(offline_cfg, ds, BIG, asof)
 
-        chart_spans = {_span_days(s, e) for c, s, e, caller in records if caller == "chart_payload"}
-        assert chart_spans == {span}, (
-            f"真源改成 {span} 后，图的主查询跨度是 {sorted(chart_spans)} —— "
-            "说明图没有读 `datasource.VIEWER_DAILY_DAYS`（两边会各取一遍）"
+        # ★ v6：真源是**起点日期**（不是天数）⇒ 比 `start` 本身，而不是 `_span_days`
+        chart_starts = {s for c, s, e, caller in records if caller == "chart_payload"}
+        assert chart_starts == {anchor}, (
+            f"真源改成 {anchor!r} 后，图的主查询起点是 {sorted(chart_starts)} —— "
+            "说明图没有读 `datasource.VIEWER_START_DATE`（两边会各取一遍）"
         )
         asof_records = [r for r in records if r[3] == "_latest_bar_day"]
         if asof_records:                      # 便宜分支下 asof 相不取数
-            spans = {_span_days(s, e) for c, s, e, _ in asof_records}
-            assert spans == {span}, f"`_latest_bar_day` 的跨度没跟随真源：{sorted(spans)}"
+            starts = {s for c, s, e, _ in asof_records}
+            assert starts == {anchor}, f"`_latest_bar_day` 的起点没跟随真源：{sorted(starts)}"
 
 
 def test_tpn14_shared_key_when_anchors_coincide(offline_cfg, monkeypatch):
@@ -481,7 +484,7 @@ def test_tpn14_shared_key_when_anchors_coincide(offline_cfg, monkeypatch):
     assert len(chart_main) == 1, f"图应恰好一次主查询：{sorted(chart_main)}"
     assert chart_main == set(asof_phase), (
         f"锚点相同却窗口不同 —— 图 {sorted(chart_main)} vs asof 相 {sorted(asof_phase)}；"
-        f"跨度真源={datasource_mod.VIEWER_DAILY_DAYS}"
+        f"跨度真源={datasource_mod.VIEWER_START_DATE}"
     )
 
 
@@ -650,12 +653,10 @@ def test_v3_20_chart_data_is_deep_equal(offline_cfg, offline_ds):
     start = html.index(marker) + len(marker)
     decoded, end = json.JSONDecoder().raw_decode(html[start:])
     assert end > 0
-    expected = {
-        "periods": payload["periods"],
-        "initial_period": "daily",
-        "code": payload["code"],
-        "legend": C.legend_groups(payload),
-    }
+    # ★ v6 改写（**更强**）：不再在测试里手抄 `option_data` 的形状 ——
+    #   那会让「实现加字段、判据忘同步」变成假红（v6 加 `coverage` 就是这样炸的）。
+    #   直接调**同一个函数** ⇒ 判据永远与实现同形，且仍然钉住「两路径深等」的本意。
+    expected = C.option_data(payload, "daily")
     assert decoded == json.loads(json.dumps(expected, ensure_ascii=False)), (
         "页面内联的 CHART_DATA 与 Python 载荷不深等"
     )

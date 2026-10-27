@@ -519,8 +519,20 @@ def test_seven_panels_explicit_titles_and_linked_axes(tmp_path, offline_cfg, off
     assert len(grids) == 6, f"应有 6 个图表 grid，实际 {len(grids)}: {grids}"
 
     assert "xAxisIndex:[0,1,2,3,4,5]" in flat, "6 个面板必须 X 轴联动"
-    assert re.search(r"const startPct = d0 > 120 \?", flat), "默认显示最近 ~120 根"
-    assert "start:startPct, end:100" in flat
+    # ★ v6 改写（**更强**）：默认可见根数从「写死 120 + 百分比」改成
+    #   **按周期**（日 120 / 周 260 / 月 60）+ **索引**（`startValue`/`endValue`）
+    #   + **显式** `filterMode`。原断言 `const startPct = d0 > 120 ?` 与
+    #   `start:startPct, end:100` 正是被有意替换掉的旧形态。
+    assert "const DEFAULT_VISIBLE_BARS = { daily: 120, weekly: 260, monthly: 60 }" in flat, \
+        "默认可见根数必须**按周期**（近半年 / 5 年 / 5 年）"
+    assert "startValue:startIndex, endValue:endIndex" in flat, "dataZoom 必须用**索引**而不是百分比"
+    assert flat.count('filterMode:"filter"') >= 2, "两个 dataZoom 组件都必须**显式** filterMode"
+    # ★ 断**代码形态**，不断「字符串不存在」——
+    #   我自己在注释里提到了 startPct（解释「为什么改成索引」）⇒ 断字符串会假红。
+    #   （这是「注释里提到就算过/就算红」这个坑今天的第 4 次，已记入 .omx/NOTES.md 铁律 5。）
+    assert "start:startPct" not in flat, "旧形态 start:startPct 必须彻底删除（不只是注释里提到）"
+    assert "const startPct" not in flat, "旧变量 startPct 必须删除"
+    assert "startValue:startIndex" in flat
     assert C.no_external_refs(html)
 
 

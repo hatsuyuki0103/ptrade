@@ -150,6 +150,10 @@ th,td{padding:2px 6px}
       <span class="row">
         <span id="last-updated" class="small muted">上次更新 —</span>
         <span class="small muted" data-testid="quote-freshness-hint">行情每 60s 更新 · 界面每 5s 刷新</span>
+        <!-- ★ v6：**数据覆盖范围**的诚实标注 —— 让用户自己判断「这条线从哪天开始」。
+             离线（夹具只有 2 年）时会明示「数据仅到 …（离线）」，否则用户会以为
+             「从上市日算起」这个需求没修。 -->
+        <span id="chart-coverage" class="small muted" data-testid="chart-coverage"></span>
         <span id="analysis-state" data-testid="analysis-state" class="small muted">分析：未加载</span>
       </span>
     </div>
@@ -653,9 +657,29 @@ function ensureChart() {
   }
   return CHART;
 }
+/* ★ v6：**数据覆盖范围**的诚实标注。
+   * 为什么需要：`--offline` 只有 2 年夹具 ⇒ 图会"从 2024 开始" ⇒ 用户会以为
+   * 「从上市日算起」这个需求**没修**。所以把 `payload.coverage` 如实显示出来：
+   *   在线：`数据从 2001-08-27 开始`
+   *   离线：`数据仅到 2026-10-14（离线）`   ← 明确告诉用户这是离线夹具的边界
+   * ★ `coverage` 只给 `{first, last, requested_start}`，**没有 `complete` 布尔** ——
+   *   因为从 `daily()` 的返回无法区分「这只票上市就晚」与「取数被截断」，给假布尔更糟。 */
+function renderCoverage(payload) {
+  var el = $("chart-coverage");
+  if (!el) { return; }
+  var cov = (payload && payload.coverage) || {};
+  var first = cov.first, last = cov.last;
+  if (!first || !last) { el.textContent = ""; return; }
+  el.textContent = isOffline()
+    ? "数据仅到 " + String(last).slice(0, 10) + "（离线）"
+    : "数据从 " + String(first).slice(0, 10) + " 开始";
+  el.title = "请求窗口自 " + String(cov.requested_start || "—") + "；实际首根 " + String(first).slice(0, 10)
+    + "（该票上市日或数据源边界）";
+}
 function renderChart() {
   var st = CHART_STATE;
   if (!st.payload) { return; }
+  renderCoverage(st.payload);
   if (typeof window.buildOption !== "function") {
     /* 模块脚本是 defer 的：首次可能还没就绪 —— 等事件再画，而不是报错/降级成空白。 */
     chartEmpty("图表模块加载中…");
