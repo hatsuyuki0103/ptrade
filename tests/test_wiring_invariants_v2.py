@@ -597,6 +597,7 @@ REGISTERED_GUARD_SITES: frozenset[str] = frozenset({
     "engine::_is_short_target",
     "engine::_mark_prices",
     "engine::_quote",
+    "service::effective_trade_date",
     "service::resolve_asof",
     "watchlist::_has_market_data",
     "watchlist::add_to_watchlist",

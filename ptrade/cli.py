@@ -550,20 +550,27 @@ def cmd_order(args: argparse.Namespace, cfg: AppConfig) -> int:
     Engine, OrderRequest = _import_engine()
     ds = _make_ds(cfg, bool(args.offline))
     generated: dict[str, Any] = {}
-    # 锁外预热（BLOCK-1）：交易日按锁内同款逻辑解析，并带上本次下单标的
-    _prewarm_before_write(cfg, ds, args.trade_date, extra_codes=(args.code,), side=args.side)
+    # ★ v7：**锁外**解析下单交易日 —— 不传 `--trade-date` 时 = 最新交易日（快照 asof，含今天）。
+    #   用户口径（2026-11-03）：「如果不传交易日期，就是最新的一个交易日」。
+    #   ★ 这一步是网络取数（`live_quote`），**必须在写锁之前**做，否则 INV-42。
+    _effective_td = service.effective_trade_date(ds, args.trade_date, codes=(args.code,))
+    # 锁外预热（BLOCK-1）：交易日与锁内**同源**，并带上本次下单标的
+    _prewarm_before_write(cfg, ds, _effective_td, extra_codes=(args.code,), side=args.side)
 
     def _mutate(state: AccountState | None) -> AccountState:
         if state is None:
             raise FileNotFoundError(f"未找到账户文件 {_state_path(cfg)}，请先执行 `python -m ptrade init`")
         price_arg = _coerce_price_arg(args.price)
-        trade_date = args.trade_date or state.trade_date or _resolve_asof(ds, None)
-        # **`--price live` 的交易日取自快照**（B，2026-10-14）：`resolve_asof` 在 15:30 前
-        # 会回退到上一交易日，而引擎的停牌检查看的是 `td` 那天的行情 ——
-        # 两者不一致会让 live 下单被判 SUSPENDED（实测），于是必须**同时**给
-        # `--trade-date=今天` 才能用。以快照日期为准就一步到位。
-        if _is_live_price_arg(price_arg) and not args.trade_date:
-            trade_date = service.live_trade_date(ds, args.code)
+        # ★ v7：交易日**已在锁外解析好**（`_effective_td`），锁内**不再取数**（INV-42）。
+        #   优先级：显式 > 锁外解析（快照 asof = 最新交易日）> 账户旧日期 > 旧兜底。
+        #   （旧实现在这里用 `state.trade_date` 打头 ⇒ 账户停在昨天时新单还按昨天结算 ✗；
+        #     且 `live` 分支的 `live_trade_date()` 是**锁内网络取数** ✗ ⇒ 两处都已上移。）
+        trade_date = (
+            args.trade_date
+            or _effective_td
+            or state.trade_date
+            or _resolve_asof(ds, None)
+        )
         engine = _engine_for(Engine, cfg, ds, state, source="cli")
         if state.trade_date != trade_date:
             state = engine.roll_to(trade_date)
@@ -628,12 +635,20 @@ def cmd_close(args: argparse.Namespace, cfg: AppConfig) -> int:
     Engine, _ = _import_engine()
     ds = _make_ds(cfg, bool(getattr(args, "offline", False)))
     generated: dict[str, Any] = {}
-    _prewarm_before_write(cfg, ds, args.trade_date, extra_codes=(args.code,), side="close")
+    # ★ v7：与 cmd_order 同款 —— 锁外解析交易日（不传 = 最新交易日，含今天）
+    _effective_td = service.effective_trade_date(ds, args.trade_date, codes=(args.code,))
+    _prewarm_before_write(cfg, ds, _effective_td, extra_codes=(args.code,), side="close")
 
     def _mutate(state: AccountState | None) -> AccountState:
         if state is None:
             raise FileNotFoundError(f"未找到账户文件 {_state_path(cfg)}，请先执行 `python -m ptrade init`")
-        trade_date = args.trade_date or state.trade_date or _resolve_asof(ds, None)
+        # ★ v7：用锁外解析好的交易日（锁内**不取数**，INV-42）
+        trade_date = (
+            args.trade_date
+            or _effective_td
+            or state.trade_date
+            or _resolve_asof(ds, None)
+        )
         engine = _engine_for(Engine, cfg, ds, state, source="cli")
         if state.trade_date != trade_date:
             state = engine.roll_to(trade_date)

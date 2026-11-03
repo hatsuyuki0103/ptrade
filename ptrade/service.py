@@ -294,6 +294,63 @@ def prewarm_for_write(
     return warmed
 
 
+def effective_trade_date(
+    ds: DataSource,
+    explicit_date: str | None,
+    codes: Iterable[str] = (),
+    peek: Any = None,
+) -> str | None:
+    """**下单用的交易日**（锁外解析，与锁内同源）。
+
+    ## 用户口径（2026-11-03 原话）
+    > 「如果不传交易日期，就是**最新的一个交易日**。你不应该是按 11 月 2 号的价。
+    >   今天已经 3 号了……你应该以**今天的早盘收市价格**下单。」
+
+    优先级：
+    1. **显式** ``--trade-date`` ⇒ 原样返回（既有行为，不变）；
+    2. 否则 ⇒ :func:`live_trade_date`（= 快照 ``asof`` = **最新有行情的交易日，含今天**）；
+    3. 取不到 ⇒ ``peek.trade_date``（兼容旧账户）；
+    4. 再取不到 ⇒ ``None``（交给调用方按旧语义兜底）。
+
+    ★ 为什么第 2 步是快照 asof 而不是 :func:`resolve_asof`：
+      ``resolve_asof`` 带 **15:30 未来函数防护**（15:30 前回退上一交易日）—— 那是 ``--asof`` /
+      ``plan`` / ``scan`` 该守的；但**下单**要的是「今天此刻的价格」，回退到昨天就是错的。
+      ``live_trade_date`` 内部走 ``live_quote(require_today=True)`` ⇒ **快照必须是今天的**，
+      陈旧直接抛 ``DataUnavailable``（**不会静默用陈旧价**）⇒ 不放宽未来函数防护。
+
+    ★ **必须在写锁外调用**（第 2 步是网络取数；锁内会抛 ``NetworkForbiddenInLock``）。
+    """
+    if (explicit_date or "").strip():
+        return str(explicit_date).strip()
+    # ★ 优先「**今天是不是交易日**」—— 交易日语义**不依赖快照新鲜度**
+    #   （快照新鲜度是**价格**的事，由 --price live 的 live_quote(require_today=True) 单独把关）。
+    #   用户口径：「不传就是最新的一个交易日」⇒ 今天开市 ⇒ 就是今天。
+    try:
+        today = str(ds._today())  # noqa: SLF001 - 与 resolve_asof 同款（它承载当前可用交易日语义）
+        if ds.is_trade_date(today):
+            return today
+        cal_latest = ds.latest_trade_date()
+        if cal_latest:
+            return str(cal_latest)
+    except NetworkForbiddenInLock:
+        # ★ INV-42：写锁内联网必须**响亮地炸**，绝不能被下面的宽 handler 吞成"拿不到日期"
+        raise
+    except Exception:  # noqa: BLE001 - 日历不可用 ⇒ 退回快照 asof，再退回 peek
+        pass
+    try:
+        td = live_trade_date(ds, str(next(iter(codes), "")))
+        if td:
+            return str(td)
+    except NetworkForbiddenInLock:
+        raise  # ★ INV-42：同上
+    except Exception:  # noqa: BLE001
+        pass
+    peek_td = getattr(peek, "trade_date", None) if peek is not None else None
+    if peek_td:
+        return str(peek_td)
+    return None
+
+
 def prewarm_before_write(
     cfg: AppConfig,
     ds: DataSource,
@@ -315,7 +372,10 @@ def prewarm_before_write(
         peek = store.read_state(cfg)
     except Exception:  # noqa: BLE001 - 读不到就让锁内按原语义报错
         peek = None
-    date = (explicit_date or "").strip() or (peek.trade_date if peek else "") or None
+    # ★ v7：用**与锁内同源**的解析器（显式 > 快照 asof（= 最新交易日，含今天）> peek > None）。
+    #   旧实现把 `peek.trade_date` 排在快照之前 ⇒ 账户停在旧日期时预热的是**旧日期**的键，
+    #   而锁内（live 模式）用的是**今天** ⇒ 预热未命中 ⇒ 锁内联网 ⇒ INV-42（用户实测被挡）。
+    date = effective_trade_date(ds, explicit_date, codes=extra_codes, peek=peek)
     if not date:
         try:
             date = resolve_asof(ds, None)

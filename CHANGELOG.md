@@ -4,6 +4,71 @@
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-11-03
+
+**主题：v7 —— 下单交易日语义（**不传 = 最新交易日**）+ 预热与锁内同源（修 INV-42 违规）**
+
+### 修复（**用户实测被挡的 bug**）
+
+用户原话（2026-11-03）：
+> 「如果不传交易日期，就是**最新的一个交易日**。你不应该是按 11 月 2 号的价。
+>   今天已经 3 号了。现在早上盘已经收了。你应该以**今天的早盘收市价格**下单。」
+
+**现象**：`order` / `close` **不传 `--trade-date`** 时必然失败：
+```
+ok=false · NetworkForbiddenInLock: 写锁临界区内禁止联网取数（INV-42）
+```
+只有显式 `--trade-date <昨天>` 才能成交 ⇒ 用户被迫用**昨天的价**下单。
+
+**根因（两条独立的）**：
+1. **预热日期与锁内日期不同源**：`service.prewarm_before_write` 把 `peek.trade_date`（= 账户里的
+   **旧日期**）排在快照之前 ⇒ 预热的是**旧日期**的 `quote` 键；而 `cli.cmd_order` 的 live 分支在**锁内**
+   用 `live_trade_date()` 解析成**今天** ⇒ 预热未命中 ⇒ 锁内联网 ⇒ INV-42 ✗
+2. **`live_trade_date()` 本身在写锁内调用** ⇒ 它内部 `ds.live_quote()` 是网络取数 ⇒ 直接违反 INV-42 ✗
+
+### 新增
+
+- **`service.effective_trade_date(ds, explicit_date, codes, peek)`** ——
+  下单交易日的**唯一解析入口**（**必须在写锁外调用**）。优先级：
+  1. 显式 `--trade-date` ⇒ 原样（既有行为不变）；
+  2. ★ **今天是不是交易日** ⇒ 是就用**今天**（用户口径「最新交易日」）；
+  3. 否则 ⇒ 日历里的最近交易日；
+  4. 日历不可用 ⇒ 快照 `asof`；再不行 ⇒ `peek.trade_date`；全失败 ⇒ `None`（不抛）。
+  ★ **为什么用日历而不是 `resolve_asof`**：`resolve_asof` 带 **15:30 未来函数防护**（15:30 前回退上一交易日），
+  那是 `--asof` / `plan` / `scan` 该守的；**下单**要的是「今天此刻的价」，回退到昨天就是错的。
+
+### 变更（★ **行为变更，务必看**）
+
+- **`cli.cmd_order` / `cli.cmd_close`**：交易日改为**锁外**解析成 `_effective_td`，再传进锁内；
+  **锁内不再取数**（删掉了 `live_trade_date()` 的锁内调用）。
+- ★ **不传 `--trade-date` 时，结算日从「账户里的旧日期」变成「最新交易日（含今天）」**。
+  这正是用户要的语义，但**对既有脚本是 breaking**：升级后不传 `--trade-date` 会按**今天**结算。
+- `service.prewarm_before_write` 改用 `effective_trade_date`（与锁内**同源**）。
+
+### 测试
+
+- 新增 **`tests/test_v7_trade_date.py`（V7-1…V7-5）**：
+  `effective_trade_date` 五档优先级（纯函数，不联网）· `cmd_order`/`cmd_close` 的解析**必须在
+  `locked_update` 之前**（源码顺序断言）· 锁内**不得**再出现 `live_trade_date` 调用 ·
+  显式 `--trade-date` 仍最优先 · 真机 `slow`：不传交易日下单**不得**触发 INV-42。
+- ★ **不变式判据连抓我两次**（都对，都已修）：
+  ① `test_W1`：我给 `effective_trade_date` 加的宽 `except Exception` 会**吞掉**
+     `NetworkForbiddenInLock`（`⊂ DataUnavailable ⊂ Exception`）⇒ 已加 `except NetworkForbiddenInLock: raise`；
+  ② `test_W7`：新增守卫站点**必须登记** ⇒ 已登记 `service::effective_trade_date`。
+- 全量 **1202 passed / 3 skipped / 0 failed**（v1.10.0 基线 1190/4 ⇒ +12 判据）·
+  `pytest -m slow -q -rs` → **2 passed / 0 skipped** ✓
+
+### 真机验证（这就是用户要的结果）
+
+```
+close --code 600594 --ratio 1.0            （不传 --trade-date）
+→ ok=true · trade_date=**2026-11-03** · status=filled ✓
+
+order --code 600594 --side short_sell --qty 15500 --price 3.23   （不传 --trade-date）
+→ ok=true · trade_date=**2026-11-03** · status=filled · 50,065 元
+→ 担保比例 10.97 · 杠杆 0.100
+```
+
 ## [1.10.0] — 2026-10-20
 
 **主题：v6 —— K 线**从该票上市日算起**（窗口锚点改为 A 股开市日）+ 每周期默认缩放**
