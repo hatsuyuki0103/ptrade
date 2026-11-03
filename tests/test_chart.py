@@ -523,8 +523,8 @@ def test_seven_panels_explicit_titles_and_linked_axes(tmp_path, offline_cfg, off
     #   **按周期**（日 120 / 周 260 / 月 60）+ **索引**（`startValue`/`endValue`）
     #   + **显式** `filterMode`。原断言 `const startPct = d0 > 120 ?` 与
     #   `start:startPct, end:100` 正是被有意替换掉的旧形态。
-    assert "const DEFAULT_VISIBLE_BARS = { daily: 120, weekly: 260, monthly: 60 }" in flat, \
-        "默认可见根数必须**按周期**（近半年 / 5 年 / 5 年）"
+    assert "const DEFAULT_VISIBLE_BARS = { daily: 120, weekly: 260, monthly: 240 }" in flat, \
+        "默认可见根数必须**按周期**（近半年 / 5 年 / 20 年）"
     assert "startValue:startIndex, endValue:endIndex" in flat, "dataZoom 必须用**索引**而不是百分比"
     assert flat.count('filterMode:"filter"') >= 2, "两个 dataZoom 组件都必须**显式** filterMode"
     # ★ 断**代码形态**，不断「字符串不存在」——

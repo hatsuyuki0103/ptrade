@@ -57,7 +57,7 @@ export function buildOption(payload, period, opts) {
        ③ 用索引用确定：`startIndex = max(0, d0 - visible)`。
      ★ 注意 `dataZoom` 两个组件（inside/slider）**必须用同一对索引** —— 只设一处会不同步。
      ★ `filterMode:"filter"` 显式写：ECharts 5.5.1 的默认确实是 filter，但**显式才叫契约**。 */
-  const DEFAULT_VISIBLE_BARS = { daily: 120, weekly: 260, monthly: 60 };
+  const DEFAULT_VISIBLE_BARS = { daily: 120, weekly: 260, monthly: 240 };
   const visible = DEFAULT_VISIBLE_BARS[period] || d0;
   const startIndex = Math.max(0, d0 - visible);
   const endIndex = Math.max(0, d0 - 1);

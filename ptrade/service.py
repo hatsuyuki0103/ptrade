@@ -288,6 +288,10 @@ def prewarm_for_write(
     if trade_date:
         _try("next_trade_date", lambda: ds.next_trade_date(trade_date))
         _try("is_trade_date", lambda: ds.is_trade_date(trade_date))
+        # ★ v7.1：**全新账户**（`init` 后 `state.trade_date == ""`）锁内会走 `roll_to(trade_date)`，
+        #   它需要 `prev_trade_date` —— 不预热就会在锁内联网 ⇒ INV-42 ✗
+        #   （实测：`test_v7_real_order_without_trade_date` 在 tmp_path 全新账户上就是这么红的。）
+        _try("prev_trade_date", lambda: ds.prev_trade_date(trade_date))
         for code in all_codes:
             _try(f"quote:{code}", lambda c=code: ds.quote(c, trade_date))
             _try(f"last_close:{code}", lambda c=code: ds.last_close(c, trade_date))
