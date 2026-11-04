@@ -355,6 +355,75 @@ def effective_trade_date(
     return None
 
 
+def mark_positions_live(
+    ds: DataSource,
+    positions: list[dict] | dict,
+) -> list[dict]:
+    """**读时重估**：用**当前快照价**给持仓算 `last_price` / `*_value` / `*_pnl`。
+
+    ## 为什么要它（用户 2026-11-03 实测）
+    > 「我昨天模拟下单了，怎么**成本、市值、浮盈**这些都还没计算出来呢
+    >   而且昨天 3.19 下的单，现在 3.16，我应该也有赚了」
+
+    `engine.mark_to_market` **只在 `settle`/`roll_to` 时跑** ⇒ 不结算 ⇒ `last_price` 永远停在
+    成交价 ⇒ 浮盈恒为 0 ✗。用户以为"没算"，其实"没重估"。
+
+    ## 语义（**只读，绝不写回 state**）
+    * 有实时价 ⇒ 用它；`long_pnl = (last − long_cost) × long_qty`、
+      `short_pnl = (short_cost − last) × short_qty`（与 `engine` 同一公式）；
+    * **取不到价 ⇒ 退回**传入的 `last_price`（**不编造**、不置 0）；
+    * ★ **不修改 state** —— `settle` 的结算语义（按**结算日**价）不受影响。
+
+    ★ 为什么不在读路径加 `mark` 命令写 state：那会让"打开页面"产生**写操作** ✗，
+      且与结算语义冲突（结算要用结算日收盘价，不是此刻实时价）✗
+    """
+    items = list(positions.values()) if isinstance(positions, dict) else list(positions or [])
+    codes = [str(p.get("code") or "") for p in items if p.get("code")]
+    quotes: dict[str, float] = {}
+    if codes:
+        try:
+            frame = ds.spot(codes)
+            if frame is not None and len(frame):
+                for _, row in frame.iterrows():
+                    code = str(row.get("code") or "").zfill(6)
+                    last = row.get("last")
+                    try:
+                        if last is not None and float(last) > 0:
+                            quotes[code] = float(last)
+                    except (TypeError, ValueError):
+                        pass
+        except NetworkForbiddenInLock:
+            # ★ INV-42：写锁内联网必须**响亮地炸**，不能被下面的宽 handler 吞成"取不到价"
+            raise
+        except Exception:  # noqa: BLE001 - 取不到价就退回 state 里的 last_price
+            quotes = {}
+
+    out: list[dict] = []
+    for p in items:
+        item = dict(p)
+        code = str(item.get("code") or "")
+        state_last = item.get("last_price")
+        try:
+            state_last_f = float(state_last) if state_last is not None else 0.0
+        except (TypeError, ValueError):
+            state_last_f = 0.0
+        last = quotes.get(code, state_last_f)
+
+        long_qty = float(item.get("long_qty") or 0)
+        short_qty = float(item.get("short_qty") or 0)
+        long_cost = float(item.get("long_cost") or 0)
+        short_cost = float(item.get("short_cost") or 0)
+
+        item["last_price"] = round(last, 4)
+        item["long_value"] = round(long_qty * last, 2)
+        item["short_value"] = round(short_qty * last, 2)
+        item["long_pnl"] = round((last - long_cost) * long_qty, 2) if long_qty else 0.0
+        item["short_pnl"] = round((short_cost - last) * short_qty, 2) if short_qty else 0.0
+        item["price_source"] = "live" if code in quotes else "state"
+        out.append(item)
+    return out
+
+
 def prewarm_before_write(
     cfg: AppConfig,
     ds: DataSource,

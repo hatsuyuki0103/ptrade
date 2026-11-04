@@ -773,6 +773,11 @@ class WebApp:
         if state is None:
             return self._state_missing()
         data = _svc().state_summary(state)              # 同一序列化器（INV-40）
+        # ★ **不要在这里重估** —— 本端点受 **INV-40** 约束：
+        #   `data` 必须与 `ptrade status --json` 的 `data` **逐字段一致**。
+        #   若在此处用实时价重估 `positions`，`last_price`/`*_pnl` 就会与 `status --json` 不同 ⇒ INV-40 破 ✗
+        #   ⇒ **实时重估只做在 `/api/positions`**（那个端点不受 INV-40 约束），
+        #     而用户看的**持仓面板**正是走 `/api/positions` ⇒ 体验目标仍达成 ✓
         data["state_path"] = _svc().state_path(self.cfg)  # 与 cmd_status 同构造
         # M3：与 `ptrade status --json` **同样**给出账实一致性（INV-40 要求逐字段一致，
         # 所以两处必须一起加；只加一边就会打红既有的「逐字段比对」测试）
@@ -784,6 +789,18 @@ class WebApp:
         if state is None:
             return self._state_missing()
         positions = _svc().state_summary(state)["positions"]
+        # ★ v9：**读时用当前快照价重估**（只返回，不写回 state）。
+        #   旧行为：`last_price` 只在 `settle` 时更新 ⇒ 不结算时浮盈恒为 0 ✗
+        #   ★ 数据源走 `self._ds()`（**唯一**数据源缝隙，见 _ds 的 docstring）——
+        #     不要在这里直接 `DataSource(...)`，否则测试替不掉它、离线语义也会丢。
+        #   ★ `from . import service` 是**局部 import**（webapp.py 里为避循环导入的既有模式），
+        #     所以这里必须自己再 import 一次 —— 否则 `service` 在本作用域不可见（NameError）✗
+        from . import service  # noqa: PLC0415 - 同 webapp.py 的既有局部 import 模式
+
+        try:
+            positions = service.mark_positions_live(self._ds(), positions)
+        except (OSError, ValueError, RuntimeError):  # 只吞"取价/重估"类失败，**不吞 NameError**
+            pass
         return Response(200, _envelope("positions", {
             "positions": positions,
             "count": len(positions),

@@ -299,6 +299,8 @@ function num(v, digits) {
   return v.toLocaleString("zh-CN", { minimumFractionDigits: digits === undefined ? 2 : digits, maximumFractionDigits: digits === undefined ? 2 : digits });
 }
 function pct(v) { return isNum(v) ? (v * 100).toFixed(2) + "%" : "—"; }
+/* ★ v9：数值兜底为 0（`num()` 对 null 返回 "—"，但"有没有仓位"的判断需要真 0） */
+function num0(v) { return isNum(v) ? v : 0; }
 
 function toast(msg, kind) {
   var box = $("toast");
@@ -463,17 +465,31 @@ function renderState(data) {
 
 function renderPositions(data) {
   var rows = asRows(data && (data.positions || data), ["positions", "results", "items", "rows"]);
+  /* ★ v9：**多空两侧都显示**。
+     旧实现只渲染多头（多头数量/成本/市值/浮盈）⇒ 空头仓位完全看不见 ✗
+     （真实案例：融券卖出 600594 15,700 股，账户头「融券市值」有值，但持仓表全是 0）
+     新表头 10 列：代码/名称 · 多头数量 · 多头成本 · 多头市值 · 多头浮盈
+                          · 空头数量 · 空头成本 · 空头市值 · 空头浮盈 · 实时价
+     没有仓位的一侧显示「—」，避免一行十几个 0 喧宾夺主。 */
+  function sideCells(qty, cost, val, pnl) {
+    var q = num0(qty), c = num0(cost), v = num0(val), p = num0(pnl);
+    if (!q) return ["—", "—", "—", "—"];
+    var cls = p >= 0 ? "up" : "down";
+    return [esc(String(q)), num(c), num(v), '<span class="' + cls + '">' + num(p) + "</span>"];
+  }
   var html = rows.map(function (p) {
-    var qty = pick(p, ["long_qty", "qty", "quantity"]) || 0;
-    var val = pick(p, ["long_value", "market_value", "value"]);
-    var cost = pick(p, ["long_cost", "cost_price", "cost"]);
-    var pnl = pick(p, ["long_pnl", "pnl", "float_pnl"]);
-    var cls = isNum(pnl) ? (pnl >= 0 ? "up" : "down") : "";
-    return '<tr data-code="' + esc(p.code) + '"><td>' + esc(p.code) + " " + esc(p.name || "")
-      + '</td><td>' + esc(qty) + "</td><td>" + num(cost) + "</td><td>" + num(val)
-      + '</td><td class="' + cls + '">' + num(pnl) + "</td></tr>";
+    var last = pick(p, ["last_price"]);
+    var longCells = sideCells(pick(p, ["long_qty"]), pick(p, ["long_cost"]),
+                              pick(p, ["long_value"]), pick(p, ["long_pnl"]));
+    var shortCells = sideCells(pick(p, ["short_qty"]), pick(p, ["short_cost"]),
+                               pick(p, ["short_value"]), pick(p, ["short_pnl"]));
+    var cells = [esc(p.code) + " " + esc(p.name || "")]
+      .concat(longCells).concat(shortCells).concat([num(last)]);
+    return '<tr data-code="' + esc(p.code) + '"><td>' + cells.join("</td><td>") + "</td></tr>";
   });
-  $("positions").innerHTML = table(["代码/名称", "多头数量", "成本", "市值", "浮盈"], html);
+  $("positions").innerHTML = table(
+    ["代码/名称", "多头数量", "多头成本", "多头市值", "多头浮盈",
+     "空头数量", "空头成本", "空头市值", "空头浮盈", "实时价"], html);
 }
 
 function renderRisk(data) {

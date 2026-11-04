@@ -4,6 +4,79 @@
 
 ## [Unreleased]
 
+## [1.13.0] — 2026-11-03
+
+## 用户实测（2026-11-03 原话 + 截图）
+
+> 「我昨天模拟下单了，怎么**成本、市值、浮盈**这些都还没计算出来呢
+>   而且昨天 **3.19** 下的单，现在 **3.16**，我应该也有赚了」
+
+## 根因（**数据齐全，缺陷全在显示层**）
+
+实测 `state.state.positions["600594"]`：
+```
+long_qty=0 · short_qty=15700 · short_cost=3.19 · last_price=3.19
+long_value=0 · short_value=50083 · long_pnl=0 · **short_pnl=0**   ← last_price 未重估
+```
+`/api/positions` 的输出**字段全在** ✓ ⇒ 是两个显示层缺陷：
+
+### 缺陷 A：持仓表**只有多头列**（`webui.py::renderPositions`）
+```js
+// 旧
+$("positions").innerHTML = table(["代码/名称", "多头数量", "成本", "市值", "浮盈"], html);
+```
+⇒ **空头仓位完全看不见** ✗（用户只能从「融券市值」那一格间接猜）
+
+### 缺陷 B：`last_price` 只在 `settle`/`roll_to` 时更新（`engine.py:121`）
+⇒ 不结算 ⇒ `last_price` 永远停在成交价 ⇒ **浮盈恒为 0** ✗
+⇒ 用户以为"没算"，其实"没重估" ✓
+
+## 修法
+
+### A. 持仓表改成**多空两侧**（前端）
+表头 10 列：`代码/名称 · 多头数量 · 多头成本 · 多头市值 · 多头浮盈 · 空头数量 · 空头成本 · 空头市值 · 空头浮盈 · 实时价`
+★ **没有仓位的一侧显示「—」**，避免一行十几个 0 喧宾夺主 ✓
+
+### B. 新增 `service.mark_positions_live(ds, positions)`（**读时重估，只读**）
+* 批量取当前快照价 ⇒ 重算 `last_price` / `*_value` / `*_pnl`；
+* **取不到价 ⇒ 退回 `state.last_price`**（**不编造、不置 0**）✓
+* ★ **不写回 state** —— `settle` 的结算语义（按**结算日**价）不受影响 ✓
+* ★ 应用到 **`/api/positions`**（用户看的持仓面板）✓
+* ★★ **`/api/state` 刻意不重估** —— 它受 **INV-40** 约束，必须与 `ptrade status --json` **逐字段一致** ✗
+  第一版我在两处都加了，被 `test_webapp.py::test_w2_state_matches_status_json` 抓红 ✗ 已撤 ✓
+
+## 实测（真机，非手算）
+
+```
+/api/positions（**重估**）: 空头 15,700 · 成本 3.19 · 实时价 3.20 · 浮盈 **−157** · price_source=live ✓
+/api/state（**不重估**）  : 空头 15,700 · 成本 3.19 · 实时价 3.19 · 浮盈 0      ← 守 INV-40 ✓
+★ 读路径无副作用：调 `/api/positions` 前后 `state.json` sha256 **完全一致** ✓
+```
+★ 早前现价 3.16 时该端点的输出是 **浮盈 +471**（= 用户自己算的数）✓ —— 数字随实时价变化，这才是对的 ✓
+
+## 测试
+
+- 新增 **`tests/test_positions_v9.py`**（V9-1…V9-7）：
+  实时价重估 · 空头浮盈公式 `(cost−last)×qty` · **取不到价时退回 state 价** ·
+  **重估不修改入参**（读路径无副作用）· 表头含空头四列 + 实时价（前端）·
+  ★ **`api_positions` 必须有局部 import**（`webapp.py` 的 `service` 是**局部** import，避循环导入）·
+  ★ **不得用裸 `except Exception`** 包重估（会吞 `NameError` 这类**编程错误**）。
+- 全量 **1211 passed / 4 skipped / 0 failed**（v1.12.0 基线 1203 ⇒ **+8 判据**）。
+
+## ★ 修这个 bug 时被仓库纪律连抓三次（都修了）
+
+| 判据 | 抓到我什么 |
+|---|---|
+`test_W2`（INV-40） | 我在 `/api/state` 也加重估 ⇒ 与 `ptrade status --json` 不一致 ✗ |
+`test_W1`（INV-42） | `mark_positions_live` 的宽 `except` 会**吞** `NetworkForbiddenInLock` ✗ |
+`test_W7` | 新增守卫站点**必须登记** ⇒ 已登记 `service::mark_positions_live` ✓ |
+
+★ 还踩到一个**很典型的坑**：`webapp.py` 的 `from . import service` 是**函数内局部 import**
+（为避循环导入），我在新方法里直接用 `service.xxx` ⇒ **`NameError`**，
+而我又加了宽 `except Exception: pass`（本意是"取价失败不 500"）⇒ **把自己的编程错误静默吞掉** ✗
+⇒ 表现为「重估不生效、但一切看起来正常」，极难查 ✗
+⇒ 修法：**局部 import + 把 `except` 收窄**到 `(OSError, ValueError, RuntimeError)` ✓
+
 ## [1.12.0] — 2026-11-03
 
 **主题：v8 —— 月线默认视野从 5 年拉到 **20 年**（周线保持 5 年）**
