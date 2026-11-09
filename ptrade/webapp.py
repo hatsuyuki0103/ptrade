@@ -784,6 +784,45 @@ class WebApp:
         data["ledger_consistency"] = _svc().consistency(self.cfg)
         return Response(200, _envelope("status", data))
 
+    def api_score_refresh_status(self, query, body) -> Response:
+        """**周末全市场分数刷新**的进度（v10-A4，只读）。
+
+        ★ 为什么单开端点：全市场 5024 只跑一趟 **4–8 小时**（Critic M3 重估；
+          每票新建 scorer 的旧做法是 103h ✗）⇒ **绝不能放进 HTTP 请求** ✓
+        ★ 进度真源是**台账文件**（`data/cache/score_refresh_<iso_week>.json`），
+          内存态只是加速缓存 —— 服务重启后从台账恢复 ✓
+        """
+        from . import score_refresher  # noqa: PLC0415 - 局部 import（webapp.py 既有模式）
+
+        # ★ 双源：先取**内存态**（跑的时候实时），再用**台账**覆盖（重启后仍准确 —— 台账是真源）
+        st: dict = {"status": "idle", "asof": "", "total": 0, "done": 0,
+                    "failed": 0, "started_at": "", "updated_at": ""}
+        refresher = getattr(self, "score_refresher", None)
+        if refresher is not None:
+            try:
+                st.update({k: v for k, v in refresher.status().items() if v is not None})
+            except (OSError, ValueError, RuntimeError):
+                pass
+        try:
+            week = score_refresher.iso_week_key(score_refresher.datetime.now())
+            doc = score_refresher.read_ledger(self.cfg, week)
+            if isinstance(doc, dict):
+                st = {
+                    "status": doc.get("status") or st.get("status") or "idle",
+                    "asof": doc.get("asof") or "",
+                    "iso_week": doc.get("iso_week") or week,
+                    "total": doc.get("total") or 0,
+                    "done": len(doc.get("done") or []),
+                    "failed": len(doc.get("failed") or {}),
+                    "started_at": doc.get("started_at") or "",
+                    "updated_at": doc.get("updated_at") or "",
+                }
+        except NetworkForbiddenInLock:
+            raise                      # ★ INV-42：锁内联网必须响亮地炸
+        except (OSError, ValueError):  # 台账读不到 ⇒ 返回内存态（不编造）
+            pass
+        return Response(200, _envelope("score_refresh_status", st))
+
     def api_live_state(self, query, body) -> Response:
         """**实时账户快照**（v10）—— 与 `/api/state` **同形**，但用**当前快照价**重估。
 
@@ -1525,6 +1564,8 @@ class WebApp:
             return self.api_health(query, body)
         if path == "/api/state":
             return self.api_state(query, body)
+        if path == "/api/score_refresh_status":
+            return self.api_score_refresh_status(query, body)
         if path == "/api/live_state":
             return self.api_live_state(query, body)
         if path == "/api/positions":
@@ -1796,6 +1837,22 @@ def create_server(
         )
     except Exception:                                      # noqa: BLE001 - 刷新器起不来也要能 serve
         app.spot_refresher = None                          # type: ignore[attr-defined]
+    # ★ v10-A4：**周末全市场分数刷新器**（用户裁决：「周五收盘的时候，你可以全市场都算，
+    #   因为我不在乎这个时间消耗。平时你可以给我算持仓的和自选池的」）。
+    #   ★ 独立线程（**不是** per-tick）：全市场 5024 只跑一趟 **4–8h**
+    #     （★ 复用一个 scorer；每票新建的旧做法是 103h —— Critic M3 的重估）。
+    #   ★ 触发由 `is_weekend_window` 判（交易日历 + 排除周一盘中），
+    #     幂等由 `data/cache/score_refresh_<iso_week>.json` 台账保证（一周最多一轮）。
+    #   ★ 起不来**绝不能**影响 serve（后台服务尽力而为）。
+    try:
+        from .score_refresher import ScoreRefresher
+
+        app.score_refresher = ScoreRefresher(              # type: ignore[attr-defined]
+            cfg, _svc().make_ds(cfg, offline)
+        )
+        app.score_refresher.start()
+    except Exception:                                      # noqa: BLE001 - 刷新器起不来也要能 serve
+        app.score_refresher = None                         # type: ignore[attr-defined]
     return server
 
 

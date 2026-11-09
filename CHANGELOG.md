@@ -4,6 +4,97 @@
 
 ## [Unreleased]
 
+## [1.15.0] — 2026-11-09
+
+**主题：v10 补完 —— A4「周五收盘 ~ 下周一开盘前，全市场 5024 只分数后台重算」**
+
+> v1.14.0 交付了用户两个诉求（分数按交易日刷新 + 账户实时盈亏），但 A4 **当时未实现**。
+> 本版把 A4 补上，**v10 至此完整** ✓
+
+### 新增 `ptrade/score_refresher.py`
+
+**用户裁决（原话）**
+
+> 「**周五收盘**的时候，你可以**全市场都算**，因为**我不在乎这个时间消耗**。
+>   平时你可以给我算**持仓的和自选池的**。」
+
+**★ 为什么是独立线程、不是复用 `spot_refresher`**
+
+| | `spot_refresher` | `score_refresher` |
+|---|---|---|
+周期 | 盘中 **60s** 一次 | **周末**单趟 |
+工作量 | 一次抓快照（十几秒）| **5024 只 × 1.5–4.5s ≈ 4–8h** |
+模型 | per-tick + **惰性门控**（120s 内有 UI 请求才刷）| ★ **单趟循环**（惰性门控会让 4–8h 任务**永远跑不完** ✗）|
+
+**★ 成本（Critic M3 的重估，是可交付性的关键）**
+
+`chart.py:643` 原来**每票新建 `CanslimScorer`** ⇒ 丢掉 `strategy.py:592-602` 的**全部实例级缓存**
+⇒ **≈103h**（超过一个周末，永远追不上下一周 ✗）。
+本模块**复用一个 scorer** ⇒ 每票只多 1 次自身日线 + 2–3 次自身财务/股东
+⇒ 5024 只 ≈ **2.8–6.3h**，加节流/重试 **≈4–8h** ⇒ **一个周末够** ✓
+
+### 「周五收盘」判定（四个易错点全打上）
+
+```python
+prev_td = today if now >= 15:30 else prev_trade_date(today)   # 最近**已收盘**交易日
+next_td = next_trade_date(today)                               # ★ 新浪是**历史**日历 ⇒ 可能抛
+in_window = prev_td.iso_week != next_td.iso_week
+# ★ 1：排除「周一盘中」（否则周一 10:00 也 True ⇒ 盘中触发全市场 ✗）
+# ★ 2：next_td 取不到 ⇒ 回退「日历最大日 == prev_td」启发式
+# ★ 3：ISO 周幂等台账 ⇒ 一周最多一轮（判定宽松也不会重复烧时间）
+```
+
+★ 判据覆盖：**周四当最后交易日**（周五休市）⇒ `True` ✓ · **周一盘中 10:00** ⇒ `False` ✓ ·
+周一盘前 ⇒ `True` ✓ · 周二 ⇒ `False` ✓
+
+### 范围（两个模式）
+
+* **周末**：`spot` 快照 rows ⇒ **只留 6 位 A 股**（★ 排除 ETF —— `UNIVERSE_CODES` 只有 32 只且含
+  `588000/510050/159915` 三只 ETF ✗，**绝不能用它**）
+* **平时**：`持仓 ∪ 自选池`（≤40 只）
+* ★ 不用 `ds.spot()`（会联网刷新）—— 用 `_spot_frame_raw()` **只读缓存** ✓
+
+### 进度：`GET /api/score_refresh_status`
+
+**双源**：台账（`data/cache/score_refresh_<iso_week>.json`）> 内存态。
+★ 台账是**独立文件**、不在 `analysis_*` 命名空间 ⇒ `cleanup_stale_cache` **不会清它** ✓
+（★ 不能拿 analysis 缓存当进度：`ANALYSIS_TTL=6h` 跑几小时就过期 ✗）
+
+### 本轮被抓到并修掉的真问题（都是仓库纪律抓的，不是我自查出来的）
+
+1. **INV-42/45**：`_tick`/`_run_batch` 的宽 handler 会**吞掉 `NetworkForbiddenInLock`** ✗
+   （`ds.trade_dates()` / `ds.latest_trade_asof()` 都会走 `_ak()`）⇒ 加 2 处 guard re-raise ✓
+2. **`test_W7`**：4 个守卫站点未登记 ⇒ 补 `REGISTERED_GUARD_SITES` ✓
+3. **`test_meta_only_store_may_call_os_replace`**：★ 我自己写了 `os.replace` ✗
+   ⇒ 改用 `store.atomic_write_json`（**理由**：`watchlist.py` 曾自带无重试原子写，
+   4 个读者线程下 60 次写**失败 50 次** ⇒ 写方重试必须只有一处落点）✓
+4. **`_is_a_share("")` 返回 `True`** ✗（`"".zfill(6) == "000000"` 以 `"00"` 开头）
+   ⇒ 先判**恰好 6 位**再匹配前缀 ✓ —— 这是**我自己的测试抓到的**
+
+### 测试
+
+* 新增 `tests/test_v10_score_refresher.py`（**20 条**：窗口判定 8 组 · 范围过滤 · 幂等台账 ·
+  单 scorer · 守卫语义 · 端点形状）
+* 开发副本 **1239 passed / 5 skipped / 0 failed**
+  ★ 2 条 flaky 已按 `NOTES.md` 铁律 11 单独连跑 **3/3 通过** 复核：
+  `test_C1_C4_write_command_waits_for_lock[close]`（既有已知）·
+  `test_S8_concurrent_append_keeps_lines_intact`（Windows 并发文件锁偶发）
+
+### v10 完整状态
+
+| 需求 | 状态 |
+|---|---|
+A1 同交易日稳定 | ✅ v1.14.0 |
+A2 跨交易日重算 | ✅ v1.14.0（key 含 asof，天然满足）|
+A3 显示分数时效 | ✅ v1.14.0（`data-asof` 属性 + `title`）|
+**A4 周末全市场** | ✅ **v1.15.0（本版）** |
+A5 平时持仓+自选 | ✅ v1.15.0 |
+B1/B2 实时盈亏 | ✅ v1.14.0 |
+B3 不破 INV-40 | ✅ v1.14.0（`/api/state` 一行未改）|
+B4 只读 + 不编造 | ✅ v1.14.0（cache-only 取价 + `source=state` 降级）|
+B5 标明来源时效 | ✅ v1.14.0（`data-*` 属性 + `title`）|
+M1 两路径统一 | ✅ v1.14.0（自选池写回同一缓存）|
+
 ## [1.14.0] — 2026-11-09
 
 **主题：v10（**部分交付**）—— CANSLIM 分数**按交易日刷新** + 账户盈亏**实时可见**
