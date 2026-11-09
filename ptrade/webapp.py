@@ -378,7 +378,18 @@ def analysis_status(cfg, offline: bool, code: str, asof: str | None) -> dict:
         _ensure_analysis_job(cfg, offline, code, None)
         return {"state": "pending", "error": None, "asof": None, "code": code,
                 "elapsed_s": _elapsed_s(cfg, code)}   # ★ v5：进度（秒）
-    cached = read_cached_analysis(cfg, code, asof)
+    # ★★ B3：把 `trade_day=` **真正传进去** —— 否则「同交易日永久有效」是死代码 ✗
+    #   （评审 B3：只写 `chart.py` 的分支而生产调用点不传 ⇒ 6h TTL 照旧 ⇒ 一天重算 2–4 次）
+    _trade_day = None
+    try:
+        from . import service as _service
+
+        _trade_day = _service.today_trade_date(_svc().make_ds(cfg, offline))
+    except NetworkForbiddenInLock:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        _trade_day = None            # 拿不到 ⇒ 退回 6h TTL（不阻塞渲染）
+    cached = read_cached_analysis(cfg, code, asof, trade_day=_trade_day)
     if cached is None:
         _ensure_analysis_job(cfg, offline, code, asof)
         return {"state": "pending", "error": None, "asof": asof, "code": code,
@@ -1031,7 +1042,20 @@ class WebApp:
         # ① 分析缓存：命中 → **完整页**；未命中 → **占位页立即返回** + 后台算（PRD F2）
         #   占位/失败的载荷形状由 `chart.py` 定义（`ANALYSIS_PENDING` / `ANALYSIS_FAILED`），
         #   `<body data-analysis-state=...>` 也由 chart 的模板渲染 —— 本模块**不做 HTML 后处理**。
-        cached = read_cached_analysis(self.cfg, code, asof)
+        # ★★ B3：同上 —— 传 `trade_day=` 才真正享受「同交易日永久有效」
+        _trade_day = None
+        try:
+            from . import service as _service
+
+            # ★ 复用上面已经构造好的 `ds` —— **不要**再调 `self._ds()`：
+            #   `test_webapp_v2.py::test_r5_ds_seam_is_parameterized` 断言
+            #   "`_ds` 恰好被调用一次"，多调一次会红 ✗（且多构造一个 DataSource 是浪费）
+            _trade_day = _service.today_trade_date(ds)
+        except NetworkForbiddenInLock:
+            raise
+        except (OSError, ValueError, RuntimeError):
+            _trade_day = None
+        cached = read_cached_analysis(self.cfg, code, asof, trade_day=_trade_day)
         if cached is not None:
             analysis = cached
         else:
@@ -1276,8 +1300,13 @@ class WebApp:
             for _item in results:
                 if not _item.factors:      # 取数失败的票不写缓存（与 INV-38 一致）
                     continue
-                _payload = dict(_svc().jsonable(_item))
-                _payload["computed_at"] = _computed_at
+                # ★★ B1（CRITICAL）：**必须**用唯一构造器。
+                #   曾用 `_svc().jsonable(_item)`（= `CanslimResult.to_dict()`）—— 它**没有 `ok`**、
+                #   且 `factors` 是 **list** ⇒ `analysis_state()` 判 failed ⇒ TTL 走
+                #   `ANALYSIS_FAIL_TTL=120s` ⇒ 写进缓存的东西 2 分钟后作废 ✗
+                _payload = _chart.analysis_payload_from_result(
+                    _item, self.cfg, computed_at=_computed_at
+                )
                 _chart.write_cached_analysis(self.cfg, _item.code, asof, _payload)
         except NetworkForbiddenInLock:
             raise                         # ★ INV-42：锁内联网必须响亮地炸
@@ -1845,12 +1874,15 @@ def create_server(
     #     幂等由 `data/cache/score_refresh_<iso_week>.json` 台账保证（一周最多一轮）。
     #   ★ 起不来**绝不能**影响 serve（后台服务尽力而为）。
     try:
+        # ★ 建议 6：`--offline` 时**不启动** —— 否则线程每 600s 白拉一次日历（且一次都不会跑）
         from .score_refresher import ScoreRefresher
 
-        app.score_refresher = ScoreRefresher(              # type: ignore[attr-defined]
-            cfg, _svc().make_ds(cfg, offline)
+        app.score_refresher = (                            # type: ignore[attr-defined]
+            None if offline
+            else ScoreRefresher(cfg, _svc().make_ds(cfg, offline))
         )
-        app.score_refresher.start()
+        if app.score_refresher is not None:
+            app.score_refresher.start()
     except Exception:                                      # noqa: BLE001 - 刷新器起不来也要能 serve
         app.score_refresher = None                         # type: ignore[attr-defined]
     return server

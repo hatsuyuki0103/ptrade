@@ -222,3 +222,114 @@ def test_v10_m1_watchlist_score_writes_cache():
     assert "computed_at" in src, "没写 computed_at ⇒ A3 无法显示计算时刻"
     # ★ 写回处必须有 INV-42 guard
     assert "except NetworkForbiddenInLock" in src
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+# ★ code-review 要求的**行为判据**（评审建议 5：原来全是 `inspect.getsource` 文本断言，
+#   恰好放过了 B1/B3/B5 三个行为缺陷）
+# ═══════════════════════════════════════════════════════════════════════════ #
+def test_v10_b1_payload_is_ready_shape(tmp_path):
+    """★ V10-B1（CRITICAL，行为判据）：写回的分析载荷必须让 `analysis_state` 判 **ready**。
+
+    ★★ 这条钉住的是本轮最严重的缺陷：
+       曾把 `CanslimResult.to_dict()` 直接写进 `analysis_<code>_<asof>` —— 它**没有 `ok`**、
+       `factors` 是 **list** ⇒ `analysis_state()` 判 `failed` ⇒ TTL 走 `ANALYSIS_FAIL_TTL=120s`
+       ⇒ **A4 周末扫描（4~8h × 5024 只）的产出 2 分钟后全部作废** ✗
+    """
+    from ptrade import chart, strategy
+
+    class _F:
+        def __init__(self, key, score, note=""):
+            self.key, self.score, self.note = key, score, note
+        def to_dict(self):
+            return {"key": self.key, "score": self.score, "note": self.note}
+
+    class _R:
+        code, name, asof, total, signal = "600594", "益佰制药", "2026-11-09", 32.0, "short"
+        reasons, risks = ["r1"], ["k1"]
+        factors = [_F(k, 5.0, f"note-{k}") for k in "CANSLIM"]
+
+    class _Cfg:
+        class root:
+            pass
+
+    cfg = type("C", (), {"root": str(tmp_path)})()
+    payload = chart.analysis_payload_from_result(_R(), cfg, computed_at="2026-11-09T15:31:00")
+
+    # ① 形状必须是"缓存期望"的那一种
+    assert payload["ok"] is True
+    assert isinstance(payload["factors"], dict), "factors 必须是 dict（list 会被判 failed）✗"
+    for k in "CANSLIM":
+        assert k in payload["factors"], f"缺因子 {k}"
+    assert payload["computed_at"] == "2026-11-09T15:31:00"
+
+    # ② 真的能落盘 + 读回 + 判 ready（**端到端**，不是源码文本）
+    chart.write_cached_analysis(cfg, "600594", "2026-11-09", payload)
+    got = chart.read_cached_analysis(cfg, "600594", "2026-11-09", trade_day="2026-11-09")
+    assert got is not None, "写进去却读不到"
+    assert chart.analysis_state(got) == "ready", (
+        f"analysis_state 判了 {chart.analysis_state(got)}（应为 ready）⇒ 会按 120s 失败 TTL 过期 ✗"
+    )
+    assert got["total"] == 32.0
+
+
+def test_v10_b1_rejects_dirty_payload(tmp_path):
+    """★ V10-B1b：`write_cached_analysis` 必须**拒绝**脏载荷（第二道防线）。"""
+    from ptrade import chart
+
+    cfg = type("C", (), {"root": str(tmp_path)})()
+    with pytest.raises(ValueError, match="factors 必须是 dict"):
+        chart.write_cached_analysis(
+            cfg, "600594", "2026-11-09",
+            {"ok": True, "total": 1.0, "factors": [{"key": "C", "score": 1.0}]},
+        )
+
+
+def test_v10_b3_trade_day_wired_in_production(tmp_path, monkeypatch):
+    """★ V10-B3（HIGH，行为判据）：**生产调用点**必须真的传 `trade_day=`。
+
+    ★ 缺陷：`chart.read_cached_analysis(..., trade_day=)` 写好了但**生产零调用**
+    ⇒ 6h TTL 照旧 ⇒ 同一交易日内仍会重算 2–4 次 ⇒ 用户「当天内稳定」未达成 ✗
+    """
+    from ptrade import chart as chart_mod
+    from ptrade import webapp as webapp_mod
+
+    # ① 生产源码里必须出现关键字实参（两处）
+    src = pathlib.Path(webapp_mod.__file__).read_text(encoding="utf-8")
+    assert src.count("trade_day=_trade_day") == 2, (
+        f"webapp 只有 {src.count('trade_day=_trade_day')} 处传了 trade_day（应 2 处）"
+    )
+
+    # ② 行为：7 天前的 ok=True 缓存 + trade_day == asof ⇒ 必须**命中**
+    cfg = type("C", (), {"root": str(tmp_path)})()
+    cache = tmp_path / "data" / "cache"
+    cache.mkdir(parents=True)
+    key = chart_mod.analysis_cache_key("600594", "2026-11-09")
+    payload = {"ok": True, "total": 32.0, "signal": "short", "factors": {"C": 1.0}}
+    (cache / f"{key}.json").write_text(
+        json.dumps({"payload": payload, "fetched_at": "2026-01-01T00:00:00"}), encoding="utf-8"
+    )
+    got = chart_mod.read_cached_analysis(cfg, "600594", "2026-11-09", trade_day="2026-11-09")
+    assert got is not None, "同交易日的旧缓存没命中 ⇒ A1 未生效 ✗"
+    assert chart_mod.analysis_state(got) == "ready"
+
+
+def test_v10_b5_source_marker_is_visible():
+    """★ V10-B5（MEDIUM-HIGH，行为判据）：用户必须**看得见**盈亏时效。
+
+    ★ 缺陷：原来只有后端 `as_of`/`source` 字段，页面 `grep live-pnl-source` = **0 处**
+    ⇒ 用户仍不知道「这个盈亏是哪一刻的」✗（正是用户抱怨的那半个问题）
+    ★ 布局约束：**不许新增行**（`test_ui_layout_v4` 零容忍）⇒ 只在「总盈亏」的值里加 2 字标记
+    """
+    from ptrade import webui as webui_mod
+
+    html = webui_mod.APP_HTML
+    assert 'data-testid="live-pnl-source"' in html, "页面上找不到来源标记 ✗"
+    # ★ 可见来源在**「总盈亏」的标签**里（零宽度增量）；值只包一层 title
+    assert '"总盈亏" + (_src === "live" ? "（实时）" : "（结算）")' in html
+    assert '<span data-testid="live-pnl-source" title="' in html
+    # 反证：值里**不许**再叠加可见字符（那是布局红过的两次位置：851 / 869）
+    assert "num(d.total_pnl) + \" \" + _srcTag" not in html
+    # 完整时刻在 title（零高度），两态文案不同
+    assert '"实时 · " + _asOf' in html
+    assert '"截至 " + _asOf + "（未取到实时价）"' in html

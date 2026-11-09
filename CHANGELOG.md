@@ -4,6 +4,99 @@
 
 ## [Unreleased]
 
+## [1.16.0] — 2026-11-09
+
+**主题：code-review（`REJECT`/`BLOCK`）的 6 个阻断项 + 10 条建议全部修复**
+
+> ★ 独立 code-review（task-47）判定 **`REJECT` · 架构状态 `BLOCK`**，理由是
+> **载荷形状错 ⇒ A4 的 4–8h 扫描产出 2 分钟内全部作废**。
+> 本版把 6 个阻断项全部修完，并补了评审要求的**行为判据**。
+
+### B1 · CRITICAL · 分析缓存载荷形状不一致（A4 全部作废）
+
+**缺陷**：`strategy.CanslimResult.to_dict()` 的形状是
+`{code, name, asof, total, factors: [list], signal, reasons, risks}` ——
+★ **没有 `ok` 字段**、★ `factors` 是 **list**。
+而 `analysis_<code>_<asof>` 缓存**期望**的是
+`{ok: True, total, signal, factors: {C: ..}, notes: {..}, reasons: [..], risks: [..], recommend}`。
+
+⇒ 直接把 `to_dict()` 写进缓存会让：
+* `analysis_state()` 判 **`failed`**（`chart.py:705`）
+* 读取时 TTL 走 **`ANALYSIS_FAIL_TTL = 120 秒`**（`chart.py:730`）
+* ★★★ **A4 周末全市场扫描（4–8h × 5024 只）的产出 2 分钟后全部作废** ✗
+* 用户点过「批量打分」再去看图 ⇒ 分析卡显示「数据缺失 —— 未知原因」
+
+**修法（三道防线）**：
+1. `chart.analysis_payload_from_result(result, cfg, computed_at=)` —— **全仓唯一构造器**
+2. **三处调用点全改**：`chart._score_analysis` · `webapp.api_watchlist_score` · `score_refresher._run_batch`
+3. `write_cached_analysis` 增加形状校验：`ok is True` 时 `factors` 必须是 `dict`，否则 `raise ValueError`
+
+### B2 · HIGH · 「周五收盘」判定在真实日历下把每个交易日收盘后都判成窗口
+
+**缺陷**：旧回退 `return prev_td == cal[-1]` —— 生产日历 `ak.tool_trade_date_hist_sina` 是
+**历史**日历（只到今天）⇒ `later` **恒空** ⇒ **周一 16:00**：`today in cal` 且 `prev_td == cal[-1]`
+⇒ 判 **True** ⇒ **扫描跑在周一晚**，且 ISO 周台账把该周标 done ⇒ **该周周五收盘后不再扫** ✗
+
+**修法**：回退只认「**今天不是交易日**」或「**今天已是周五及以后**」：
+`return prev_td == cal[-1] and (today not in cal or now.weekday() >= 4)`
+★ 判据覆盖：周一/二/三 16:00 ⇒ False · 周四 16:00（历史日历无法区分）⇒ False ·
+周五 16:00 ⇒ True · 周六/周日 ⇒ True
+
+### B3 · HIGH · A1「同交易日永久有效」是死代码
+
+**缺陷**：`chart.read_cached_analysis(..., trade_day=)` 写好了，但**生产零调用**
+（`grep trade_day ptrade/` 只命中 `chart.py` 自己）⇒ 6h TTL 照旧
+⇒ 同一交易日内仍会重算 2–4 次（3–40s/次）⇒ 用户「当天内稳定」**未达成** ✗
+
+**修法**：
+* `service.today_trade_date(ds, now=None)`：`now >= 15:30` 且今天是交易日 ⇒ 今天；
+  否则 `prev_trade_date(today)`；再退化 `latest_trade_date()`；全拿不到 ⇒ `None`（退回 6h TTL，不算错）
+* **两处生产调用点真传** `trade_day=`（`analysis_status` / `api_chart`）
+  ★ `api_chart` 里**复用已构造的 `ds`** —— `test_r5_ds_seam_is_parameterized` 断言 `_ds` 恰好调 1 次
+
+### B4 · MEDIUM-HIGH · `asof` 取不到时白写 5024 个空 key 垃圾缓存
+
+**修法**：`if not asof: return False`（本轮不跑，等下一 tick）。
+
+### B5 · MEDIUM-HIGH · 用户看不到「盈亏是哪一刻的」
+
+**缺陷**：只有后端 `as_of`/`source` 字段，页面 `grep live-pnl-source` = **0 处** ✗
+⇒ 用户仍不知道时效；降级 `source="state"` 时显示旧值且无标注 —— **正是用户抱怨的那半个问题**。
+
+**修法（受布局硬约束）**：
+* 页面「总盈亏」**标签**带来源：`总盈亏（实时）` / `总盈亏（结算）`
+* 值只把原有数字包一层 `<span data-testid="live-pnl-source" title="实时 · 2026-11-09">`
+  ⇒ **不加任何可见字符** ⇒ 宽度零增量 ✓
+* ★ **布局预算压测（第 6 次）**：标记放「总盈亏」的**值**里 ⇒ `851 > 848`；
+  放「交易日」的值里 ⇒ `869 > 848` ⇒ **右列任何可见内联元素都撑宽** ✗
+  ⇒ **终版改标签文字**（复用 `esc(kv[0])`，7 字 ≈ 既有 `冻结(融券券款)` ⇒ 不换行）✓
+
+### B6 · MEDIUM · A5「平时算持仓∪自选」从未被调用
+
+**修法**：`ScoreRefresher._weekday_pass()` —— 不在周末窗口时，按 `WEEKDAY_REFRESH_S = 3600s`
+节流跑 `weekday_codes()`（持仓 ∪ 自选，≤40 只，几分钟）✓
+
+### 评审建议项（全部落地）
+
+1. `MAX_ATTEMPTS` 原来是死逻辑（两个分支写**完全相同**的 dict）⇒ 达到上限记 `dead` 并**跳过**
+2. guard 判断的绕写法 ⇒ 改项目标准形态（`except NetworkForbiddenInLock: raise` 在前）
+3. `weekend_codes` / `read_ledger` 的宽 `except` ⇒ 收窄（`OSError/ValueError/TypeError`）+ 先 guard
+5. ★ **判据以源码文本为主 ⇒ 恰好放过了 B1/B3/B5 三个行为缺陷** ⇒ 本版补 **4 条行为判据**：
+   * `test_v10_b1_payload_is_ready_shape`（写盘→读回→`analysis_state == "ready"`，端到端）
+   * `test_v10_b1_rejects_dirty_payload`（脏载荷必须 `raise`）
+   * `test_v10_b3_trade_day_wired_in_production`（生产源码 2 处 + 7 天前缓存命中）
+   * `test_v10_b5_source_marker_is_visible`（两态文案 + 反证值里不许叠加字符）
+6. `--offline` 时不启动刷新器（原来线程空转、每 600s 白拉一次日历）
+7. 统一走注入的 `self._now_fn`（台账时间戳可注入）
+
+### 测试
+
+* 开发副本 **1244 passed / 5 skipped / 0 failed**
+* `pytest -m slow`：**1 passed / 1 skipped**（skip = v7 显式已知限制，符合铁律 9）
+* ★ 同时修正了一条**断言了错误行为**的判据：
+  `test_v10_a4a_no_future_calendar_fallback` 原来断言「周四 16:00 + 无未来日历 ⇒ True」
+  —— 那正是 B2 的 bug 行为 ✗ ⇒ 改成评审指定的正确口径 ✓
+
 ## [1.15.0] — 2026-11-09
 
 **主题：v10 补完 —— A4「周五收盘 ~ 下周一开盘前，全市场 5024 只分数后台重算」**

@@ -632,6 +632,47 @@ def chart_payload(
 # =========================================================================== #
 # 分析区
 # =========================================================================== #
+def analysis_payload_from_result(result, cfg: AppConfig, *, computed_at: str | None = None) -> dict:
+    """从 ``CanslimResult`` 构造**分析缓存载荷** —— ★ **全仓唯一构造器**。
+
+    ## 为什么必须有它（code-review B1，CRITICAL）
+    ``CanslimResult.to_dict()``（`strategy.py:466`）的形状是
+    ``{code, name, asof, total, factors: [list], signal, reasons, risks}`` ——
+    ★ **没有 ``ok`` 字段**、★ ``factors`` 是 **list** 不是 dict。
+    而 ``analysis_<code>_<asof>`` 缓存**期望**的形状是
+    ``{ok: True, total, signal, factors: {C: 12.5, ...}, notes: {...}, reasons: [...], risks: [...], recommend}``。
+
+    ⇒ 直接把 ``to_dict()`` 写进缓存会让：
+      ① :func:`analysis_state` 判 **``failed``**（缺 ``ok``）—— `chart.py:705`
+      ② 读取时 TTL 走 ``ANALYSIS_FAIL_TTL = **120 秒**`` —— `chart.py:730`
+      ③ ★★★ **A4 周末全市场扫描（4–8h）的产出 2 分钟后全部作废** ✗
+      ④ 用户点过「批量打分」再去看图，分析卡显示「数据缺失 —— 未知原因」
+
+    ## 本函数就是那**唯一**的转换点 —— 三个产出方都必须用它
+    ``chart._score_analysis`` · ``webapp.api_watchlist_score`` · ``score_refresher._run_batch``
+    """
+    factors = {str(f.key): _finite(f.score) for f in (getattr(result, "factors", None) or [])}
+    payload: dict = {
+        "ok": True,
+        "total": _finite(getattr(result, "total", 0.0)),
+        "signal": str(getattr(result, "signal", "")),
+        "factors": factors,
+        "notes": {str(f.key): str(f.note) for f in (getattr(result, "factors", None) or [])},
+        "reasons": [str(r) for r in (getattr(result, "reasons", None) or [])],
+        "risks": [str(r) for r in (getattr(result, "risks", None) or [])],
+    }
+    try:
+        from . import strategy
+
+        recs = strategy.recommend([result], cfg)
+        payload["recommend"] = recs[0] if recs else None
+    except Exception:  # noqa: BLE001 - recommend 是可选展示信息，算不出来不影响主载荷
+        payload["recommend"] = None
+    if computed_at:
+        payload["computed_at"] = str(computed_at)
+    return payload
+
+
 def _score_analysis(cfg: AppConfig, ds: DataSource, code: str, asof: str) -> dict:
     """只读调用 ``ptrade.strategy``；任何失败都降级为「数据缺失」提示，绝不抛异常。"""
     try:
@@ -642,22 +683,8 @@ def _score_analysis(cfg: AppConfig, ds: DataSource, code: str, asof: str) -> dic
     try:
         scorer = strategy.CanslimScorer(cfg, ds, offline=True)
         result = scorer.score(code, asof)
-        factors = {str(f.key): _finite(f.score) for f in result.factors}
-        payload: dict = {
-            "ok": True,
-            "total": _finite(result.total),
-            "signal": str(result.signal),
-            "factors": factors,
-            "notes": {str(f.key): str(f.note) for f in result.factors},
-            "reasons": [str(r) for r in result.reasons],
-            "risks": [str(r) for r in result.risks],
-        }
-        try:
-            recs = strategy.recommend([result], cfg)
-            payload["recommend"] = recs[0] if recs else None
-        except Exception as exc:  # noqa: BLE001
-            payload["recommend"] = None
-            payload["recommend_error"] = str(exc)
+        # ★ B1：用**唯一构造器**（与 M1/刷新器共用）—— 不许在这里手搓第二份形状 ✗
+        payload: dict = analysis_payload_from_result(result, cfg)
         return payload
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"打分失败：{exc}"}
@@ -758,6 +785,16 @@ def write_cached_analysis(cfg: AppConfig, code: str, asof: str, payload: Any) ->
     if payload.get("pending"):
         raise ValueError(
             "pending 占位不得写缓存：落盘后前端会把「还在算」当成「数据缺失」而停止轮询"
+        )
+    # ★★ code-review B1 的第二道防线：拒绝**形状错误**的载荷。
+    #   曾经 `strategy.CanslimResult.to_dict()` 被直接写进来 —— 它没有 `ok`、`factors` 是 list
+    #   ⇒ `analysis_state()` 判 failed ⇒ TTL 走 120s ⇒ **A4 的 4–8h 扫描产出 2 分钟作废** ✗
+    #   ⇒ 这里硬校验，让"写脏"在**写入时**就炸，而不是让用户 2 分钟后看到"数据缺失"。
+    if payload.get("ok") is True and not isinstance(payload.get("factors"), dict):
+        raise ValueError(
+            "分析缓存载荷形状错误：ok=True 时 factors 必须是 dict "
+            f"（实际 {type(payload.get('factors')).__name__}）"
+            " —— 请用 chart.analysis_payload_from_result() 构造"
         )
     return DataSource._write_entry(
         _analysis_cache_dir(cfg), analysis_cache_key(code, asof), payload

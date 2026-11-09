@@ -63,6 +63,10 @@ LEDGER_DIR = os.path.join("data", "cache")
 #: 每 N 只落一次台账（★ 太频会拖慢，太稀会丢进度）
 CHECKPOINT_EVERY = 50
 
+#: **平时**（非周末窗口）刷「持仓 ∪ 自选」的最小间隔（秒）。
+#: ★ 评审 B6：`weekday_codes` 原来**生产零调用** ⇒ PRD A5 未接线 ✗
+WEEKDAY_REFRESH_S = 3600.0
+
 #: 单票失败重试上限（★ 东财限流时不要狂重试，1 次够了）
 MAX_ATTEMPTS = 2
 
@@ -109,9 +113,18 @@ def is_weekend_window(
     # 之后第一个交易日
     later = [d for d in cal if d > today]
     if not later:
-        # ★ 修正 2：日历没有未来日期（新浪是**历史**日历）
-        #   ⇒ 回退启发式：今天之后日历里已无交易日 ⇒ 若最近已收盘交易日就是日历最大日 ⇒ 视为跨周缺口
-        return prev_td == cal[-1]
+        # ★ 修正 2：日历没有未来日期（新浪 `tool_trade_date_hist_sina` 是**历史**日历）。
+        #
+        # ★★ code-review B2（HIGH）：原回退 `return prev_td == cal[-1]` **错了** ✗
+        #   生产日历只到「今天」⇒ `later` **恒空** ⇒ **周一 16:00**：`today in cal` 且
+        #   `prev_td == today == cal[-1]` ⇒ 判 **True** ⇒ **扫描跑在周一晚**，
+        #   而 ISO 周台账随后把该周标 done ⇒ **该周周五收盘后不再扫** ✗（且 4–8h 占工作日晚间）
+        #
+        # ⇒ 回退只许认「**今天不是交易日**」或「**今天已是周五及以后**」：
+        #   * 周一~周四的交易日 ⇒ 绝不可能是"本周最后一个交易日"的窗口 ⇒ False ✓
+        #   * 周五收盘后 / 周六 / 周日 ⇒ True ✓
+        #   * 周四（周五休市）⇒ 历史日历**无法区分** ⇒ 按约定 False（由周五/周六轮次兜住）✓
+        return prev_td == cal[-1] and (today not in cal or now.weekday() >= 4)
 
     next_td = later[0]
     # ★ 核心判定：prev / next 是否**跨 ISO 周**
@@ -141,7 +154,7 @@ def read_ledger(cfg, iso_week: str) -> dict[str, Any] | None:
         with open(p, "r", encoding="utf-8") as fh:
             doc = json.load(fh)
         return doc if isinstance(doc, dict) else None
-    except Exception:  # noqa: BLE001 - 坏台账 ⇒ 当作没有（会重跑，不静默错）
+    except (OSError, ValueError, TypeError):  # ★ 建议 3：收窄
         return None
 
 
@@ -185,7 +198,9 @@ def weekend_codes(cfg, ds) -> list[str]:
     """
     try:
         frame, _ = ds._spot_frame_raw()  # noqa: SLF001 - 只读缓存
-    except Exception:  # noqa: BLE001
+    except NetworkForbiddenInLock:
+        raise                      # ★ 建议 3：未来若这里加守卫，不许被静默吞掉
+    except (OSError, ValueError, TypeError):
         return []
     if frame is None or not len(frame):
         return []
@@ -250,6 +265,8 @@ class ScoreRefresher:
                                       "asof": "", "iso_week": "", "last_error": "",
                                       "started_at": "", "updated_at": ""}
         self.codes: list[str] = []
+        #: ★ B6：平时分支的上次运行时刻（monotonic，避免墙钟回拨）
+        self._last_weekday_at: float = 0.0
 
     # ---- 只读状态 ----
     def status(self) -> dict[str, Any]:
@@ -301,12 +318,82 @@ class ScoreRefresher:
             trade_dates=trade_dates,
             is_trade_date=lambda d: d in set(trade_dates),
         ):
-            return False
+            # ★★ B6（评审 MEDIUM）：**平时分支** —— PRD A5「平时算持仓 ∪ 自选池」。
+            #   原实现只跑周末 ⇒ `weekday_codes` **生产零调用**（死代码）✗
+            #   ⇒ 这里按 `WEEKDAY_REFRESH_S` 节流跑一次（≤40 只，几分钟，不是 4–8h）
+            return self._weekday_pass(now)
         week = iso_week_key(now)
         doc = read_ledger(self.cfg, week)
         if isinstance(doc, dict) and doc.get("status") == "done":
             return False                       # ★ ISO 周幂等：本周已跑完
         return self._run_batch(now, week, doc)
+
+    def _weekday_pass(self, now: datetime) -> bool:
+        """**平时**（非周末窗口）刷「持仓 ∪ 自选」—— ≤40 只，按 `WEEKDAY_REFRESH_S` 节流。
+
+        ★ PRD A5：用户原话「平时你可以给我算**持仓的和自选池的**」。
+        ★ 节流理由：盘中有 5s 轮询的 UI，这里不能跟着跑；1 小时一次足够让分数「当天内稳定」。
+        """
+        import time as _time
+
+        mono = _time.monotonic()
+        if self._last_weekday_at and (mono - self._last_weekday_at) < WEEKDAY_REFRESH_S:
+            return False
+        try:
+            from . import store, watchlist
+
+            state = store.read_state(self.cfg)
+            items = watchlist.list_watchlist(self.cfg)
+        except (OSError, ValueError):
+            return False
+        if state is None:
+            return False
+        codes = weekday_codes(self.cfg, state, items)
+        if not codes:
+            return False
+        asof = ""
+        try:
+            asof = str(self.ds.latest_trade_asof(codes[:5]) or "")
+        except NetworkForbiddenInLock:
+            raise
+        except (OSError, ValueError, RuntimeError):
+            asof = ""
+        if not asof:
+            return False
+        self._last_weekday_at = mono
+        with self._lock:
+            self.state.update(
+                status="weekday", total=len(codes), done=0, asof=asof,
+                iso_week="", updated_at=now.strftime("%Y-%m-%dT%H:%M:%S"),
+                started_at=now.strftime("%Y-%m-%dT%H:%M:%S"), last_error="",
+            )
+        # ★ 复用同一个 scorer（同样适用于 ≤40 只的小批）
+        from . import chart as chart_mod
+        from . import strategy
+
+        scorer = strategy.CanslimScorer(self.cfg, self.ds, offline=False)
+        done = 0
+        for code in codes:
+            if self._stop.is_set():
+                break
+            try:
+                result = scorer.score(code, asof)
+                payload = chart_mod.analysis_payload_from_result(
+                    result, self.cfg,
+                    computed_at=self._now_fn().strftime("%Y-%m-%dT%H:%M:%S"),
+                )
+                chart_mod.write_cached_analysis(self.cfg, code, asof, payload)
+                done += 1
+            except NetworkForbiddenInLock:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 单票失败不拖垮整轮（与周末批次口径一致）
+                with self._lock:
+                    self.state["last_error"] = f"{code}: {type(exc).__name__}: {exc}"[:160]
+            with self._lock:
+                self.state["done"] = done
+        with self._lock:
+            self.state["status"] = "idle"
+        return True
 
     def _run_batch(self, now: datetime, week: str, prev: dict | None) -> bool:
         codes = weekend_codes(self.cfg, self.ds)
@@ -319,6 +406,10 @@ class ScoreRefresher:
             raise                      # ★ INV-42/45：同上
         except Exception:  # noqa: BLE001
             asof = ""
+        # ★ B4：`asof` 拿不到就**本轮不跑** —— 否则 `analysis_<code>_` 空 key
+        #   会写 5024 个**永久读不到**的垃圾缓存（评审 B4）✗
+        if not asof:
+            return False
         done: set[str] = set((prev or {}).get("done") or [])
         failed: dict[str, Any] = dict((prev or {}).get("failed") or {})
         with self._lock:
@@ -352,27 +443,28 @@ class ScoreRefresher:
                 continue
             attempts = int((failed.get(code) or {}).get("attempts") or 0)
             try:
+                if (failed.get(code) or {}).get("dead"):
+                    continue               # ★ 建议 1：已达重试上限 ⇒ 跳过（不再无谓烧时间）
                 result = scorer.score(code, asof)
-                payload = dict(result.to_dict()) if hasattr(result, "to_dict") else {}
-                payload["computed_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                payload["asof"] = asof
+                # ★★ B1（CRITICAL）：**必须**用 chart 的唯一构造器。
+                #   曾用 `result.to_dict()` —— 无 `ok`、`factors` 是 list ⇒ 判 failed ⇒ 120s 过期
+                #   ⇒ **整个周末扫描（4–8h × 5024 只）2 分钟后全部作废** ✗
+                payload = chart_mod.analysis_payload_from_result(
+                    result, self.cfg, computed_at=self._now_fn().strftime("%Y-%m-%dT%H:%M:%S")
+                )
                 chart_mod.write_cached_analysis(self.cfg, code, asof, payload)
                 done.add(code)
                 failed.pop(code, None)
             except Exception as exc:  # noqa: BLE001 - **单票失败不拖垮整批**（Critic B8 允许的宽 except）
                 attempts += 1
-                # ★ 守卫错误必须上抛（INV-42），不许被整批吞掉
-                try:
-                    from .datasource import NetworkForbiddenInLock
-
-                    if isinstance(exc, NetworkForbiddenInLock):
-                        raise
-                except ImportError:  # pragma: no cover
-                    pass
-                if attempts < MAX_ATTEMPTS:
-                    failed[code] = {"error": f"{type(exc).__name__}: {exc}"[:120], "attempts": attempts}
-                else:
-                    failed[code] = {"error": f"{type(exc).__name__}: {exc}"[:120], "attempts": attempts}
+                # ★ 建议 1：`MAX_ATTEMPTS` 原来两个分支写**完全相同**的 dict ⇒
+                #   "重试上限"根本没生效，failed 票下一轮还会重试 ✗
+                #   ⇒ 达到上限后记 `dead`，**跳过**后续轮次（不再白烧时间）
+                failed[code] = {
+                    "error": f"{type(exc).__name__}: {exc}"[:120],
+                    "attempts": attempts,
+                    "dead": attempts >= MAX_ATTEMPTS,
+                }
             n_since_ckpt += 1
             with self._lock:
                 self.state["done"] = len(done)

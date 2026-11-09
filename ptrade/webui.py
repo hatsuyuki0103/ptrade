@@ -454,12 +454,25 @@ function renderState(data) {
   var d = (data && data.state) || data || {};
   renderDivergence(d);
   var ratio = pick(d, ["maintenance_ratio"]);
+  /* ★★ B5（评审 MEDIUM-HIGH）：用户必须看得出「这个盈亏是哪一刻的」。
+     ★ **不能新增行** —— `test_ui_layout_v4` 对右列高度零容忍（v10 踩了 5 次）✗
+     ⇒ 只在「总盈亏」的**值**里塞一个 **2 字**标记（`实时` / `结算`），完整时刻放 `title`（零高度）✓ */
+  var _src = d.source;
+  var _asOf = d.as_of || d.trade_date || "";
+  /* ★ B5：可见的来源写在下面「总盈亏」的**标签**里（不是新元素、不撑宽） */
   var items = [
     ["交易日", d.trade_date], ["可用资金", num(d.available_cash)], ["总资产", num(d.total_assets)],
     ["净资产", num(d.net_assets)], ["多头市值", num(d.long_market_value)], ["融券市值", num(d.short_market_value)],
     ["融资负债", num(d.financing_debt)], ["冻结(T+1)", num(d.frozen_t1)], ["冻结(融券券款)", num(d.frozen_collateral)],
     ["应计利息", num(d.interest_accrued)], ["维持担保比例", ratio === null ? "—（无负债）" : num(ratio, 4)],
-    ["总盈亏", num(d.total_pnl)]
+    /* ★★ B5（终版）：**标签**带来源（`总盈亏（实时）`/`总盈亏（结算）`）——
+       复用既有 `esc(kv[0])`，**不是新元素**，7 字 ≈ 既有 `冻结(融券券款)` ⇒ 不换行 ✓
+       **值**只把原有数字包一层 `title`（**不加任何字符**）⇒ 宽度零增量 ✓
+       ★ 两次失败教训：放「总盈亏」值里 ⇒ 851；放「交易日」值里 ⇒ 869 ⇒ 右列**任何可见内联元素都撑宽** ✗ */
+    ["总盈亏" + (_src === "live" ? "（实时）" : "（结算）"),
+     '<span data-testid="live-pnl-source" title="' + esc(_src === "live"
+        ? ("实时 · " + _asOf) : ("截至 " + _asOf + "（未取到实时价）"))
+     + '">' + num(d.total_pnl) + "</span>"]
   ];
   $("state-panel").innerHTML = items.map(function (kv) {
     return '<div><span class="k">' + esc(kv[0]) + '</span><span class="v">' + (kv[1] === undefined || kv[1] === null ? "—" : (typeof kv[1] === "string" ? esc(kv[1]) : kv[1])) + "</span></div>";

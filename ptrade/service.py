@@ -380,6 +380,43 @@ def live_state_summary(
     return data, source, as_of
 
 
+def today_trade_date(ds: DataSource, now: datetime | None = None) -> str | None:
+    """**日历口径的"当前交易日"**（v10-A1 用：判定「同交易日永久有效」）。
+
+    ## 定义（这是 A1 唯一的正确口径 —— 评审 B6 定的）
+    * `now >= 15:30` **且**今天是交易日 ⇒ **今天**（收盘了，今天的桶是完整的）
+    * 否则 ⇒ `prev_trade_date(today)`（盘前/盘中 ⇒ 最近一个**已收盘**交易日）
+    * 再退化 ⇒ `latest_trade_date()`
+    * 全拿不到 ⇒ ``None``（调用方退回 6h TTL，**不算错**，只是不享受"永久有效"）
+
+    ★ **不能用 `_today()`**：周末 `_today()` 是周日，而分数该用**周五**的桶 ——
+      若按 `_today()` 判「同交易日」，周末每次打开都会重算 ✗（正是评审 B6 点的坑）
+    """
+    from datetime import time as _dtime
+
+    now = now or datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    try:
+        if now.time() >= _dtime(15, 30) and ds.is_trade_date(today):
+            return today
+    except NetworkForbiddenInLock:
+        raise                       # ★ INV-42：锁内联网必须响亮地炸
+    except (OSError, ValueError, RuntimeError):
+        pass
+    try:
+        return str(ds.prev_trade_date(today))
+    except NetworkForbiddenInLock:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        pass
+    try:
+        return str(ds.latest_trade_date())
+    except NetworkForbiddenInLock:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 def effective_trade_date(
     ds: DataSource,
     explicit_date: str | None,

@@ -61,11 +61,30 @@ def test_v10_a4a_weekend_window(name, now, expect):
 
 
 def test_v10_a4a_no_future_calendar_fallback():
-    """V10-A4a'（Critic B3 修正 2）：日历无未来日期时，回退到「日历最大日 == 最近已收盘交易日」。"""
-    # 日历只到 11-05（周四），now = 11-05 16:00 ⇒ 之后无交易日 ⇒ 应判 True（跨周缺口）
-    assert _win(_w(5, 16), cal=CAL[:4]) is True
-    # 而 11-04 16:00（日历里还有 11-05）⇒ prev=11-04 next=11-05 同周 ⇒ False
-    assert _win(_w(4, 16), cal=CAL[:4]) is False
+    """V10-A4a'（Critic B3 修正 2 + **code-review B2 的纠正**）：纯**历史**日历下的回退。
+
+    ★★ 这条判据原来是**错的**（断言了 bug 的行为）：
+       旧实现回退成 `return prev_td == cal[-1]` —— 而生产日历 `ak.tool_trade_date_hist_sina`
+       是**历史**日历（只到今天）⇒ `later` **恒空** ⇒ 该回退对**每个交易日收盘后**都返回 True
+       ⇒ 扫描跑在**周一晚**而不是周五收盘，且 ISO 周台账把该周标 done ⇒ **该周周五收盘后不再扫** ✗
+
+    ★ 新口径（评审 B2 指定）：回退只认「**今天不是交易日**」或「**今天已是周五及以后**」
+      * 周五 16:00 ⇒ True（本周最后交易日，收盘了）✓
+      * 周六 / 周日 ⇒ True（非交易日，仍在窗口内）✓
+      * 周一~周四的**交易日** ⇒ **False**（绝不可能是"本周最后一个交易日"的窗口）✓
+      * 周四（周五休市的历史日历无法区分）⇒ 按约定 False（由周五/周六轮次兜住）✓
+    """
+    hist = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"]   # 只到周四
+    hist2 = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"]  # 到周五
+    # ★ 交易日收盘后不得误判成周末窗口
+    assert _win(_w(2, 16), cal=hist2) is False, "周一 16:00 被误判成周末窗口 ✗"
+    assert _win(_w(3, 16), cal=hist2) is False, "周二 16:00 被误判成周末窗口 ✗"
+    assert _win(_w(4, 16), cal=hist2) is False, "周三 16:00 被误判成周末窗口 ✗"
+    assert _win(_w(5, 16), cal=hist) is False, "周四 16:00：历史日历无法区分，按约定 False"
+    # ★ 周五收盘后 / 周末 ⇒ True
+    assert _win(_w(6, 16), cal=hist2) is True, "周五 16:00 应进窗口"
+    assert _win(_w(7, 12), cal=hist2) is True, "周六应仍在窗口内"
+    assert _win(_w(8, 12), cal=hist2) is True, "周日应仍在窗口内"
 
 
 def test_v10_a4a_empty_calendar():
