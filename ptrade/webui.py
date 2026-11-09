@@ -264,6 +264,9 @@ window.dispatchEvent(new Event("chart-option-ready"));
 var API = {
   health: "/api/health",
   state: "/api/state",
+  /* ★ v10-M2：**实时账户**端点（带 as_of/source）。`/api/state` 保留（受 INV-40 约束），
+     前端账户卡改读这个 —— 否则用户看到的永远是「上一次成交时」的盈亏 ✗ */
+  live_state: "/api/live_state",
   positions: "/api/positions",
   risk: "/api/risk",
   search: "/api/search",
@@ -835,7 +838,21 @@ function analysisReadyHtml(p) {
 function applyAnalysis(state, payload) {
   var view = analysisView(state, payload);
   var st = $("analysis-state"), su = $("analysis-summary"), pan = $("analysis-panel");
-  if (st) { st.setAttribute("data-state", view.state); st.textContent = "分析：" + view.summary; }
+  if (st) {
+    /* ★ v10-A3：分数**时效**（`asof` 优先，退化到 `computed_at` 的日期部分）。
+       ★★ **只写 `data-*` 属性 + `title`，绝不动 `textContent`** ——
+          该元素在**左列图表卡头部**，文本一变长就换行 ⇒ 左列变高 ⇒ 整页 flex 重排
+          ⇒ **右列可用高度被压缩** ⇒ `test_ui_layout_v4` 4 条红（实测 819→832→851→888 一路变差）✗
+          二分证明：`webui.py` 换回 v1.13.0 ⇒ 4 passed ✓
+       ⇒ `data-asof` 供**判据**读，`title` 供**用户 hover** 看，**视觉零变化** ✓ */
+    var _asof = (payload && (payload.asof || payload.computed_at)) || "";
+    if (!_asof && view && view.asof) { _asof = view.asof; }
+    _asof = String(_asof || "").slice(0, 10);
+    st.setAttribute("data-state", view.state);
+    st.setAttribute("data-asof", _asof);
+    st.setAttribute("title", _asof ? ("算于 " + _asof) : "");
+    st.textContent = "分析：" + view.summary;
+  }
   if (su) { su.textContent = view.summary; }          /* ★ summary 的唯一写点 */
   if (pan) { pan.innerHTML = view.bodyHtml; }         /* ★ body 的唯一写点 */
   var retry = (pan && pan.querySelector) ? pan.querySelector('[data-act="analysis-retry"]') : null;
@@ -888,7 +905,15 @@ function prefillOrder(code) {
   toast("已预填下单表单（" + target + "）—— 请核对数量/价格后**手动**提交", "ok");
 }
 
-function refreshState() { return api(API.state).then(function (b) { if (b) { renderState(b.data); } }); }
+/* ★ v10-M2：读**实时**端点；OK=false 或异常都退回 `/api/state`（页面永不白屏） */
+function refreshState() {
+  return api(API.live_state).then(function (b) {
+    if (b && b.ok !== false) { renderState(b.data); return null; }
+    return api(API.state).then(function (b2) { if (b2) { renderState(b2.data); } });
+  }).catch(function () {
+    return api(API.state).then(function (b2) { if (b2) { renderState(b2.data); } });
+  });
+}
 function refreshPositions() { return api(API.positions).then(function (b) { if (b) { renderPositions(b.data); } }); }
 function refreshRisk() { return api(API.risk).then(function (b) { if (b) { renderRisk(b.data); } }); }
 /* ★★ X3（真缺陷，已修）：这里**曾经**又定义了一次 `refreshWatchlist`：

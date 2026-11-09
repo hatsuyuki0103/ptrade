@@ -598,6 +598,7 @@ REGISTERED_GUARD_SITES: frozenset[str] = frozenset({
     "engine::_mark_prices",
     "engine::_quote",
     "service::effective_trade_date",
+    "service::live_state_summary",
     "service::mark_positions_live",
     "service::resolve_asof",
     "watchlist::_has_market_data",
@@ -605,7 +606,9 @@ REGISTERED_GUARD_SITES: frozenset[str] = frozenset({
     "watchlist::score_watchlist",
     "webapp::_analysis_background",
     "webapp::_work",
+    "webapp::api_live_state",
     "webapp::api_name_refresh",
+    "webapp::api_watchlist_score",
     "webapp::api_search",
     "webapp::start_startup_maintenance",
 })

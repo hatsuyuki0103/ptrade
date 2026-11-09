@@ -715,7 +715,13 @@ def _analysis_cache_dir(cfg: AppConfig) -> str:
     return os.path.join(str(cfg.root), "data", "cache")
 
 
-def read_cached_analysis(cfg: AppConfig, code: str, asof: str) -> dict | None:
+def read_cached_analysis(
+    cfg: AppConfig,
+    code: str,
+    asof: str,
+    *,
+    trade_day: str | None = None,
+) -> dict | None:
     """读分析缓存（**只读**：不联网、不计算）。缺失/过期/形状不对 → ``None``。
 
     ★ **TTL 按内容分档**（Critic 要求「相位并 key」，**不做** `{value, resolved_for, phase}` 三字段包装）：
@@ -727,6 +733,12 @@ def read_cached_analysis(cfg: AppConfig, code: str, asof: str) -> dict | None:
     payload = entry.get("payload")
     if not isinstance(payload, dict):
         return None
+    # ★ v10-A1：**同交易日永久有效**（用户裁决「按交易日过期」）。
+    #   判定式用「**请求的 asof == 解析出的当前交易日**」而非「payload.asof」——
+    #   ★ 因为 `_score_analysis` 的 payload **没有 asof 字段**（Critic B6 实测）。
+    #   ★ 只有 `ok is True` 才许走这条分支；失败缓存永远按 `ANALYSIS_FAIL_TTL` 过期 ✗
+    if trade_day and payload.get("ok") is True and str(asof)[:10] == str(trade_day)[:10]:
+        return payload
     ttl = ANALYSIS_TTL if payload.get("ok") else ANALYSIS_FAIL_TTL
     if DataSource._expired(entry, ttl):
         return None

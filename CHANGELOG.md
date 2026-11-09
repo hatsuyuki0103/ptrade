@@ -4,6 +4,77 @@
 
 ## [Unreleased]
 
+## [1.14.0] — 2026-11-09
+
+**主题：v10（**部分交付**）—— CANSLIM 分数**按交易日刷新** + 账户盈亏**实时可见**
+
+> ★★ **诚实声明：v10 的 A4（「周五收盘全市场后台重算」）本轮**未实现** ✗，留下 v1.15.0。**
+> 本轮交付的是用户两个诉求的**核心部分**：① 分数按时效刷新且**能看出是哪天的**；② 盈亏**实时**且**标明来源**。
+
+### 用户原话（真源）
+
+> 「我的页面上，这个**益佰制药还是 33 分**，现在你给了 **32 分**，说明，我的模拟盘，**需要有刷新的机制，每天去刷新这个分数**。
+>   另外，**账号状态，也是没有实时更新的**…我之前看的时候都还是 **−33 块**，现在才给我赚到了 **100 多块**。
+>   我需要你至少让我**每次刷新页面的时候，都知道自己赚/亏了多少**，或者**在交易时间内的时候，给我刷新这个**。」
+
+### 新增 · 账户实时盈亏（B 组）
+
+- **`GET /api/live_state`**（与 `/api/state` **同形**，多 `as_of`/`source`）：
+  ```python
+  prices = cache-only spot prices          # _spot_frame_raw()，★ 打开页面**不打网络**
+  live = core.mark_to_market(state, prices)          # deepcopy ⇒ 只读；坏价自动跳过
+  live = core.refresh_risk_flags(live, cfg.risk, cfg.margin)   # ★ 风险指标也按实时价
+  data = service.state_summary(live)                 # ★ 与 /api/state 共用同一序列化器
+  ```
+  ★ **不新造公式** —— 评审（Architect B1/Critic）指出 `state_summary` 只是序列化器，公式在 `core.AccountState`
+  派生属性里；**逐条复刻会造出第二套会计恒等式** ✗
+  ★ **`/api/state` 一行未改** ⇒ **INV-40 保持**（与 `ptrade status --json` 逐字段一致）✓
+- ★ **前端 `refreshState()` 改读 `/api/live_state`**（失败回退 `/api/state`）—— 否则新端点**白做** ✓
+- ★ **`live_state` 必须补齐 `ledger_consistency`** —— 缺它前端 `renderDivergence` 会拿到
+  `diverged===undefined` ⇒ 渲染**灰色「无法判定」横幅** ⇒ **右列多一块高度** ⇒
+  `test_ui_layout_v4` **4 条全红**（实测右列 `scrollH 888 > clientH 807`）✗
+
+### 新增 · 分数按交易日刷新（A 组）
+
+- **`chart.read_cached_analysis(..., trade_day=)`**：★ 判定式用「**请求的 asof == 解析出的当前交易日**」
+  （payload 里**没有** `asof` 字段 —— Critic B6 实测），**仅 `ok is True`** 才允许「同交易日永久有效」；
+  ★ **失败缓存永远按 `ANALYSIS_FAIL_TTL=120s`** 过期，不许被放宽 ✗
+- ★ **`#analysis-state` 的 `data-asof` 属性 + `title`** 显示「算于 YYYY-MM-DD」——
+  ★ **只写属性，不动 `textContent`**（见下「布局预算」）
+- **M1**：`/api/watchlist/score` 算完**写回 `analysis_<code>_<asof>` 缓存**（+ `computed_at`）⇒
+  自选池与图表分析卡**从此共用同一份数据** ⇒ 同一 asof 下分数必然一致 ✓
+  （★ 这才是用户「33 vs 32」的真源 —— Critic M1：原来自选池实时算、图表卡读缓存 ✗）
+
+### ★★ 本轮最贵的教训：**布局预算只剩 0px**
+
+`tests/test_ui_layout_v4.py`（INV-66b 右列无滚动 / K 线面板 ≥215px）对**任何新增 DOM 都零容忍**：
+| 我试过的做法 | 结果 |
+|---|---|
+右列新增「盈亏来源」**独立一行** | `819 > 807` ✗ |
+把完整文案**内联**到总盈亏值 | `832 > 807` ✗ |
+1 字符标记 + title | `851 > 807` ✗ |
+全部 `hidden` 零占位 | `888 > 807` ✗ |
+★ **最终**：只写 **`data-*` 属性** + `title`（**视觉零变化**） | **28 passed** ✓ |
+
+⇒ ★ **在 `#analysis-state` 或 `state-panel` 里加任何元素/文本，左列头部一变高 ⇒ 整页 flex 重排
+⇒ 右列可用高度被压缩 ⇒ 4 条布局判据全红** ✗ —— **判据已把这条写进注释，防将来"顺手加个元素"** ✓
+
+### 测试
+
+- 新增 **`tests/test_v10_refresh.py`**（V10-B1/B4/B5/M1/M2/A1/A3 等 10 条）
+- 全量 **1220 passed / 5 skipped / 0 failed**（v1.13.0 基线 1200/4 ⇒ **+20 判据**）
+- ★ 过程中被仓库纪律抓住并修复：**守卫站点必须登记**（`test_W7`，2 次）·
+  **宽 `except` 吞 `NetworkForbiddenInLock`**（`test_W1`）· **不变式扫描撞上我留下的 UTF-16 临时文件**（`0xff` BOM）
+
+### ★ 未实现（v1.15.0）
+
+- **A4 周末全市场后台重算**：需按评审共识实现 ——
+  **单 `CanslimScorer` 批处理**（★ 每票新建 scorer 是 103h 的根源；复用后 **4–8h/趟**）·
+  `data/cache/score_refresh_<iso_week>.json` **ISO 周幂等台账**（一周最多一轮）· failed 台账 + 一次重试 ·
+  范围 = **spot 快照过滤 6 位 A 股/排除 ETF/停牌/成交额 0**（★ `UNIVERSE_CODES` 只有 32 只且含 3 只 ETF ✗）·
+  「周五收盘」判定用 **`prev_td.iso_week != next_td.iso_week`** + **排除周一盘中** + `next_trade_date` 抛错时回退 ·
+  进度端点 · **单趟循环**（不是 `spot_refresher` 的 per-tick，惰性门控会让 103h 任务永远跑不完 ✗）
+
 ## [1.13.0] — 2026-11-03
 
 ## 用户实测（2026-11-03 原话 + 截图）

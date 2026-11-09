@@ -298,6 +298,88 @@ def prewarm_for_write(
     return warmed
 
 
+def live_state_summary(
+    cfg,
+    ds,
+    state,
+    *,
+    now: str | None = None,
+) -> tuple[dict, str, str]:
+    """**实时账户快照**（给 `/api/live_state` 用；**只读**，绝不写回 state）。
+
+    ## 为什么（用户 2026-11-09 原话）
+    > 「账号状态，也是没有实时更新的，并不会随着我那个仓位去变动价格，
+    >   我之前看的时候都还是 **−33 块**，现在才给我赚到了 **100 多块**。」
+
+    `service.state_summary` 基于 `state.last_prices`，而它**只在成交/`settle` 时更新** ✗
+    ⇒ 页面上的总盈亏是**上一次成交时**的快照。
+
+    ## 实现（★ 与 `state_summary` **共用同一序列化器**，不新造公式 —— Architect B1）
+    ```python
+    prices = cache-only spot prices
+    live = core.mark_to_market(state, prices)                    # deepcopy ⇒ 只读；坏价跳过
+    live = core.refresh_risk_flags(live, cfg.risk, cfg.margin)   # ★ B7：风险指标也按实时价
+    data = state_summary(live)                                   # ★ 同一个序列化器
+    ```
+    ★ **不要**用 :func:`mark_positions_live` 去拼 —— 它返回 ``list[dict]`` **行**，
+      不是 ``AccountState.positions`` 里的 ``Position`` 对象 ⇒ 喂给 ``state_summary`` 会字段错位 ✗
+
+    ## 取价：**cache-only**（Critic 新增3）
+    ``ds.spot(codes)`` 在冷缓存时会**真取数**（`TTL_SPOT=60`）⇒ 5 秒轮询下**每分钟打一次网络** ✗
+    ⇒ 这里只读 ``DataSource._spot_frame_raw()``；**读不到就整份降级**到 state 原值 ✓
+
+    ## 返回
+    ``(data, source, as_of)``
+    * ``source``：``"live"``（全部实时）/ ``"mixed"``（部分）/ ``"state"``（全部退回落）
+    * ``as_of``：行情时刻（拿不到则空串）
+    """
+    data_state = state_summary(state)          # 降级基线（永不为 None）
+
+    codes = list((getattr(state, "positions", {}) or {}).keys())
+    prices: dict[str, float] = {}
+    as_of = ""
+    frame = None
+    if codes:
+        try:
+            # ★ 真实签名 `_spot_frame_raw() -> tuple[DataFrame, str]`（frame, asof）——
+            #   我原来写成 `frame = ds._spot_frame_raw()` ⇒ frame 是 tuple ⇒ `.iterrows()` 抛
+            #   AttributeError ⇒ 被外层宽 except 吞 ⇒ **永远降级 source="state"** ✗
+            frame, as_of = ds._spot_frame_raw()   # noqa: SLF001 - **只读缓存**，绝不联网 ✓
+            as_of = str(as_of or "")
+        except NetworkForbiddenInLock:
+            raise                      # ★ INV-42：锁内联网必须响亮地炸，不许被降级吞掉
+        except Exception:  # noqa: BLE001 - 缓存读失败 ⇒ 降级（不抛，不编造）
+            frame = None
+    if frame is not None and len(frame):
+        try:
+            for _, row in frame.iterrows():
+                code = str(row.get("code") or "").zfill(6)
+                if code in codes:
+                    px = row.get("last")
+                    try:
+                        if px is not None and float(px) > 0:
+                            prices[code] = float(px)
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:  # noqa: BLE001 - 解析失败 ⇒ 全降级
+            prices = {}
+
+    if not prices:
+        return data_state, "state", as_of
+
+    try:
+        from . import core
+
+        live = core.mark_to_market(state, prices)
+        live = core.refresh_risk_flags(live, cfg.risk, cfg.margin)
+        data = state_summary(live)
+    except Exception:  # noqa: BLE001 - 重算失败 ⇒ 整份降级（显示不能因重算失败而 500）
+        return data_state, "state", as_of
+
+    source = "live" if len(prices) >= len(codes) else "mixed"
+    return data, source, as_of
+
+
 def effective_trade_date(
     ds: DataSource,
     explicit_date: str | None,

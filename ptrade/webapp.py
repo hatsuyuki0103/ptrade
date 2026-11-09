@@ -784,6 +784,37 @@ class WebApp:
         data["ledger_consistency"] = _svc().consistency(self.cfg)
         return Response(200, _envelope("status", data))
 
+    def api_live_state(self, query, body) -> Response:
+        """**实时账户快照**（v10）—— 与 `/api/state` **同形**，但用**当前快照价**重估。
+
+        ★ 为什么单开一个端点而不改 `/api/state`：后者受 **INV-40** 约束，
+          必须与 `ptrade status --json` **逐字段一致** ✗（`test_w2_state_matches_status_json` 会抓）。
+        ★ **只读**：`service.live_state_summary` 内部 `core.mark_to_market` 是 deepcopy ⇒ 不写 state ✓
+        ★ **取价 cache-only**（`_spot_frame_raw`）⇒ 打开页面**不会打网络** ✓
+        ★ 多返回两个字段：`as_of`（行情时刻）· `source`（`live`/`mixed`/`state`）—— 用户 B5 要求 ✓
+        """
+        from . import service  # noqa: PLC0415 - webapp.py 的既有局部 import 模式
+
+        state = self._read_state()
+        if state is None:
+            return self._state_missing()
+        try:
+            data, source, as_of = service.live_state_summary(self.cfg, self._ds(), state)
+        except NetworkForbiddenInLock:
+            raise                      # ★ INV-42：锁内联网必须响亮地炸，不许被降级吞掉
+        except (OSError, ValueError, RuntimeError):  # 实时快照失败 ⇒ 退回结算口径（页面标 source=state）
+            data, source, as_of = _svc().state_summary(state), "state", ""
+        data["as_of"] = as_of
+        data["source"] = source
+        data["state_path"] = _svc().state_path(self.cfg)
+        # ★★ **必须补齐 `ledger_consistency`** —— 否则前端 `renderDivergence(d)` 拿到
+        #   `diverged === undefined` ⇒ 渲染**灰色「无法判定」横幅** ⇒ **右列多一块高度**
+        #   ⇒ `test_ui_layout_v4`（INV-66b 右列无滚动 / K线面板 ≥215px）**4 条全红** ✗
+        #   证据链：① 右列 scrollH 888 > 807；② 把 webui.py 换回 v1.13.0 ⇒ 4 passed；
+        #          ③ 前端唯一新逻辑 = 改读本端点；④ 缺这个字段 ⇒ 灰横幅占高度 ✓
+        data["ledger_consistency"] = _svc().consistency(self.cfg)
+        return Response(200, _envelope("live_state", data))
+
     def api_positions(self, query, body) -> Response:
         state = self._read_state()
         if state is None:
@@ -1193,6 +1224,26 @@ class WebApp:
             }))
         scorer = strategy.CanslimScorer(self.cfg, self._ds(), offline=self.offline)
         results = scorer.score_many(codes, asof)
+        # ★ v10-M1：把结果**写回图表分析卡读的那份缓存**（`analysis_<code>_<asof>`）
+        #   ⇒ 两条打分路径从此**共用同一份数据** ⇒ 同一 asof 下分数必然一致 ✓
+        #   （Critic M1：原来自选池实时算、图表卡读缓存 ⇒ 页面能同时显示两个分数 ✗）
+        #   ★ 只写缓存、**不改任何状态**；写失败静默（不影响打分返回）
+        try:
+            import time as _time
+
+            from . import chart as _chart
+
+            _computed_at = _time.strftime("%Y-%m-%dT%H:%M:%S")
+            for _item in results:
+                if not _item.factors:      # 取数失败的票不写缓存（与 INV-38 一致）
+                    continue
+                _payload = dict(_svc().jsonable(_item))
+                _payload["computed_at"] = _computed_at
+                _chart.write_cached_analysis(self.cfg, _item.code, asof, _payload)
+        except NetworkForbiddenInLock:
+            raise                         # ★ INV-42：锁内联网必须响亮地炸
+        except (OSError, ValueError):     # 写缓存失败不得影响打分返回
+            pass
         rows: list[dict] = []
         no_data: list[dict] = []
         for item in results:
@@ -1474,6 +1525,8 @@ class WebApp:
             return self.api_health(query, body)
         if path == "/api/state":
             return self.api_state(query, body)
+        if path == "/api/live_state":
+            return self.api_live_state(query, body)
         if path == "/api/positions":
             return self.api_positions(query, body)
         if path == "/api/risk":
