@@ -235,3 +235,63 @@ def test_v10_a4g_status_endpoint_shape():
     for k in ("status", "total", "done", "failed"):
         assert f'"{k}"' in src, f"缺 {k}"
     assert "read_ledger" in src, "必须读台账（重启后进度不丢）"
+
+
+# ── V10-A4h · week_anchor（复审 R3 的回归保护；终审建议 1）
+def test_v10_a4h_week_anchor_spans_the_window():
+    """★ V10-A4h（复审 R3）：**ISO 周台账的锚点必须是窗口起点**，不是 `now`。
+
+    ## 缺陷（复审 R3，HIGH）
+    窗口是「周五收盘 → 周一开盘」，而 ISO 周从**周一 00:00** 起 ⇒ **跨周**：
+    * 周一 00:00–09:30 ⇒ 窗口仍 True（盘中排除只覆盖 09:30–15:30），但 `now` 已属 **W+1**
+      ⇒ 台账 W+1 不存在 ⇒ **再跑一整批**（+8–16h 重复烧）
+    * 该次跑把 **W+1** 标 done ⇒ **W+1 的周五收盘后不再跑**
+      ⇒ A4 从「每周五」漂成「每周一凌晨」，数据仍是上周五的 ✗
+
+    ## 四口径（全部必须返回 **同一个 W**，次周五才 +1）
+    * 周五 16:00 / 周六 / 周日 / **周一盘前** ⇒ 都锚到**上周五** ⇒ **W45**
+    * 次周五 16:00 ⇒ 锚到次周五 ⇒ **W46**
+    """
+    cal = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06",
+           "2026-11-09", "2026-11-10", "2026-11-11", "2026-11-12", "2026-11-13"]
+
+    # 周五 16:00（收盘后）⇒ 今天
+    assert sr.week_anchor(_w(6, 16), cal) == "2026-11-06"
+    # 周六 / 周日 ⇒ 上一个交易日（周五）
+    assert sr.week_anchor(_w(7, 12), cal) == "2026-11-06"
+    assert sr.week_anchor(_w(8, 12), cal) == "2026-11-06"
+    # ★★ 周一盘前 ⇒ **上周五**（不是本周一、更不是 W+1）
+    assert sr.week_anchor(_w(9, 8), cal) == "2026-11-06"
+    # ★ 四条必须落在**同一个 ISO 周**
+    from datetime import datetime as _dt
+
+    assert {
+        sr.iso_week_key(_dt.strptime(sr.week_anchor(_w(6, 16), cal), "%Y-%m-%d")),
+        sr.iso_week_key(_dt.strptime(sr.week_anchor(_w(7, 12), cal), "%Y-%m-%d")),
+        sr.iso_week_key(_dt.strptime(sr.week_anchor(_w(8, 12), cal), "%Y-%m-%d")),
+        sr.iso_week_key(_dt.strptime(sr.week_anchor(_w(9, 8), cal), "%Y-%m-%d")),
+    } == {"2026-W45"}, "窗口内四个时刻必须同周 ✗"
+
+    # 次周五 16:00 ⇒ W46（**必须 +1**，否则 A4 永远只跑第一周）
+    assert sr.week_anchor(_w(13, 16), cal) == "2026-11-13"
+    assert sr.iso_week_key(_dt.strptime(sr.week_anchor(_w(13, 16), cal), "%Y-%m-%d")) == "2026-W46"
+
+    # 空日历 ⇒ 退回 today（无法更准，不崩）
+    assert sr.week_anchor(_w(6, 16), []) == "2026-11-06"
+
+
+def test_v10_a4h_status_endpoint_uses_anchor_not_now():
+    """★ V10-A4h'：状态端点**必须**用 `week_anchor`，不许回退到 `iso_week_key(now)`。
+
+    ★ 否则周一盘前（now 属 W+1）会读 W+1 的空台账 ⇒ 显示 idle，
+      而真正的进度在 W 台账里 ⇒ **进度不可见** ✗
+    """
+    import inspect
+
+    from ptrade import webapp as webapp_mod
+
+    src = inspect.getsource(webapp_mod.WebApp.api_score_refresh_status)
+    assert "week_anchor(" in src, "状态端点没用 window anchor ⇒ 周一会读错周 ✗"
+    assert "iso_week_key(score_refresher.datetime.now())" not in src, (
+        "状态端点又用 now 记周了（复审 R3 的 bug 形态）✗"
+    )

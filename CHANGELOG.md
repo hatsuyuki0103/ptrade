@@ -4,6 +4,43 @@
 
 ## [Unreleased]
 
+## [1.18.0] — 2026-11-09
+
+**主题：按终审建议补 R3 判据（产品代码零改动）**
+
+> code-review 终审结论 **APPROVE · 架构状态 CLEAR** —— R1/R2/R3 三条全部真修好。
+> 终审提了两条非阻断建议，本版落实第 1 条（第 2 条「B5 判据升到 DOM 级」登记为 backlog：
+> 需要 CDP 起真 Chrome，成本高；当前「正向 + 反证 + 零宽度」三层已能防住该坏模式重现）。
+
+### 新增判据（	ests/test_v10_score_refresher.py）
+
+* **	est_v10_a4h_week_anchor_spans_the_window** —— week_anchor 的**四口径**：
+  * 周五 16:00 ⇒ 2026-11-06（W45）✓
+  * 周六 / 周日 ⇒ 同一个周五 ⇒ **W45** ✓
+  * ★★ **周一盘前 ⇒ 上周五** ⇒ **W45**（不是 W+1 —— 这正是复审 R3 的 bug 形态）
+  * 次周五 16:00 ⇒ 2026-11-13 ⇒ **W46**（必须 +1，否则 A4 永远只跑第一周）
+  * 空日历 ⇒ 退回 today（不崩）
+* **	est_v10_a4h_status_endpoint_uses_anchor_not_now** —— 状态端点**必须**用 week_anchor，
+  且**不得**回退到 iso_week_key(now)（防回归）
+
+### 复核（终审要求）
+
+终审说「布局判据我这边只读无法跑 CDP，请在发布流程里复核一次」：
+* pytest tests/test_ui_layout_v4.py -q ⇒ **28 passed** ✓
+* 另与 v10 判据同跑 ⇒ **64 passed** ✓
+* 全量 **1246 passed / 4 skipped / 0 failed**
+  （1 条 	est_C1_C4_write_command_waits_for_lock[settle] 偶发 —— 按 NOTES.md 铁律 11
+   单独连跑 **3/3 通过** 复核，判定为既有 flaky，不挡发布）
+
+### 登记为 backlog（终审建议，非阻断）
+
+1. **B5 判据升到 DOM 级**：用 CDP measure 断言 querySelector('[data-testid="live-pnl-source"]')
+   存在、	extContent 是纯数字、	itle 含「实时/截至」，并断言「总盈亏」行 offsetHeight 与基线一致
+2. **_weekday_pass 24/7 每小时跑且不先查缓存**：
+   建议加「命中 
+ead_cached_analysis 就跳过 + 仅交易时段/UI 活跃时跑」
+3. **pi_score_refresh_status 每请求构造 DS**：可缓存 anchor 数秒
+
 ## [1.17.0] — 2026-11-09
 
 **主题：code-review 复审（`REJECT`/`BLOCK`）的 R1/R2/R3 全部修复**
