@@ -133,6 +133,31 @@ def is_weekend_window(
     return (pw[0], pw[1]) != (nw[0], nw[1])
 
 
+def week_anchor(now: datetime, trade_dates: list[str]) -> str:
+    """**ISO 周台账的锚点日期** = 窗口起点 = **最近一个已收盘交易日**。
+
+    ## 为什么不能用 `now`（复审 R3，HIGH）
+    窗口是「**周五收盘 → 周一开盘**」，而 ISO 周从**周一 00:00** 起 ⇒ **跨周**：
+    * 周一 00:00–09:30 ⇒ 窗口仍为 True（盘中排除只覆盖 09:30–15:30），
+      但 `now` 已属 **W+1** ⇒ 台账 W+1 不存在 ⇒ **再跑一整批**（8–16h 重复烧）✗
+    * 该次跑把 **W+1** 标 done ⇒ **W+1 的周五收盘后不再跑**
+      ⇒ A4 从「每周五」漂成「**每周一凌晨**」，且数据仍是上周五的 ✗
+    * 状态端点也按 `now` 读 ⇒ 周一盘前看不到真实进度 ✗
+
+    ## 锚点口径（四条都正确）
+    * 周五 16:00 ⇒ 今天（周五）⇒ **W** ✓
+    * 周六 / 周日 ⇒ prev_trade_date ⇒ **周五** ⇒ **W** ✓
+    * 周一盘前 ⇒ prev_trade_date ⇒ **上周五** ⇒ **W**（不是 W+1）✓
+    * 次周五 16:00 ⇒ 今天 ⇒ **W+1** ✓
+    """
+    today = now.strftime("%Y-%m-%d")
+    cal = sorted(set(str(d)[:10] for d in (trade_dates or [])))
+    if now.time() >= MARKET_CLOSE and today in cal:
+        return today
+    earlier = [d for d in cal if d < today]
+    return earlier[-1] if earlier else today
+
+
 def iso_week_key(dt: datetime) -> str:
     """ISO 周键：`2026-W45`（★ 用它做**幂等**：一周最多跑一轮）。"""
     y, w, _ = dt.isocalendar()
@@ -322,7 +347,9 @@ class ScoreRefresher:
             #   原实现只跑周末 ⇒ `weekday_codes` **生产零调用**（死代码）✗
             #   ⇒ 这里按 `WEEKDAY_REFRESH_S` 节流跑一次（≤40 只，几分钟，不是 4–8h）
             return self._weekday_pass(now)
-        week = iso_week_key(now)
+        # ★★ 复审 R3：周键锚到**窗口起点**（最近已收盘交易日），**不是 `now`** ——
+        #   否则周一 00:00–09:30 会算成 W+1 ⇒ 首周双跑 8–16h + 次周五漏跑 ✗
+        week = iso_week_key(datetime.strptime(week_anchor(now, trade_dates), "%Y-%m-%d"))
         doc = read_ledger(self.cfg, week)
         if isinstance(doc, dict) and doc.get("status") == "done":
             return False                       # ★ ISO 周幂等：本周已跑完
@@ -455,6 +482,13 @@ class ScoreRefresher:
                 chart_mod.write_cached_analysis(self.cfg, code, asof, payload)
                 done.add(code)
                 failed.pop(code, None)
+            except NetworkForbiddenInLock:
+                # ★★ 复审 R2（HIGH，纪律回归）：v1.16 重构时把 v1.15 内层的
+                #   `isinstance(exc, NetworkForbiddenInLock): raise` 删了、**却没换成**标准形态
+                #   ⇒ 宽 `except Exception` 会把**守卫错误**记成"这只票算失败"而静默吞掉 ✗
+                #   （INV-42/45；且 `REGISTERED_GUARD_SITES` 仍登记着 score_refresher::_run_batch）
+                #   ⇒ 冒到 `_run` 的兜底记 last_error、等下一 tick，**不要**记成单票 failed
+                raise
             except Exception as exc:  # noqa: BLE001 - **单票失败不拖垮整批**（Critic B8 允许的宽 except）
                 attempts += 1
                 # ★ 建议 1：`MAX_ATTEMPTS` 原来两个分支写**完全相同**的 dict ⇒

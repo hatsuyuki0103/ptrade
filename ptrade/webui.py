@@ -465,17 +465,32 @@ function renderState(data) {
     ["净资产", num(d.net_assets)], ["多头市值", num(d.long_market_value)], ["融券市值", num(d.short_market_value)],
     ["融资负债", num(d.financing_debt)], ["冻结(T+1)", num(d.frozen_t1)], ["冻结(融券券款)", num(d.frozen_collateral)],
     ["应计利息", num(d.interest_accrued)], ["维持担保比例", ratio === null ? "—（无负债）" : num(ratio, 4)],
-    /* ★★ B5（终版）：**标签**带来源（`总盈亏（实时）`/`总盈亏（结算）`）——
-       复用既有 `esc(kv[0])`，**不是新元素**，7 字 ≈ 既有 `冻结(融券券款)` ⇒ 不换行 ✓
-       **值**只把原有数字包一层 `title`（**不加任何字符**）⇒ 宽度零增量 ✓
-       ★ 两次失败教训：放「总盈亏」值里 ⇒ 851；放「交易日」值里 ⇒ 869 ⇒ 右列**任何可见内联元素都撑宽** ✗ */
-    ["总盈亏" + (_src === "live" ? "（实时）" : "（结算）"),
-     '<span data-testid="live-pnl-source" title="' + esc(_src === "live"
-        ? ("实时 · " + _asOf) : ("截至 " + _asOf + "（未取到实时价）"))
-     + '">' + num(d.total_pnl) + "</span>"]
+    /* ★★ B5（复审 R1 修正）：**标签**带来源 + **值**用第三项挂属性。
+       ★★ 上一版把 `<span>` 塞进**值字符串**里 —— 但 renderState 对**字符串做 `esc()`**
+          （见下面 `typeof kv[1] === "string" ? esc(kv[1]) : kv[1]`）⇒ span 被转义成
+          `&lt;span…` ⇒ **DOM 里根本没有这个元素**，用户看到约 90 字符**乱码**，
+          且 `.v` 无 `nowrap` ⇒ **换行 ⇒ 右列变高** ✗。
+       ⇒ 现在 items 的**第三项**是属性对象，渲染时加到**既有的 `.v` 元素**上：
+          · **不新增任何字符**（值仍是纯数字）⇒ 布局零风险 ✓
+          · `title` 只 esc **属性值**（安全）✓
+          · **真的是 DOM 元素**（可 `querySelector`）✓
+       ★ 两次宽度失败教训：放「总盈亏」值里 ⇒ 851；放「交易日」值里 ⇒ 869 */
+    ["总盈亏" + (_src === "live" ? "（实时）" : "（结算）"), num(d.total_pnl),
+     {testid: "live-pnl-source", title: _src === "live"
+        ? ("实时 · " + _asOf) : ("截至 " + _asOf + "（未取到实时价）")}]
   ];
+  /* ★ 属性对象 → HTML 属性串（**只 esc 属性值**，不是整段 HTML）。
+     ★★ 为什么需要它（复审 R1）：`kv[1]` 若是字符串会被 `esc()` 转义 ⇒ 塞 HTML 进值里
+        只会渲染成字面标签。要挂 `data-testid`/`title` 必须走**真正的属性**。 */
+  function attrs(o) {
+    if (!o) { return ""; }
+    var out = "";
+    if (o.testid) { out += ' data-testid="' + esc(o.testid) + '"'; }
+    if (o.title) { out += ' title="' + esc(o.title) + '"'; }
+    return out;
+  }
   $("state-panel").innerHTML = items.map(function (kv) {
-    return '<div><span class="k">' + esc(kv[0]) + '</span><span class="v">' + (kv[1] === undefined || kv[1] === null ? "—" : (typeof kv[1] === "string" ? esc(kv[1]) : kv[1])) + "</span></div>";
+    return '<div><span class="k">' + esc(kv[0]) + '</span><span class="v"' + attrs(kv[2]) + '>' + (kv[1] === undefined || kv[1] === null ? "—" : (typeof kv[1] === "string" ? esc(kv[1]) : kv[1])) + "</span></div>";
   }).join("");
 }
 

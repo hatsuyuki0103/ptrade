@@ -4,6 +4,73 @@
 
 ## [Unreleased]
 
+## [1.17.0] — 2026-11-09
+
+**主题：code-review 复审（`REJECT`/`BLOCK`）的 R1/R2/R3 全部修复**
+
+> 复审结论：6 条阻断项里 **5 条真修好**（B1 ✓ / B2 ✓ / B3 核心 ✓ / B4 ✓ / B6 ✓），
+> 但仍有 3 条阻断级问题。本版全部修完。
+
+### R1 · MED-HIGH · B5「用户可见时效」把 HTML 塞进了**会被 `esc()` 的位置**
+
+**缺陷**：`renderState` 的值渲染是
+```js
+typeof kv[1] === "string" ? esc(kv[1]) : kv[1]
+```
+上一版把 `'<span data-testid="live-pnl-source" …>' + num(...) + '</span>'` 放进**字符串值**
+⇒ 被 `esc()` 成 `&lt;span…` ⇒
+* ★ **DOM 里根本没有这个元素**（`querySelector` 找不到）
+* ★ 用户会在账户面板里看到**约 90 字符的字面 HTML 乱码**
+* ★ `.v` 没有 `nowrap` ⇒ **换行 ⇒ 右列变高** ⇒ 极可能再打红 `test_ui_layout_v4`
+* ★ 而当时的判据只 `grep APP_HTML` ⇒ **绿着放过了它**
+
+**修法**：items 支持**第三项 = 属性对象**，新增 `attrs(o)` 把 `data-testid`/`title`
+加到**既有的 `.v` 元素**上：
+```js
+["总盈亏" + (_src === "live" ? "（实时）" : "（结算）"), num(d.total_pnl),
+ {testid: "live-pnl-source", title: _src === "live" ? ("实时 · " + _asOf) : ("截至 " + _asOf + "（未取到实时价）")}]
+```
+* **值仍是纯数字** ⇒ **零宽度增量** ⇒ 布局零风险 ✓
+* `attrs()` **只 esc 属性值**（不是整段 HTML）✓
+* **真的是 DOM 属性**（可 `querySelector('[data-testid="live-pnl-source"]')`）✓
+
+**判据重写**（原来只查源码字符串）：
+① `attrs()` 就位且只 esc 属性值 · ② items 第三项是属性对象 ·
+★③ **反证**：`'<span data-testid="live-pnl-source"'` **不得**出现在页面里（坏模式彻底消失）·
+★④ **反证**：「总盈亏」的值必须紧跟**纯** `num(d.total_pnl)` ·
+⑤ 零宽度：值里不许叠加可见字符（两次实测 851 / 869 都因它超预算）
+
+### R2 · HIGH（纪律回归）· `_run_batch` 丢了守卫前置放行
+
+**缺陷**：v1.16 重构时把 v1.15 的内层 `isinstance(exc, NetworkForbiddenInLock): raise` 删了，
+**却没换成** `except NetworkForbiddenInLock: raise` ⇒ 宽 `except Exception` 会把**守卫错误**
+记成「这只票算失败」而**静默吞掉** ✗（INV-42/45；且 `REGISTERED_GUARD_SITES` 仍登记着该站点）
+
+**修法**：在宽 handler **之前**加 `except NetworkForbiddenInLock: raise`，
+让异常冒到 `_run` 的兜底记 `last_error`、等下一 tick，**不**记成单票 failed。
+
+### R3 · HIGH（A4 节奏）· ISO 周台账用 `now` 记周，而窗口**横跨 ISO 周**
+
+**缺陷**：窗口是「周五收盘 → 周一开盘」，ISO 周从**周一 00:00** 起 ⇒ 跨 W→W+1：
+* 周五 16:00 / 周六 / 周日 ⇒ `now` 属 **W** ⇒ 台账 W（正确）
+* **周一 00:00–09:30** ⇒ 窗口仍 True（盘中排除只覆盖 09:30–15:30）但 `now` 已属 **W+1**
+  ⇒ 台账 W+1 不存在 ⇒ **再跑一整批**（+8–16h 重复烧）
+* 该次跑把 **W+1** 标 done ⇒ **W+1 的周五收盘后不再跑**
+  ⇒ ★ **A4 从「每周五」漂成「每周一凌晨」**，且数据仍是上周五的 ✗
+* 状态端点也按 `now` 读 ⇒ 周一盘前**看不到真实进度** ✗
+
+**修法**：新增 `week_anchor(now, trade_dates)` = 窗口起点 = **最近一个已收盘交易日**：
+`anchor = today if (today in cal and now >= 15:30) else prev_trade_date(today)`
+⇒ 周五 16:00 / 周六 / 周日 / **周一盘前** ⇒ 都是 **W** ✓；次周五 ⇒ **W+1** ✓
+`_tick` 与 `/api/score_refresh_status` **共用同一 anchor** ✓
+
+### 测试
+
+* 开发副本 **1245 passed / 4 skipped / 0 failed**
+* ★ 本轮特别注意了「判据是否真的能抓住 bug」：
+  R1 的教训是**源码字符串存在性断言**会绿着放过渲染期 bug
+  ⇒ B5 判据改成「正向 + **反证**（禁止坏模式）+ 零宽度」三层
+
 ## [1.16.0] — 2026-11-09
 
 **主题：code-review（`REJECT`/`BLOCK`）的 6 个阻断项 + 10 条建议全部修复**

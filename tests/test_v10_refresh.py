@@ -315,21 +315,49 @@ def test_v10_b3_trade_day_wired_in_production(tmp_path, monkeypatch):
 
 
 def test_v10_b5_source_marker_is_visible():
-    """★ V10-B5（MEDIUM-HIGH，行为判据）：用户必须**看得见**盈亏时效。
+    """★ V10-B5（行为/反证级）：用户必须**看得见**盈亏时效，且**不许**把 HTML 塞进会被 esc 的位置。
 
-    ★ 缺陷：原来只有后端 `as_of`/`source` 字段，页面 `grep live-pnl-source` = **0 处**
-    ⇒ 用户仍不知道「这个盈亏是哪一刻的」✗（正是用户抱怨的那半个问题）
-    ★ 布局约束：**不许新增行**（`test_ui_layout_v4` 零容忍）⇒ 只在「总盈亏」的值里加 2 字标记
+    ## 为什么这条判据要重写（复审 R1）
+    上一版只断言 `'<span data-testid="live-pnl-source"' in APP_HTML` —— 那是**源码字符串存在性**。
+    而 `renderState` 的值渲染是：
+    ```js
+    typeof kv[1] === "string" ? esc(kv[1]) : kv[1]
+    ```
+    ⇒ 把 `<span …>` 放进**字符串值**里 ⇒ 被 `esc()` 成 `&lt;span…` ⇒
+    ★ **DOM 里没有这个元素**、用户看到约 90 字符乱码、`.v` 无 `nowrap` ⇒ **换行 ⇒ 右列变高** ✗
+    ⇒ 判据却**绿着放过了**它。
+
+    ## 新判据：正向 + 反证 + 零宽度
     """
     from ptrade import webui as webui_mod
 
     html = webui_mod.APP_HTML
-    assert 'data-testid="live-pnl-source"' in html, "页面上找不到来源标记 ✗"
-    # ★ 可见来源在**「总盈亏」的标签**里（零宽度增量）；值只包一层 title
-    assert '"总盈亏" + (_src === "live" ? "（实时）" : "（结算）")' in html
-    assert '<span data-testid="live-pnl-source" title="' in html
-    # 反证：值里**不许**再叠加可见字符（那是布局红过的两次位置：851 / 869）
-    assert "num(d.total_pnl) + \" \" + _srcTag" not in html
-    # 完整时刻在 title（零高度），两态文案不同
-    assert '"实时 · " + _asOf' in html
+
+    # ── ① 正向：属性机制就位（`attrs(kv[2])` 把 testid/title 加到**既有 `.v` 元素**上）
+    assert "function attrs(o)" in html, "缺 attrs() 辅助 ⇒ 无法给 .v 挂真正的属性"
+    # attrs() 必须**只 esc 属性值**（不是整段 HTML）—— 否则仍会渲染成字面文本
+    assert "esc(o.testid)" in html and "esc(o.title)" in html, "attrs 必须 esc 属性值"
+
+    # ── ② 正向：items 第三项是**属性对象**（不是字符串 HTML）
+    assert '{testid: "live-pnl-source", title:' in html, "缺结构化属性对象"
+    # ★ testid 值是运行时由 `attrs()` 拼成属性串的 ⇒ 源码里只有 `"live-pnl-source"` 这个值
+    assert '"live-pnl-source"' in html
+
+    # ── ③ ★ 反证：坏模式（HTML 塞进会被 esc 的值）必须**彻底消失**
+    assert '<span data-testid="live-pnl-source"' not in html, (
+        "又出现了「把 <span> 塞进字符串值」的坏模式 —— 它会被 esc() 成字面文本 ✗"
+    )
+
+    # ── ④ ★ 反证：「总盈亏」的值必须是**纯数字**
+    assert '["总盈亏" + (_src === "live" ? "（实时）" : "（结算）"), num(d.total_pnl),' in html, (
+        "总盈亏的值必须紧跟纯 num(d.total_pnl)（第三项才是属性对象）"
+    )
+
+    # ── ⑤ 零宽度：值里不许叠加可见字符（两次实测：851 / 869 都因它超预算）
+    assert "num(d.total_pnl) + " " + _srcTag" not in html
+    assert "_srcTag" not in html, "_srcTag 死代码残留"
+
+    # ── ⑥ 两态文案与完整时刻（可见 + hover）
+    assert '"（实时）" : "（结算）"' in html, "缺少实时/结算两态标签"
+    assert '"实时 · " + _asOf' in html, "缺少 hover 可见的完整时刻"
     assert '"截至 " + _asOf + "（未取到实时价）"' in html

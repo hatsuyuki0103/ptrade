@@ -815,7 +815,19 @@ class WebApp:
             except (OSError, ValueError, RuntimeError):
                 pass
         try:
-            week = score_refresher.iso_week_key(score_refresher.datetime.now())
+            # ★★ 复审 R3：窗口横跨 ISO 周 ⇒ 周键必须用**窗口锚点**（最近已收盘交易日），
+            #   否则周一盘前按 `now` 算成 W+1 ⇒ 读不到仍在跑的 W 台账 ⇒ 进度显示 idle ✗
+            _now = score_refresher.datetime.now()
+            try:
+                _cal = list(self._ds().trade_dates())
+            except NetworkForbiddenInLock:
+                raise
+            except (OSError, ValueError, RuntimeError):
+                _cal = []
+            _anchor = score_refresher.week_anchor(_now, _cal)
+            week = score_refresher.iso_week_key(
+                score_refresher.datetime.strptime(_anchor, "%Y-%m-%d")
+            )
             doc = score_refresher.read_ledger(self.cfg, week)
             if isinstance(doc, dict):
                 st = {
