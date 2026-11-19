@@ -276,6 +276,8 @@ var API = {
   order: "/api/order",
   close: "/api/close",
   settle: "/api/settle",
+  /* ★ v11：**自动把账户推进到当前交易日**（幂等；已同步时服务端走快路径不取锁） */
+  autoSettle: "/api/auto_settle",
   chart: "/api/chart",
   chartData: "/api/chart/data",
   quote: "/api/quote",
@@ -934,6 +936,23 @@ function prefillOrder(code) {
 }
 
 /* ★ v10-M2：读**实时**端点；OK=false 或异常都退回 `/api/state`（页面永不白屏） */
+/* ★★ v11：**页面打开时自动把账户推进到当前交易日**。
+   用户原话：「为什么现在 还是 交易日 2026-11-09。现在已经是 2026年11月19日 了」
+   ★ 幂等：服务端 `auto_settle_to_today` 在 trade_date 已等于今天时走**快路径**
+     （不取写锁、不计息）⇒ 每次打开都调也很便宜
+   ★ **失败静默**：这是后台增强，绝不能因为网络/锁忙就弹错误打扰用户
+   ★ **不加任何 DOM**（只用一个 toast 浮层）—— 右列 0px 布局预算 */
+function autoSettleOnLoad() {
+  return post(API.autoSettle, {}).then(function (b) {
+    var d = (b && b.data) || {};
+    if (d.advanced) {
+      toast("已自动结算到 " + (d.to || "?") + "（补 " + (d.days || 0) + " 个交易日）", "ok");
+      return refreshAll();          /* 结算改了账户 ⇒ 重刷一遍面板 */
+    }
+    return null;
+  }).catch(function () { return null; });
+}
+
 function refreshState() {
   return api(API.live_state).then(function (b) {
     if (b && b.ok !== false) { renderState(b.data); return null; }
@@ -1274,9 +1293,22 @@ function initCollapse() {
   }
 }
 setInterval(autoRefreshTick, POLL_TICK_MS);
-window.addEventListener("DOMContentLoaded", function () { refreshAll(); initCollapse(); });
+window.addEventListener("DOMContentLoaded", function () {
+  refreshAll();
+  initCollapse();
+});
 refreshAll();
 initCollapse();
+/* ★★ v11：**页面打开后自动把账户推进到当前交易日**。
+   ★★★ 必须用 setTimeout，**不能** 
+efreshAll().then(...) ——
+     
+efreshAll() **不返回 Promise**（它只是并发发起几个请求）✗
+     链 .then 会抛 TypeError: Cannot read properties of undefined，
+     把整个初始化脚本打断（initCollapse() 都不执行 ⇒ 折叠默认值全错）。
+     ★ 这是 poll_probe（node 跑真实前端脚本）抓到的真 runtime bug，不是测试问题。
+   ★ 延迟 1.5s：让首屏几个请求先回来，避免自动结算和首屏抢网络。 */
+setTimeout(autoSettleOnLoad, 1500);
 </script>
 </body>
 </html>

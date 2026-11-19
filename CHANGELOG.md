@@ -4,6 +4,96 @@
 
 ## [Unreleased]
 
+## [1.19.0] — 2026-11-19
+
+**主题：v11 —— 模拟盘「交易日」**自动推进到当天**（服务启动 + 每次页面打开）**
+
+### 用户 bug（真源）
+
+> 「/autopilot 有问题，为什么现在 还是 交易日 **2026-11-09**。
+>   现在已经是 **2026年11月19日12:08:35** 了。你需要帮我修复这个 bug」
+
+### 真根因（实测，不是猜）
+
+| 事实 | 值 |
+|---|---|
+系统时间 | 2026-11-19 12:08（周四·盘中）|
+`state.trade_date` | **2026-11-09**（落后 8 个交易日）|
+`spot.json` | `asof=2026-11-19` ✓ **是今天的** ⇒ **不是数据问题** |
+`latest_trade_date()` | 2026-11-18（= 最近**已收盘**交易日）|
+
+`engine.roll_to(trade_date)`（`engine.py:94`）是**唯一**推进 `state.trade_date` 的入口，
+而它的**全部调用点只有三处**：页面「结算」按钮（★ **必须手填日期**）/ CLI `settle --trade-date` /
+下单平仓内部。
+
+⇒ ★ **全仓库没有任何自动推进逻辑** ✗ ⇒ 用户 10 天没手动结算，账户就停在 11-09。
+**所以这不是"数据错"，是模拟盘缺了「日终自动结算」这一环** —— 真实券商每天收盘自动结算。
+
+### 新增
+
+* **`service.account_target_trade_date(ds, now=None)`** —— 账户应处的交易日
+  * 今天**是交易日** ⇒ **今天**（★ **盘中也是今天**，不是昨天）
+  * 否则 ⇒ 今天之前最近的交易日；日历拿不到 ⇒ `None`（不猜）
+  * ★★ **必须与 `latest_trade_date()` 分开**：后者盘中回退到昨天是 **v3.1 未来函数防护**
+    （用于信号/数据），语义正确、**不得改** ✗ —— 判据 `test_v11_5` 钉住它
+* **`service.auto_settle_to_today(cfg, ds, now=None)`** —— 幂等 / 绝不上抛 / 不推进到未来
+  * 推进内容 = `roll_to` 的**完整真实口径**：T+1 交收 → 按日计息 → 盯市 → 风险评估
+  * ★★ **快路径**：`state.trade_date == target` ⇒ **不取写锁、不计息**
+    （页面每次打开都会调它，实测 **0.12s**）
+  * ★ **锁外** `prewarm_before_write` → **锁内** `Engine.roll_to`（照抄 `api_settle` 既有形态）
+  * ★ **任何异常都转成 `{advanced:false, error}`** —— 自动结算是后台增强，不能把页面搞坏
+* **`POST /api/auto_settle`** —— 五要素 `{advanced, from, to, days, error, offline}`；**失败也 200**
+* **服务启动时自动补**（daemon 线程，`Event.wait(2)` 让 spot 预热先跑）
+* **前端**：页面加载后 1.5s `POST /api/auto_settle`；`advanced===true` ⇒
+  `toast("已自动结算到 X（补 N 个交易日）")` + `refreshAll()`
+
+### ★ 一次性补账（用户要求"立刻补上"）
+
+通过**新端点**执行（同时就是端到端验证）：
+
+```
+from → to     : 2026-11-09 → **2026-11-19**   ✓
+days          : 8 个交易日
+应计利息      : 43.91 → **306.89**（+262.98，与估算 263 吻合）
+last_prices   : 3.17/9.81/4.92 → **2.96/9.01/4.66**（11-19 的价）
+第二次调用    : advanced=False · 0.12s（快路径，不取锁）✓
+```
+
+### 本轮修掉的**真 bug（都是判据/探针抓的，不是自查）**
+
+1. ★★ **`refreshAll()` 不返回 Promise**，我写的 `refreshAll().then(...)` 会抛
+   `TypeError: Cannot read properties of undefined` ⇒ **把初始化脚本打断**
+   （`initCollapse()` 都不执行 ⇒ 折叠默认值全错，3 条布局判据红）
+   —— 由 `test_pn_frontend_polling...` 的 **poll_probe（node 跑真实前端脚本）** 抓到
+   ⇒ 改成 `setTimeout(autoSettleOnLoad, 1500)` ✓
+2. ★★ **daemon 线程退出致命错误**：加了启动线程后 `test_ui_layout_v4` **28 passed 但退出码
+   `-1073740791`**（`Fatal Python error: _enter_buffered_busy ... daemon threads`）
+   实测：镜像 v1.18.0 exit **0**，开发副本 exit **非 0** ⇒ 是我引入的
+   ⇒ ① `--offline` 不启动线程；② 端点 offline 直接返回（不 I/O）；
+     ③ 线程改 `Event.wait` + `atexit` join ✓
+3. **INV-42 判据我第一版写错了口径**：断言「锁内零 DS 调用」⇒ 立刻假红
+   `锁内取数 ['trade_dates','quote']`。真相：`roll_to` 锁内**确实会**调它们，
+   但那是**缓存命中**（prewarm 填好了）⇒ **INV-42 管的是"不联网"，不是"不调 DS"**
+   ⇒ 改成评审真正想要的：「**锁内调用的 DS 方法必须全在预热白名单里**」（V11-18）✓
+
+### code-review（teammate 独立评审）
+
+**`APPROVE` · 架构状态 `WATCH`**（无阻断项）。评审 10 条重点逐条核过全过。
+按建议补了 4 条：
+
+* **S1**（MEDIUM）启动线程退出安全 ⇒ `Event.wait` + `atexit` join
+* **S2**（MEDIUM）★ **`--offline` 时不自动结算**（明文记录）：离线取不到实时价
+  （`roll_to` 只会沿用旧价），且 daemon 线程退出有风险 ⇒ **offline 用户请用 `ptrade settle`**
+* **S3**（MEDIUM）**INV-42 缺判据** ⇒ 新增 `tests/test_v11_inv42.py`（V11-18，行为级）
+* **S4/S5**（LOW）`from==""`（账户交易日为空）⇒ 跳过（否则 `days` 会算成"从 1990 至今"）
+  · boot 线程宽 except 先放行 `NetworkForbiddenInLock`
+
+### 测试
+
+* 开发副本 **1197 passed / 4 skipped / 0 failed**
+* 新增 `tests/test_v11_auto_settle.py`（**18 条**）+ `tests/test_v11_inv42.py`（**1 条**）
+* `pytest -m slow`：1 passed / 1 skipped（skip = v7 显式已知限制，符合铁律 9）
+
 ## [1.18.0] — 2026-11-09
 
 **主题：按终审建议补 R3 判据（产品代码零改动）**

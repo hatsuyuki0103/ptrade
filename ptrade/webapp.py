@@ -1484,6 +1484,51 @@ class WebApp:
             "state": _svc().state_summary(state) if state is not None else {},
         }))
 
+    def api_auto_settle(self, query, body) -> Response:
+        """**自动把账户推进到当前交易日**（v11）。
+
+        用户原话：「为什么现在 还是 交易日 **2026-11-09**。现在已经是 **2026年11月19日** 了」
+
+        ## 为什么需要它
+        `engine.roll_to()` 是**唯一**推进 `trade_date` 的入口，而它只被
+        「页面结算按钮（须手填日期）/ CLI settle --trade-date / 下单平仓」调用
+        ⇒ **没有任何自动推进** ⇒ 用户 10 天没手动结算，账户就停在 11-09 ✗
+
+        ## 契约
+        * ★ **幂等**：已同步时 `service.auto_settle_to_today` 走**快路径**（不取写锁、不计息）
+          —— 页面每次打开都调它，必须便宜
+        * ★ **失败也 HTTP 200**（`advanced=false` + `error`）：自动结算是后台增强，
+          **不许**把页面搞坏
+        * ★ 返回 `{advanced, from, to, days, error, offline}`
+        * ★ **只读之外的唯一副作用是"把账户推进到今天"**，不改任何别的字段语义
+        """
+        from . import service  # noqa: PLC0415 - webapp.py 既有局部 import 模式（避循环导入）
+
+        ds = self._ds()          # ★ 只调一次
+        # ★★ 离线模式**直接返回，不做任何 I/O**：
+        #   页面加载会自动 POST 本端点（v11），而 CDP/布局测试会加载页面 ⇒
+        #   若这里跑 `prewarm` + `roll_to`（联网 + 落盘），测试关服时 daemon 请求线程
+        #   仍在 I/O ⇒ `Fatal Python error: _enter_buffered_busy ... daemon threads`
+        #   ⇒ pytest 明明全过却**退出码非 0** ✗（镜像 v1.18.0 exit 0，加了 v11 后 exit -1073740791）
+        #   离线本来也取不到实时价（roll_to 只会沿用旧价）⇒ 跳过语义上也合理 ✓
+        if getattr(ds, "offline", False):
+            return Response(200, _envelope("auto_settle", {
+                "advanced": False, "from": "", "to": "", "days": 0,
+                "error": "离线模式跳过自动结算（取不到实时价）", "offline": True,
+            }))
+        try:
+            result = service.auto_settle_to_today(self.cfg, ds)
+        except NetworkForbiddenInLock:
+            raise                # ★ INV-42/45：守卫错误必须先放行
+        except (OSError, ValueError, RuntimeError) as exc:
+            # ★ 失败也 200（页面不能因为自动结算失败而报错）
+            result = {
+                "advanced": False, "from": "", "to": "", "days": 0,
+                "error": f"{type(exc).__name__}: {exc}"[:200],
+                "offline": bool(getattr(ds, "offline", False)),
+            }
+        return Response(200, _envelope("auto_settle", result))
+
     def api_settle(self, query, body) -> Response:
         from .engine import Engine
 
@@ -1625,6 +1670,8 @@ class WebApp:
             return self.api_order(query, body)
         if path == "/api/close" and method == "POST":
             return self.api_close(query, body)
+        if path == "/api/auto_settle" and method == "POST":
+            return self.api_auto_settle(query, body)
         if path == "/api/settle" and method == "POST":
             return self.api_settle(query, body)
         if path == "/api/analysis" and method == "GET":
@@ -1897,6 +1944,62 @@ def create_server(
             app.score_refresher.start()
     except Exception:                                      # noqa: BLE001 - 刷新器起不来也要能 serve
         app.score_refresher = None                         # type: ignore[attr-defined]
+    # ★★ v11：**服务启动时自动把账户推进到当前交易日**。
+    #   用户原话：「为什么现在 还是 交易日 2026-11-09。现在已经是 2026年11月19日 了」
+    #   ⇒ `roll_to()` 只有手动入口，全仓没有自动推进 ✗ ⇒ 这里补上「日终自动结算」这一环。
+    #   ★ 独立 daemon 线程 + `sleep 2` ⇒ 让 `start_startup_maintenance` 的 spot 预热先跑
+    #     （`roll_to` 取价要用 spot；抢在前面只会让它走"沿用旧价"的降级路径）
+    #   ★ **失败静默**：自动补账是增强，**绝不能**影响 serve 启动
+    try:
+        import atexit
+        import threading as _threading
+
+        # ★★ --offline 时**不启动**启动补账线程：
+        #   ① offline 下取不到实时价，roll_to 会走"沿用旧价"的降级路径 ⇒ 结算意义有限；
+        #   ② **更要紧**：daemon 线程在**解释器关闭**时若还在联网，会触发
+        #      Fatal Python error: _enter_buffered_busy ... daemon threads
+        #      ⇒ pytest 明明 28 passed 却**退出码 1** ✗（实测：镜像 v1.18.0 exit 0，
+        #      加了这个线程后 exit 1 —— 这是真问题，不是测试噪音）
+        #   ★ 页面打开时的 /api/auto_settle 在 **offline 下也照常工作**（走请求线程，不是 daemon）✓
+        app.auto_settle_thread = None                      # type: ignore[attr-defined]
+        app.auto_settle_stop = None                        # type: ignore[attr-defined]
+        if not offline:
+            # ★ S1（code-review 建议）：线程改**可停止** + `atexit` join ⇒ 消掉退出瞬间
+            #   「daemon 线程仍在联网 ⇒ Fatal Python error: _enter_buffered_busy」的窗口
+            _stop_evt = _threading.Event()
+
+            def _auto_settle_boot() -> None:
+                # ★ 用 `Event.wait` 而不是 `time.sleep`：进程退出时能被**立刻唤醒**
+                if _stop_evt.wait(2.0):
+                    return
+                try:
+                    from . import service as _service
+
+                    _service.auto_settle_to_today(cfg, _svc().make_ds(cfg, offline))
+                except NetworkForbiddenInLock:
+                    raise      # ★ S5：INV-42/45 纪律 —— 守卫错误**先放行**，不许被宽 except 吞
+                except Exception:  # noqa: BLE001 - ★ 启动自动补账失败绝不影响服务
+                    pass
+
+            _boot = _threading.Thread(
+                target=_auto_settle_boot, name="auto-settle-boot", daemon=True
+            )
+            app.auto_settle_thread = _boot                 # type: ignore[attr-defined]
+            app.auto_settle_stop = _stop_evt               # type: ignore[attr-defined]
+
+            def _auto_settle_join_on_exit() -> None:
+                """进程退出：**先叫停、再有界 join** ⇒ 不让 daemon 线程在 I/O 中被硬杀。"""
+                try:
+                    _stop_evt.set()
+                    if _boot.is_alive():
+                        _boot.join(timeout=5.0)
+                except Exception:  # noqa: BLE001 - 退出清理绝不能再抛
+                    pass
+
+            atexit.register(_auto_settle_join_on_exit)
+            _boot.start()
+    except Exception:                                      # noqa: BLE001 - 起不来也要能 serve
+        app.auto_settle_thread = None                      # type: ignore[attr-defined]
     return server
 
 

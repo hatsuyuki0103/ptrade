@@ -417,6 +417,160 @@ def today_trade_date(ds: DataSource, now: datetime | None = None) -> str | None:
         return None
 
 
+def account_target_trade_date(ds: DataSource, now: datetime | None = None) -> str | None:
+    """**账户应该处于的交易日** = 今天（若今天是交易日），否则 ≤ 今天的最近交易日。
+
+    ## ★ 为什么不能用 `latest_trade_date()`（`datasource.py:716`）
+    它返回「最近一个**已收盘**的交易日」：**盘中会回退到昨天**。
+    那是 **v3.1 未来函数防护**，用于**信号/数据**，语义正确、**不得改** ✗
+
+    但**账户的交易日**不是这个语义 ——
+    今天下的单 `trade_date` 就是**今天**（见 :func:`effective_trade_date`，v7），
+    所以盘中账户也该是**今天** ✓
+    （用户 2026-11-19 12:08 看到账户停在 11-09，正是缺了这一环）
+
+    ## 返回
+    * 今天是交易日 ⇒ ``今天``
+    * 今天不是交易日 ⇒ ``今天之前最近的交易日``（周末/节假日）
+    * 日历拿不到 ⇒ ``None``（调用方不推进，**不猜**）
+    """
+    now = now or datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    try:
+        if ds.is_trade_date(today):
+            return today
+    except NetworkForbiddenInLock:
+        raise                      # ★ INV-42：锁内联网必须响亮地炸
+    except (OSError, ValueError, RuntimeError):
+        pass
+    try:
+        return str(ds.prev_trade_date(today))
+    except NetworkForbiddenInLock:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def auto_settle_to_today(
+    cfg: AppConfig,
+    ds: DataSource,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """把账户**自动**推进到 :func:`account_target_trade_date` 的交易日。
+
+    ## 语义（用户裁决：计息 + 盯市都按**真实口径**）
+    推进内容 = :meth:`engine.Engine.roll_to` 的完整语义：
+    **T+1 交收 → 按日计息 → mark-to-market → 风险评估** ✓
+
+    ## 三条硬性质
+    * ★ **幂等**：`state.trade_date` 已等于目标 ⇒ **直接返回，不取写锁、不重复计息**
+      （页面每次打开都会调它，这条快路径是性能关键）
+    * ★ **绝不上抛**：任何异常都转成 ``{"advanced": False, "error": ...}``
+      —— 自动结算是后台增强，**不能**把页面搞坏
+    * ★ **不推进到未来**：目标早于当前交易日 ⇒ 拒绝（`roll_to` 本身也会拒）
+
+    ## 锁纪律（INV-42）
+    `roll_to` 取价会**联网** ⇒ 必须在**锁外** `prewarm_before_write`，
+    **锁内**只做纯计算 + 落盘（照抄 :meth:`webapp.WebApp.api_settle` 的既有形态）
+
+    ## 返回
+    ``{"advanced", "from", "to", "days", "error", "offline"}``
+    """
+    out: dict[str, Any] = {
+        "advanced": False, "from": "", "to": "", "days": 0,
+        "error": None, "offline": bool(getattr(ds, "offline", False)),
+    }
+
+    # ① 读账户（**不取锁**，INV-26）
+    try:
+        state = store.read_state(cfg)
+    except NetworkForbiddenInLock:
+        raise
+    except (OSError, ValueError, RuntimeError) as exc:
+        out["error"] = f"读账户失败：{type(exc).__name__}: {exc}"[:160]
+        return out
+    if state is None:
+        out["error"] = "尚未初始化账户"
+        return out
+    out["from"] = str(getattr(state, "trade_date", "") or "")
+
+    # ② 解析目标交易日
+    try:
+        target = account_target_trade_date(ds, now=now)
+    except NetworkForbiddenInLock:
+        raise
+    except (OSError, ValueError, RuntimeError) as exc:
+        out["error"] = f"解析目标交易日失败：{type(exc).__name__}: {exc}"[:160]
+        return out
+    if not target:
+        out["error"] = "交易日历不可用"
+        return out
+    out["to"] = target
+
+    # ③a ★ S4（code-review 建议）：账户交易日为空 ⇒ **跳过**。
+    #   否则 `engine.roll_to` 的 `days = sum(1 for d in dates if cur < d <= trade_date)`，
+    #   `cur == ""` 时**所有历史交易日**都 `< target` ⇒ days 巨大 ⇒ 恢复账户会**多计利息** ✗
+    #   （新账户无负债 ⇒ 利息=0，无害；但"恢复账户"能触达）
+    if not out["from"]:
+        out["error"] = "账户交易日为空（未初始化？），跳过自动推进"
+        return out
+
+    # ③b ★★ 快路径：已同步 ⇒ **不取写锁、不计息**
+    if out["from"] == target:
+        return out
+
+    # ④ ★ 绝不推进到未来
+    if out["from"] and target < out["from"]:
+        out["error"] = f"目标交易日 {target} 早于当前 {out['from']}（不推进）"
+        return out
+
+    # ⑤ 天数（只用于展示"补了几个交易日"）
+    try:
+        cal = list(ds.trade_dates() or [])
+        if out["from"]:
+            out["days"] = sum(1 for d in cal if out["from"] < str(d)[:10] <= target)
+        else:
+            out["days"] = 1
+    except NetworkForbiddenInLock:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        out["days"] = 0
+
+    # ⑥ ★ 锁外预热（`roll_to` 会联网取价）
+    try:
+        prewarm_before_write(cfg, ds, target)
+    except NetworkForbiddenInLock:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        pass                       # 预热失败不致命：`_mark_prices` 取不到价会沿用旧价
+
+    def _mutate(cur):
+        if cur is None:
+            raise ValueError("尚未初始化账户")
+        from .engine import Engine   # ★ 局部导入：`engine` 不 import `service`，安全
+
+        return Engine(cfg, ds, cur).roll_to(target)
+
+    # ⑦ 锁内推进
+    try:
+        new_state = store.locked_update_split(
+            cfg, _mutate, source="auto_settle", timeout=30.0
+        )
+    except NetworkForbiddenInLock:
+        raise                      # ★ INV-42/45：守卫错误必须先放行
+    except Exception as exc:  # noqa: BLE001 - ★ 自动结算**绝不上抛**（PRD 决策 5）
+        out["error"] = f"自动结算失败：{type(exc).__name__}: {exc}"[:200]
+        return out
+
+    out["advanced"] = True
+    try:
+        out["to"] = str(getattr(new_state, "trade_date", "") or target)
+    except (AttributeError, TypeError):
+        out["to"] = target
+    return out
+
+
 def effective_trade_date(
     ds: DataSource,
     explicit_date: str | None,
