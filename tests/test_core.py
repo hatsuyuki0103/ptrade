@@ -724,9 +724,18 @@ def test_check_risk_includes_stop_loss_and_position_pct(cfg, state):
 
 
 def test_check_risk_reports_position_limit_pct(cfg):
+    """单票市值超过 ``max_position_pct × net_assets`` ⇒ 必须报 warn。
+
+    ★ v12：阈值**从配置反算**，不再写死 `20% * 500000` ——
+      否则政策一改（v12 把 0.20 调到 0.25）测试就假红，
+      而它真正要钉的是「超限会报警」而不是「上限恰好是 20%」。
+    """
     state = core.new_state(cfg)
-    state, _ = fill(state, Side.BUY.value, qty=100, price=1000.0, cfg=cfg)  # 100000 < 20% * 500000 = 100000
-    state = core.mark_to_market(state, {"600519": 1200.0})  # 120000 > 100000
+    cap = float(cfg.risk.max_position_pct) * float(state.net_assets)
+    # 先按**低于**上限建仓（0.8×cap），再盯市到**高于**上限（1.2×cap）⇒ 必然触发
+    buy_px = cap * 0.8 / 100.0
+    state, _ = fill(state, Side.BUY.value, qty=100, price=buy_px, cfg=cfg)
+    state = core.mark_to_market(state, {"600519": cap * 1.2 / 100.0})
     alerts = core.check_risk(state, cfg.risk, cfg.margin)
     hit = [a for a in alerts if a["code"] == core.ALERT_POSITION_LIMIT_PCT]
     assert hit and hit[0]["level"] == "warn"

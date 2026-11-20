@@ -39,6 +39,10 @@
 > | 场景 | available_cash | frozen_collateral | long_mv | financing_debt | 担保物 | 负债 | net_assets | ratio |
 > |---|---|---|---|---|---|---|---|---|
 > | 初始（50 万，无仓） | 500000 | 0 | 0 | 0 | 500000 | 0 | 500000 | `inf` |
+> ⚠️ **口径变更（v12）**：以下示例表的 `m=0.80` / `m=1.00` 是 **v11 及以前**的口径。
+> v12 起 `margin_ratio_long = margin_ratio_short = 0.50`（2 倍杠杆），
+> `max_short_exposure = 0.65`；示例中的**会计恒等式与结构**仍然有效，但**具体比例数字已过时**。
+>
 > | 融资买入 20 万（m=0.80） | 500000 | 0 | 200000 | 200000 | 700000 | 200000 | 500000 | **3.5** |
 > | 同上，票跌 20% | 500000 | 0 | 160000 | 200000 | 660000 | 200000 | 460000 | **3.3** |
 > | **融资满额 N=625000** | 500000 | 0 | 625000 | 625000 | 1125000 | 625000 | 500000 | **1.8** |
@@ -195,20 +199,24 @@ class MarginConfig:
     min_maintenance_ratio: float = 1.30   # 平仓线（130%，交易所口径）
     warn_maintenance_ratio: float = 1.50  # 警戒线（150%）
     max_maintenance_ratio: float = 3.00   # 可提取线（300%）
-    margin_ratio_long: float = 0.80       # 融资保证金比例：买入金额中自有资金占比 >= 此值
-    margin_ratio_short: float = 1.00      # 融券保证金比例：卖出金额中自有资金占比 >= 此值
+    # ★ v12（2026-11-20）：融资/融券保证金比例**都改为 0.50**（= 2 倍杠杆）。
+    #   历史：v11 及以前 long 0.80（1.25 倍）/ short 1.00（1 倍，无杠杆）。
+    #   依据：用户裁决「融资和融券都改成 2 倍杠杆」+ 真实 A 股散户融券保证金最低 50%。
+    margin_ratio_long: float = 0.50       # 融资保证金比例（v12：0.80 → 0.50）
+    margin_ratio_short: float = 0.50      # 融券保证金比例（v12：1.00 → 0.50）
     financing_rate_annual: float = 0.065  # 融资年化利率
     lending_rate_annual: float = 0.080    # 融券年化费率
     short_source_limit_ratio: float = 0.02  # 单票可融券量 <= 该股流通股本的 2%（券源约束）
 
 @dataclass(frozen=True)
 class RiskConfig:
-    max_position_pct: float = 0.20      # 单票市值（多头+融券）/ 净资产（**非总资产**，见 §5 强约束 6）
+    # ★ v12：单票 0.20 → 0.25、空头敞口 0.50 → 0.65（为 2 倍仓位配套放宽）
+    max_position_pct: float = 0.25      # 单票市值（多头+融券）/ 净资产（**非总资产**，见 §5 强约束 6）
     max_positions: int = 5              # 同时持仓标的数
     stop_loss_pct: float = -0.07        # CANSLIM 止损线（-7%，相对成本价）
     take_profit_pct: float = 0.25       # 止盈提示线
     max_gross_exposure: float = 2.0     # 总敞口（多头市值+融券市值）/ 净资产
-    max_short_exposure: float = 0.50    # 融券市值 / 净资产
+    max_short_exposure: float = 0.65    # 融券市值 / 净资产（v12：0.50 → 0.65）
     max_leverage: float = 2.0           # 【v3 新增】总负债 / 净资产 上限；防止「开仓即低于平仓线」
 
 @dataclass(frozen=True)

@@ -19,6 +19,12 @@ htmlcov/
 /data/scenario/
 /data/state.json
 /data/ledger.jsonl
+# v12：审计水位 / 跨进程锁 / 服务日志同样是本地运行时产物
+/data/state_audit.jsonl
+/data/.ptrade.lock
+/data/.ptrade.tmp-*
+/data/serve.log
+/data/serve.log.err
 /reports/
 /config.json
 

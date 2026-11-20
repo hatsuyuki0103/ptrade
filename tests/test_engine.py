@@ -980,20 +980,31 @@ def test_leverage_limit_blocks_open_below_maintenance(env):
 
 
 def test_v31_margin_capacity_boundaries(env):
-    """v3.1：默认参数下融资容量由保证金额度绑定 —— 625000 可建、1000000 被拒。"""
+    """v3.1：默认参数下融资容量由保证金额度绑定 —— **容量内可建、超容量被拒**。
+
+    ★ v12：容量**从配置推导**（`initial_cash / margin_ratio_long`），不再写死 625000。
+      旧写法隐含 `m_long = 0.8`（500000/0.8 = 625000）；v12 把 m_long 改成 0.50
+      ⇒ 容量变成 1,000,000，旧断言里的 1,000,000 反而变成"可建" ⇒ 假红 ✗
+      现在推导容量后，"略低于容量可建 / 远超容量被拒"这个**语义**保持不变 ✓
+    """
     px = last(make_engine(env, risk_kw=WIDE), MID)
     wide = relaxed(max_position_pct=100.0, max_gross_exposure=1000.0, max_leverage=2.0)
 
-    ok_qty = round_lot(int(625_000 / px))
+    probe = make_engine(env, zero_fee=True, risk_kw=wide)
+    m_long = float(probe.cfg.margin.margin_ratio_long)
+    capacity = 500000.0 / m_long          # 保证金额度能支撑的最大融资名义金额
+    ok_target = capacity * 0.95
+
+    ok_qty = round_lot(int(ok_target / px))
     eng = make_engine(env, zero_fee=True, risk_kw=wide)
     opened = eng.submit(req(MID, "margin_buy", ok_qty, px))
     assert opened.status == "filled", opened.reason
     notional = ok_qty * px
-    assert notional <= 625_000.0 + 1.0
+    assert notional <= capacity + 1.0
     assert eng.state.financing_debt == AP(notional, abs=1e-6)
     assert eng.state.maintenance_ratio == AP((500000.0 + notional) / notional, abs=1e-9)
 
-    for target in (1_000_000, 2_500_000):
+    for target in (int(capacity * 1.4), int(capacity * 3.0)):
         eng2 = make_engine(env, zero_fee=True, risk_kw=wide)
         qty = round_lot(int(target / px))
         order = eng2.submit(req(MID, "margin_buy", qty, px))
@@ -1225,8 +1236,10 @@ def test_inv22_margin_reuse_with_unrealized_profit(env):
     assert st.long_market_value == AP(notional, abs=1e-6)
     assert st.net_assets == AP(500000.0, abs=1e-6), "I1：开仓不产生盈亏"
     assert eng.cfg.risk.max_position_pct * float(st.net_assets) == AP(cap0, abs=1e-6)
-    assert st.margin_required == AP(notional * 0.8, abs=1e-6)
-    assert st.margin_available == AP(500000.0 - notional * 0.8, abs=1e-6)
+    # ★ v12：比例**从配置读**（原写死 0.8；v12 把融资保证金改成 0.50）
+    m_long = float(eng.cfg.margin.margin_ratio_long)
+    assert st.margin_required == AP(notional * m_long, abs=1e-6)
+    assert st.margin_available == AP(500000.0 - notional * m_long, abs=1e-6)
 
     # —— 标的涨 60% ——
     base_quote = eng.ds.quote
@@ -1238,8 +1251,8 @@ def test_inv22_margin_reuse_with_unrealized_profit(env):
     assert st.available_cash == AP(500000.0, abs=1e-6), "规则 2：浮盈不得进入 available_cash"
     assert st.long_market_value == AP(notional * 1.6, abs=1e-6)
     assert st.net_assets == AP(500000.0 + 0.6 * notional, abs=1e-6)
-    assert st.margin_required == AP(notional * 0.8, abs=1e-6), "额度占用只由负债决定"
-    assert st.margin_available == AP(500000.0 + 0.6 * notional - notional * 0.8, abs=1e-6)
+    assert st.margin_required == AP(notional * m_long, abs=1e-6), "额度占用只由负债决定"
+    assert st.margin_available == AP(500000.0 + 0.6 * notional - notional * m_long, abs=1e-6)
 
     cap1 = eng.cfg.risk.max_position_pct * float(st.net_assets)
     assert cap1 > cap0, "单票上限必须随浮盈上升（实时 net_assets 派生）"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ptrade"
-version = "1.19.0"
+version = "1.20.0"
 description = "A 股 CANSLIM 模拟盘：T+1 / 融资融券 / 风控 / 七因子打分 / K 线图"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,10 +31,12 @@ packages = ["ptrade"]
 # `vendor/echarts.min.js` 是 chart 子命令的运行时必需资源：不显式声明的话
 # setuptools 只打包 *.py，装出来的 wheel 会在渲染图表时报「缺少 vendored ECharts」。
 [tool.setuptools.package-data]
-ptrade = ["vendor/*.js", "vendor/*.min.js", "*.html", "webui_assets/*.js"]
+ptrade = ["vendor/*.js", "vendor/*.min.js", "*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+# ★ v6：登记 slow marker（Critic C3 —— 未注册会 warning，且 CI skip 会让
+# 「真实长历史首根 = 上市日」「setOption 首帧 ≤500ms」这类判据**永远没人验**）
 markers = ["slow: 需真实长历史 / 真机性能 / 可能联网；默认不进 CI，发布前用 `pytest -m slow` 跑一次"]
 

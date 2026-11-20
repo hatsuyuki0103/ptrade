@@ -2,6 +2,74 @@
 
 本文件记录 ptrade 的版本变更。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.20.0] — 2026-11-20
+
+**主题：v12 —— 融券 2 倍杠杆落地（保证金口径 50%）+ 已有三笔空头重放为 2 倍规模**
+
+### 用户实测（真源）
+> 「我的盈利是不是不对。因为我让你做空是**加了杠杆**的，现在 **300869**，
+>   从我买的时候 **9.81** 到现在 **8.92**，我应该赚了 **9000 多**才对吧？」
+
+### ★ 根因（**复核后更正过一次**）
+**曾经写错的说法**：「`margin_ratio_short = 1.00` ⇒ 杠杆 1 倍 ⇒ 盈利少一半」。
+
+**正确事实**：本仓融券模型里 **`margin_ratio_short` 不放大盈亏**。
+盈亏恒为 `(short_cost - last_price) * short_qty` —— **只由股数决定**。
+`m_short` 只影响两处（`core.py:660-669` / `core.py:353-365`）：
+* `margin_used = amount * m_short`（**记录字段**，不入账）
+* `margin_required` 里融券部分 `max(0, sum(short_mv * m_short) - frozen_collateral)`（本账户恒为 0）
+
+⇒ 用户预期「9,000 多」= 4,539 × 2 = **持仓规模翻倍**，
+  只能靠**数据迁移**实现，**改配置不会**自动翻倍。
+  ⇒ 配置改 50% 是**用户明确要求的口径对齐**（真实 A 股散户融券保证金最低 50%），与实际盈亏放大无关。
+
+### 改动
+**A. 保证金与风控口径（`ptrade/config.py`）**
+```
+margin_ratio_long:  0.80 → **0.50**   # 融资 1.25 倍 → 2 倍
+margin_ratio_short: 1.00 → **0.50**   # 融券 1 倍（无杠杆）→ 2 倍
+max_position_pct:   0.20 → **0.25**   # 2 倍仓位后单票 ~10 万，旧上限 10 万差 62 元被拒
+max_short_exposure: 0.50 → **0.65**   # 2 倍仓位后合计 ~59%，旧上限 25 万会拦
+```
+★ `max_leverage = 2.0` / `min_maintenance_ratio = 1.30` **未动**。
+
+**B. 账户迁移：三笔空头重放为 2 倍（`core.fill_plan` + `core.apply_fill` 纯函数）**
+```
+600594: 15,700 → **31,400** @3.19（+50,083）⇒ 浮盈 +3,768 → **+7,536**
+300869:  5,100 → **10,200** @9.81（+50,031）⇒ 浮盈 +4,539 → **+9,078**  ← 用户预期的「9,000 多」
+601238: 10,200 → **20,400** @4.92（+50,184）⇒ 浮盈 +2,550 → **+5,100**
+合计浮盈 +10,857 → **+21,714**
+```
+★ **不手改 `state.json`**（会与 ledger 分叉、违反 N7）：改走 `fill_plan` 算权威费用 →
+`apply_fill` 记账 → 追加 3 条 ledger 行 → `save_state` 刷水位 ⇒ `diverged = false` ✓
+★ 迁移后额外两步 state 修正（**无 ledger 行**，审计须知）：
+1. **+21,373.61** 盯市回归（`apply_fill` 会把 `last_price` 重置成成交价 ⇒ 用快照价重新 `mark_to_market`）
+2. **+340.39** 补记加开部分的建仓至今利息（★ **券款口径**，与 `accrue_interest` 的**市值口径**不同，后者应 ≈315.6）
+★ 解冻：`settle_t1` 后 `short_available == short_qty` ⇒ 三只**全额可平** ✓
+
+**C. 文档与判据**
+* `INTERFACES.md`：MarginConfig/RiskConfig 同步新值 + 示例表加「v12 口径变更」注记
+* `tests/test_v12_leverage.py`：**新增 9 条判据**（4 条配置值 + 2 条纯函数行为含反证 + 3 条数据审计）
+* 3 处旧测试改「从配置读」而非写死（`20%*500000` / `notional*0.8` / `625000`）—— 判据**未弱化**
+
+### 修复
+* 3 红回归：`test_check_risk_reports_position_limit_pct` / `test_v31_margin_capacity_boundaries` /
+  `test_inv22_margin_reuse_with_unrealized_profit`（都是写死旧配置值）
+
+### 验证
+```
+全量 1275 passed / 4 skipped / 0 failed
+v12 判据 9 passed · 受影响面（core+engine+wiring）223 passed
+账户：交易日 2026-11-20 · 净资产 520,807.59 · 总盈亏 **+20,807.59**
+      担保比例 2.8630（平仓线 1.30）· 杠杆 0.5368（上限 2.0）
+      ledger_consistency = {"consistent": true, "ledger_lines": 6, "recorded": 6, "diverged": false}
+```
+
+### 已知限制（WATCH）
+* `interest_accrued` 是**混合口径累加器**（repo 市值口径 + 迁移券款口径），**不能**与账本重放逐分对齐
+* `test_v12_7/8` 是**一次性数据审计**（账户变化即 skip），不是回归判据
+* 融券模型**没有**「保证金杠杆放大盈亏」这回事；要做真杠杆需另立产品裁决
+
 ## [Unreleased]
 
 ## [1.19.0] — 2026-11-19

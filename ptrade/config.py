@@ -43,8 +43,11 @@ class MarginConfig:
     min_maintenance_ratio: float = 1.30  # 平仓线
     warn_maintenance_ratio: float = 1.50  # 警戒线
     max_maintenance_ratio: float = 3.00  # 可提取线
-    margin_ratio_long: float = 0.80  # 融资保证金比例
-    margin_ratio_short: float = 1.00  # 融券保证金比例
+    # ★ v12：保证金比例 50% ⇒ **2 倍杠杆**（用户裁决：融资/融券都改 2 倍）
+    #   原值：long 0.80（1.25 倍）· short 1.00（**1 倍，无杠杆**）
+    #   ★ 真实 A 股散户融券保证金比例**最低 50%**，50% 才是常见 2 倍口径
+    margin_ratio_long: float = 0.50  # 融资保证金比例（v12：0.80 → 0.50 = 2 倍）
+    margin_ratio_short: float = 0.50  # 融券保证金比例（v12：1.00 → 0.50 = 2 倍）
     financing_rate_annual: float = 0.065  # 融资年化利率
     lending_rate_annual: float = 0.080  # 融券年化费率
     short_source_limit_ratio: float = 0.02  # 单票可融券量 <= 流通股本的 2%
@@ -54,12 +57,15 @@ class MarginConfig:
 class RiskConfig:
     """风控配置。"""
 
-    max_position_pct: float = 0.20  # 单票市值（多头+融券）/ 净资产（**非总资产**，见 §5 强约束 6）
+    # ★ v12：为了允许「同样的保证金做 2 倍空头」，上限同步放宽
+    #   原：max_position_pct 0.20（单票 10 万）· max_short_exposure 0.50（空头总 25 万）
+    #   2 倍后三笔各 ~10 万 ⇒ 单票刚好顶到 20% 会被拒 62 元 ✗ · 合计 30 万 > 25 万 ✗
+    max_position_pct: float = 0.25  # 单票市值（多头+融券）/ 净资产（v12：0.20 → 0.25）
     max_positions: int = 5  # 同时持仓标的数
     stop_loss_pct: float = -0.07  # CANSLIM 止损线（-7%，相对成本价）
     take_profit_pct: float = 0.25  # 止盈提示线
     max_gross_exposure: float = 2.0  # 总敞口（多头市值+融券市值）/ 净资产
-    max_short_exposure: float = 0.50  # 融券市值 / 净资产
+    max_short_exposure: float = 0.65  # 融券市值 / 净资产（v12：0.50 → 0.65）
     max_leverage: float = 2.0  # 【v3 新增】总负债 / 净资产 上限；防止「开仓即低于平仓线」
 
 
