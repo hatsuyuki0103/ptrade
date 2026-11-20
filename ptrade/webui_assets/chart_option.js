@@ -48,7 +48,22 @@ function num(v) { return (v === null || v === undefined) ? "-" : v; }
 
 export function buildOption(payload, period, opts) {
   const o = opts || {};
-  const d = payload.periods[period];
+  /* ★★ v13（真缺陷修复，R2）：入口守卫。
+     旧实现直接 `payload.periods[period].dates.length` —— 两种调用方错误都会炸成
+     `TypeError: Cannot read properties of undefined (reading 'dates')`（用户报的堆栈）：
+       ① 把**分时 payload**（`render_intraday` 产物，**没有 `periods` 字段**）传进来；
+       ② `payload` 还是**上一个周期**的（切换竞态）。
+     现在先验证再取，并给出**可诊断**的错误（点明分时该走哪个构建器）。 */
+  const periods = (payload && payload.periods) || null;
+  const d = periods ? periods[period] : null;
+  if (!d || !Array.isArray(d.dates)) {
+    throw new Error(
+      "buildOption: payload.periods[" + JSON.stringify(String(period)) + "] 无数据" +
+      (String(period) === "minute" || !periods
+        ? "（分时 payload 没有 periods 字段，请走 buildIntradayOption）"
+        : "（payload 与 period 不匹配：切换周期时请等数据到达再渲染）")
+    );
+  }
   const d0 = d.dates.length;
   /* ★★ v6：**按周期**的默认可见根数（用户拍板：日线近半年 · 周线/月线近 5 年）。
      旧实现是写死 `120` 并用**百分比**（`startPct`）。为什么改成**索引**：
@@ -186,22 +201,51 @@ export function buildOption(payload, period, opts) {
       backgroundColor:"rgba(255,255,255,0.96)", borderColor:"#e5e6eb", textStyle:{color:"#1f2329", fontSize:12},
       formatter:function (ps) {
         if (!ps || !ps.length) return "";
-        const i = ps[0].dataIndex, dd = payload.periods[activePeriod()];
-        const rows = ["<b>" + dd.dates[i] + "</b>"];
-        const ohlc = dd.ohlc[i] || [];
-        if (ohlc.length === 4) {
-          const up = ohlc[1] >= ohlc[0];
-          rows.push("开 " + num(ohlc[0]) + " 收 <b style='color:" + (up ? UP : DOWN) + "'>" + num(ohlc[1]) + "</b>");
-          rows.push("高 " + num(ohlc[3]) + " 低 " + num(ohlc[2]));
+        /* ★ S4（code-review）：**主源固定为建 option 时的 `period`** ——
+           图表上画的就是 `payload.periods[period]`，tooltip 必须跟随**绘制数据**，
+           而不是跟随调用方的活状态（那正是 v13 修的那个错配）。
+           活周期只在 `period` 取不到时**兜底**（兼容老调用方）。 */
+        const live = payload.periods ? payload.periods[activePeriod()] : null;
+        const primary = payload.periods ? payload.periods[period] : null;
+        const dd = (primary && Array.isArray(primary.dates))
+          ? primary
+          : ((live && Array.isArray(live.dates)) ? live : null);
+        if (!dd || !Array.isArray(dd.dates)) return "";
+        const i = ps[0].dataIndex;
+        if (i === null || i === undefined || i < 0 || i >= dd.dates.length) return "";
+        /* ★ S5（code-review）：下面每个子数组都是裸下标 —— 后端形状变化 / 某周期缺字段
+           仍会抛 `Cannot read properties of undefined (reading '0')`。
+           既然本函数对外承诺「绝不抛异常」，就把整段拼装包进 try/catch，
+           任一段取不到就退化成「已拼出来的那几行」而不是整块炸掉。 */
+        let rows;
+        try {
+          rows = ["<b>" + dd.dates[i] + "</b>"];
+          const ohlc = (dd.ohlc && dd.ohlc[i]) || [];
+          if (ohlc.length === 4) {
+            const up = ohlc[1] >= ohlc[0];
+            rows.push("开 " + num(ohlc[0]) + " 收 <b style='color:" + (up ? UP : DOWN) + "'>" + num(ohlc[1]) + "</b>");
+            rows.push("高 " + num(ohlc[3]) + " 低 " + num(ohlc[2]));
+          }
+          if (dd.pct_chg && dd.pct_chg[i] !== null) rows.push("涨跌幅 " + num(dd.pct_chg[i]) + "%");
+          const vol = dd.volume ? dd.volume[i] : null, amt = dd.amount ? dd.amount[i] : null;
+          if (vol !== null) {
+            const v5 = dd.vol_ma && dd.vol_ma["5"] ? dd.vol_ma["5"][i] : 0;
+            const v10 = dd.vol_ma && dd.vol_ma["10"] ? dd.vol_ma["10"][i] : 0;
+            rows.push("量 " + (vol / 1e4).toFixed(2) + " 万  MA5 " + ((v5 || 0) / 1e4).toFixed(2) + " 万  MA10 " + ((v10 || 0) / 1e4).toFixed(2) + " 万");
+          }
+          if (amt !== null) rows.push("成交额 " + (amt / 1e8).toFixed(3) + " 亿");
+          const at = function (grp, key) {
+            return (dd[grp] && Array.isArray(dd[grp][key])) ? dd[grp][key][i] : undefined;
+          };
+          rows.push("MA12 " + num(at("ma", "12")) + " / MA24 " + num(at("ma", "24")) + " / MA48 " + num(at("ma", "48")) + " / MA96 " + num(at("ma", "96")));
+          rows.push("BOLL " + num(at("boll", "lower")) + " / " + num(at("boll", "mid")) + " / " + num(at("boll", "upper")));
+          rows.push("DIF " + num(at("macd", "dif")) + " DEA " + num(at("macd", "dea")) + " 柱 " + num(at("macd", "hist")));
+          const sarV = at("sar", "value"), sarT = at("sar", "trend");
+          rows.push("SAR " + num(sarV) + (sarT > 0 ? " (多)" : " (空)"));
+        } catch (e) {
+          /* 拼装期任何异常 ⇒ 只返回已拼好的部分（绝不把异常抛给 ECharts） */
+          return (rows && rows.length) ? rows.join("<br>") : "";
         }
-        if (dd.pct_chg && dd.pct_chg[i] !== null) rows.push("涨跌幅 " + num(dd.pct_chg[i]) + "%");
-        const vol = dd.volume[i], amt = dd.amount[i];
-        if (vol !== null) rows.push("量 " + (vol / 1e4).toFixed(2) + " 万  MA5 " + ((dd.vol_ma["5"][i] || 0) / 1e4).toFixed(2) + " 万  MA10 " + ((dd.vol_ma["10"][i] || 0) / 1e4).toFixed(2) + " 万");
-        if (amt !== null) rows.push("成交额 " + (amt / 1e8).toFixed(3) + " 亿");
-        rows.push("MA12 " + num(dd.ma["12"][i]) + " / MA24 " + num(dd.ma["24"][i]) + " / MA48 " + num(dd.ma["48"][i]) + " / MA96 " + num(dd.ma["96"][i]));
-        rows.push("BOLL " + num(dd.boll.lower[i]) + " / " + num(dd.boll.mid[i]) + " / " + num(dd.boll.upper[i]));
-        rows.push("DIF " + num(dd.macd.dif[i]) + " DEA " + num(dd.macd.dea[i]) + " 柱 " + num(dd.macd.hist[i]));
-        rows.push("SAR " + num(dd.sar.value[i]) + (dd.sar.trend[i] > 0 ? " (多)" : " (空)"));
         return rows.join("<br>");
       }},
     axisPointer:{link:[{xAxisIndex:"all"}], label:{backgroundColor:"#1f6feb"}},

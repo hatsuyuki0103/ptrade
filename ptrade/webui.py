@@ -289,7 +289,20 @@ var API = {
 var CHART = null;
 var CHART_RO = null;
 var CHART_MODULE_TIMEOUT = null;   /* ★ M2：图表模块加载超时兜底（见 renderChart） */
-var CHART_STATE = {code: "", period: "daily", payload: null};
+/* ★★ v13（真缺陷修复，R3）：`payloadPeriod` 与 `period` **必须分开存**。
+   旧实现只有 `period`：`loadChart()` 里**同步立刻**改它（按钮高亮要及时），
+   但 `payload` 要等 `api(url).then(...)` **异步**回来才换 ⇒ 中间那段时间
+   `period` 是新的、`payload` 是旧的 ⇒ tooltip formatter（悬停时才求值）取到
+   `payload.periods[新周期]` = undefined ⇒ 抛
+   `TypeError: Cannot read properties of undefined (reading 'dates')`（用户报的堆栈）。
+   ⇒ `payloadPeriod` **只在数据真正到达后**才设，`renderChart()` 一律用它
+     ⇒ 图表永远按**它自己数据**的周期渲染/提示 ✓ */
+var CHART_STATE = {code: "", period: "daily", payloadPeriod: null, payload: null};
+/* ★★ v13（R4）：周期切换的**请求序号**。防「日→周→月」快速连点时，
+   后到的**旧响应**把新周期的图覆盖（那会再次造成周期/载荷错配）。 */
+var CHART_REQ_SEQ = 0;
+/* ★ LOW-2：无 ResizeObserver 时的 resize 监听器**只绑一次**（见 ensureChart） */
+var CHART_RESIZE_BOUND = false;
 var FACTOR_KEYS = ["C", "A", "N", "S", "L", "I", "M"];
 
 function $(id) { return document.getElementById(id); }
@@ -673,10 +686,43 @@ function setCurrentCode(code) {
   var el = $("stock-code");
   if (el && code) { el.value = String(code); }
 }
-function chartEmpty(text) {
+function chartPlaceholder(text, keepPayload) {
+  /* ★ B1 修复：见 chartEmpty 的说明 —— **必须 dispose 并置 null**，否则白屏到 F5。 */
   var root = $("chart-root");
+  if (CHART) {
+    try { CHART.dispose(); } catch (e) { /* dispose 失败也不该阻断「显示空态」 */ }
+  }
+  CHART = null;
+  /* ★ 顺手断开旧的 ResizeObserver：重新 init 会**再建一个**，不断开就每空态一次漏一个观察器。 */
+  if (CHART_RO) {
+    try { CHART_RO.disconnect(); } catch (e) { /* 忽略 */ }
+    CHART_RO = null;
+  }
   if (root) { root.innerHTML = '<div class="empty">' + esc(text || "") + "</div>"; }
-  CHART_STATE.payload = null;
+  /* ★ LOW-1（code-review 复审）：`#chart-coverage` 的文案只在 renderChart 且 payload 非空时
+     才更新 ⇒ 空态后旧的「数据从 2001-08-27 开始」/「数据仅到 …（离线）」会**残留**在图表下方，
+     让用户以为还有数据。这里一并清掉。 */
+  var cov = $("chart-coverage");
+  if (cov) { cov.textContent = ""; cov.title = ""; }
+  /* ★★ S1（code-review）：`keepPayload` 为真时**保留 payload**。
+     用途：`renderChart` 的「图表模块还没就绪」分支 —— 那里只是**暂时**画不出，
+     等 `chart-option-ready` 事件回来会再 `renderChart()`；若此处清了 payload，
+     重绘首行 `if (!st.payload) return;` 会直接返回 ⇒ 兜底彻底失效 ✗ */
+  if (!keepPayload) {
+    CHART_STATE.payload = null;
+    CHART_STATE.payloadPeriod = null;
+  }
+}
+function chartEmpty(text) {
+  /* ★★★ v13-B1（code-review REJECT 的阻断项，**必须修**）：
+     ECharts 把 canvas 放在 `#chart-root` 的**子 div** 里。
+     旧实现只做 `root.innerHTML = …` ⇒ canvas 子树**脱离 DOM**，但 `CHART` 实例**仍非空**
+     ⇒ `ensureChart()` 里 `if (!CHART)` 不成立、直接返回那个**失联实例**
+     ⇒ 后续 `setOption` 画进**已脱离文档**的 canvas ⇒ **图表永久白屏，必须 F5** ✗
+     触发路径：加载失败 / 构建失败 / 模块超时 / 无数据 —— 只要出现过**一次**空态就中招。
+     ★ 我原来只加 `CHART.clear()` 是**错的** —— clear 只清 option，不动 DOM 绑定关系。
+     （实现见 `chartPlaceholder`；这里只是 `keepPayload=false` 的常规空态） */
+  chartPlaceholder(text, false);
 }
 function ensureChart() {
   var root = $("chart-root");
@@ -701,8 +747,13 @@ function ensureChart() {
       });
       CHART_RO.observe(root);
     } else {                                   /* 老浏览器兜底：窗口 resize 也能自适应 */
+    /* ★ LOW-2（code-review 复审）：**幂等绑定** —— 每次空态后重绘都会走到这里，
+       不判重就会每空态叠加一个监听器（内存/重复 resize 浪费）。 */
+    if (!CHART_RESIZE_BOUND) {
+      CHART_RESIZE_BOUND = true;
       window.addEventListener("resize", function () { if (CHART) { CHART.resize(); } });
     }
+  }
   }
   return CHART;
 }
@@ -731,7 +782,10 @@ function renderChart() {
   renderCoverage(st.payload);
   if (typeof window.buildOption !== "function") {
     /* 模块脚本是 defer 的：首次可能还没就绪 —— 等事件再画，而不是报错/降级成空白。 */
-    chartEmpty("图表模块加载中…");
+    /* ★★ S1（code-review）：这里**必须 keepPayload=true** ——
+       只是「模块还没加载好」，payload 是好的；清掉它会让 `chart-option-ready`
+       回调里的 `renderChart()` 首行 `if (!st.payload) return;` 直接返回 ⇒ 兜底失效 ✗ */
+    chartPlaceholder("图表模块加载中…", true);
     var onOptionReady = function () {
       if (CHART_MODULE_TIMEOUT) { clearTimeout(CHART_MODULE_TIMEOUT); CHART_MODULE_TIMEOUT = null; }
       renderChart();
@@ -754,7 +808,11 @@ function renderChart() {
   if (CHART_MODULE_TIMEOUT) { clearTimeout(CHART_MODULE_TIMEOUT); CHART_MODULE_TIMEOUT = null; }
   var inst = ensureChart();
   if (!inst) { return; }
-  var opts = {code: st.code, getActive: function () { return st.period; }};
+  /* ★★ v13（R3）：一律用 **payload 自己的周期**（`payloadPeriod`），不用 `st.period`。
+     `st.period` 是 UI 高亮状态（点下去立刻变），而 `st.payload` 可能还是上一个周期的；
+     两者混用就是用户报的那个 TypeError 的根源。 */
+  var pp = st.payloadPeriod || st.period || "daily";
+  var opts = {code: st.code, getActive: function () { return pp; }};
   if (typeof window.miniCandlestick === "function") {
     /* ★ **必须传**：BOLL/SAR 面板的**迷你蜡烛**由它在运行时生成
        （axisIndex 1=BOLL、5=SAR）。不传就**静默没有蜡烛**（Critic C3 的坑）。 */
@@ -767,14 +825,26 @@ function renderChart() {
      ⇒ 按周期分派：minute → `buildIntradayOption(payload)`（不吃 opts）；其余 → `buildOption(payload, period, opts)`。
      两个构建器都在**同一份** `chart_option.js` 里 ⇒ 每个图型仍是**单一真源**（`T-V3-19`/`T-V3-27` 守着）。 */
   var option;
-  if (st.period === "minute") {
-    if (typeof window.buildIntradayOption !== "function") {
-      chartEmpty("分时图表模块未就绪（/static/chart_option.js 缺少 buildIntradayOption）");
-      return;
+  /* ★★ v13（R5）：构建失败必须**转成可读空态**，绝不冒泡成 console 里的未捕获异常。
+     `buildOption` 在 v13 起会为「载荷与周期不匹配」抛**带说明的 Error**，
+     这里接住并显示人话（用户报的 bug 就是这类异常直接把图表卡住）。 */
+  try {
+    if (pp === "minute") {
+      if (typeof window.buildIntradayOption !== "function") {
+        chartEmpty("分时图表模块未就绪（/static/chart_option.js 缺少 buildIntradayOption）");
+        return;
+      }
+      option = window.buildIntradayOption(st.payload);
+    } else {
+      option = window.buildOption(st.payload, pp, opts);
     }
-    option = window.buildIntradayOption(st.payload);
-  } else {
-    option = window.buildOption(st.payload, st.period, opts);
+  } catch (e) {
+    /* ★ S6（code-review）：真实 bug 不能被 UI 文案吞掉 —— 同时打到 console 便于排查。 */
+    if (window.console && window.console.error) {
+      window.console.error("[chart] buildOption/buildIntradayOption failed", e);
+    }
+    chartEmpty("图表构建失败：" + (e && e.message ? e.message : String(e)));
+    return;
   }
   if (!option) { chartEmpty("图表数据为空"); return; }
   inst.setOption(option, true);
@@ -899,15 +969,22 @@ function loadChart(period) {
   var code = currentCode();
   if (!code) { toast("请先在操作条里填写代码", "warn"); return; }
   var p = period || CHART_STATE.period || "daily";
+  /* ★ `period` 只是 **UI 状态**（按钮高亮要立刻响应）；
+     payload 对应的周期另存 `payloadPeriod`，**只在数据到达后**才设（见 R3）。 */
   CHART_STATE.period = p;
   setPeriodButtons(p);
+  var seq = ++CHART_REQ_SEQ;       /* ★ v13（R4）：本次请求的序号 */
   var url = API.chartData + "?code=" + encodeURIComponent(code) + "&period=" + encodeURIComponent(p);
   api(url).then(function (b) {
+    /* ★★ v13（R4）：**过期响应丢弃**。用户快速点「日→周→月」时，
+       先发的请求可能**后到**；若照收就会把后选的周期覆盖成旧数据 ⇒ 又是周期/载荷错配。 */
+    if (seq !== CHART_REQ_SEQ) { return; }
     var d = (b && b.data) || null;
     if (!d) { chartEmpty("加载失败：后端不可达"); return; }
     if (d.ok === false || d.error) { chartEmpty("无数据：" + (d.error || "")); return; }
     CHART_STATE.code = code;
     CHART_STATE.payload = d;
+    CHART_STATE.payloadPeriod = p;   /* ★ 只有数据真的到了才认这个周期 */
     renderChart();
     if (p === "minute") {
       stopAnalysisPoll();
@@ -922,6 +999,16 @@ function loadChart(period) {
       scheduleAnalysisPoll(code);
     }
     toast("已加载 " + code + "（" + p + "）", "ok");
+  }).catch(function (err) {
+    /* ★★ S2（code-review）：`api()` 只处理 fetch **resolve** 后的状态码；
+       服务真挂了 / 网络断连时 Promise 是 **reject** ⇒ 原来没有任何分支接手
+       ⇒ unhandled rejection，页面既不清空也没有可读提示（用户看到"加载图表时出问题"）。
+       ★ 必须带 seq 判定：过期请求的失败**不得**覆盖用户已经切到的新周期。 */
+    if (seq !== CHART_REQ_SEQ) { return; }
+    if (window.console && window.console.error) {
+      window.console.error("[chart] loadChart failed", err);
+    }
+    chartEmpty("加载失败：后端不可达（" + (err && err.message ? err.message : String(err)) + "）");
   });
 }
 /* ★ P0-3（Architect）：**「下单」只打开并预填表单，绝不提交**（一键下单 = 花真钱）。 */

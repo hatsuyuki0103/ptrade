@@ -974,6 +974,10 @@ function currentMiniCandlestick() {
   return { boll: miniCandlestick(1), sar: miniCandlestick(5) };
 }
 
+/* ★ TODO（v13 code-review 复审 S7，下版收）：这里 `switchPeriod` 没有 try/catch。
+   本页 `CHART_DATA` **含全部周期**且本函数**同步重建**，所以当前不会触发
+   「周期/载荷错配」；但若将来数据缺某周期，`buildOption` 的入口守卫会抛错
+   ⇒ 整个 `<script>` 断掉（白页）。修法 3 行：`try { chart.setOption(buildOption(...)) } catch (e) { chart.clear(); showError(e); }` */
 function switchPeriod(period) {
   active = period;
   ["daily","weekly","monthly"].forEach(function (p) {

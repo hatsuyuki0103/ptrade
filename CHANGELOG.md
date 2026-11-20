@@ -2,6 +2,90 @@
 
 本文件记录 ptrade 的版本变更。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.21.0] — 2026-11-20
+
+**主题：v13 —— 修图表 tooltip 在「切换分时 / 加载图表」时的 TypeError 崩溃（含一个白屏阻塞缺陷）**
+
+### 用户实测（真源）
+```
+chart_option.js:190 Uncaught TypeError: Cannot read properties of undefined (reading 'dates')
+    at formatter (chart_option.js:190:34)
+    at e._showTooltipContent (echarts.min.js:45:792407)
+「有时候前端控制台会出现这个bug，导致切换分时或者加载图表的时候出问题」
+```
+
+### 根因 A：`tooltip formatter` 读到「周期 / 载荷错配」
+`chart_option.js` 旧实现：
+```javascript
+const i = ps[0].dataIndex, dd = payload.periods[activePeriod()];   // dd 可能是 undefined
+const rows = ["<b>" + dd.dates[i] + "</b>"];                        // 崩（190:34）
+```
+`activePeriod()` **在悬停时才求值** `opts.getActive()`，而 `webui.py` 传的是
+`getActive: () => st.period`（**活状态**）；`loadChart()` 里 `CHART_STATE.period` 是**同步立刻**改的，
+`payload` 却要等 `api(url).then(...)` **异步**回来 ⇒ 中间那段时间两者对不上：
+1. 日线 → 点分时（fetch 期间）：`period="minute"`，payload 是日线的（无 `minute` 键）
+2. 分时 → 点日线（fetch 期间）：`period="daily"`，payload 是**分时 payload（整个 `periods` 字段都没有）**
+
+★ 同类前科：本文件早已记录「分时 payload 没有 `periods` ⇒ 不能走 `buildOption`（X2 真缺陷）」——
+X2 只修了**构建期分派**，没修 **tooltip 期活状态求值** ⇒ 同一个洞第二次爆发。
+
+### 根因 B（★ code-review 抓出的**阻塞级**缺陷，比 A 更严重）
+`chartEmpty()` 旧实现只做 `root.innerHTML = '<div class="empty">…'`，
+把 ECharts 的 **canvas 子树整个摘掉**，却**既不 `dispose()` 也不把 `CHART` 置 null**
+⇒ `ensureChart()` 里 `if (!CHART)` 不成立、直接返回那个**失联实例**
+⇒ 之后 `setOption` 画进**已脱离 DOM** 的 canvas ⇒ **图表永久白屏，必须刷新页面** ✗
+触发路径：加载失败 / 构建失败 / 模块加载超时 / 无数据 —— 只要出现过**一次**空态就中招。
+★★ 这正是「**加载图表时出问题**」的真身之一，而且**v13 的 try/catch 会放大它的触发概率**。
+
+### 改动
+**A. `ptrade/webui_assets/chart_option.js`**
+* tooltip formatter：**主源固定为建 option 时的 `period`**（图表画的就是它），活周期只做兜底；
+  `Array.isArray` 校验 + `dataIndex` 越界守卫；整段拼装包 `try/catch` ⇒ **对外承诺「绝不抛」**
+* `buildOption` **入口守卫**：`payload.periods[period]` 缺失时抛**可诊断**的 Error
+  （点明「分时请走 `buildIntradayOption`」），不再是 `.dates` 的 TypeError
+
+**B. `ptrade/webui.py`**
+* ★★ **拆分 `CHART_STATE.period`（UI 高亮，点下去立刻变）与 `CHART_STATE.payloadPeriod`（数据到达后才设）**，
+  `renderChart()` 一律用 `payloadPeriod` 分派构建器 + 传 `getActive: () => pp` ⇒ **治本，消除错配**
+* ★★ **`chartEmpty` → `chartPlaceholder(text, keepPayload)`**：`CHART.dispose()` + `CHART = null` +
+  `CHART_RO.disconnect()` 后再写空态 ⇒ **空态之后能重新 init**（白屏 B1 修复）
+* `CHART_REQ_SEQ` 请求序号：丢弃过期响应（防「日→周→月」快速连点被旧响应覆盖）
+* `loadChart` 补 `.catch`（带 seq 判定）：网络真断时给出可读空态，不再 unhandled rejection
+* 模块加载中的临时占位用 `keepPayload=true`（否则「模块就绪后重绘」的兜底失效）
+* 构建失败/加载失败都 `console.error` 留痕，不再把真实错误吞成 UI 文案
+* 空态时清 `#chart-coverage` 残留文案；无 ResizeObserver 浏览器的 `resize` 监听器**幂等绑定**
+
+**C. 判据（`tests/test_v13_chart_period_race.py`，13 条）**
+* **V13-1..5b**：在 **node 里真的调用** formatter / buildOption —— 错配不抛、回退到正确周期、
+  分时 payload 进 `buildOption` 抛可诊断错、空/坏 payload 返回 `""`、越界返回 `""`、正常情形不被修坏
+* **V13-10/11/12**：★ **B1 行为判据** —— 用花括号配平从 `webui.py` 抽出
+  `chartPlaceholder`/`chartEmpty`/`ensureChart` **真源码**，配 DOM/echarts/ResizeObserver stub 在 node 里跑：
+  `init → 空态 → 再 init` 必须 `initCalls>=2` 且 `disposeCalls>=1` 且 RO 断开并重建；临时占位保留 payload
+* **V13-6..9**：前端状态模型契约 + `node --check` 语法
+
+### 变异证明（证明判据不是假绿）
+```
+.omx/probe/v13_mutation.py      旧 formatter ⇒ threw=True  error="Cannot read properties of undefined (reading 'dates')"
+                                 新 formatter ⇒ threw=False rendered="<b>2026-11-03</b>…"
+.omx/probe/v13_mutation_b1.py   旧 chartEmpty ⇒ initCalls=1 disposeCalls=0 reinit=False （白屏）
+                                 新 chartEmpty ⇒ initCalls=2 disposeCalls=1 reinit=True  （可恢复）
+```
+★ 旧 formatter 复现出的错误与用户贴的堆栈**逐字一致**。
+
+### 验证
+```
+tests/test_v13_chart_period_race.py                                              13 passed
+chart_v2 + perf_analysis + ui_layout_v4 + webui* + chart* + v13                 236 passed / 1 skipped
+node --check：chart_option.js ✓ · webui.py 内联 2 段 script ✓
+code-review：首轮 REJECT/BLOCK（抓到上述 B1）→ 整改后复审 **APPROVE / CLEAR**
+```
+
+### 已知限制（WATCH，下版收）
+* `ptrade/chart.py` 独立 HTML 图表页的 `switchPeriod()` **仍无 try/catch**
+  —— 该页 `CHART_DATA` 含全部周期且同步重建，当前不可达；已就地记 TODO
+* `V13-6/7/8` 是**源码契约**判据（非行为）；`payloadPeriod` 提交顺序 / 请求序号语义
+  建议后续抽纯函数做行为判据
+
 ## [1.20.0] — 2026-11-20
 
 **主题：v12 —— 融券 2 倍杠杆落地（保证金口径 50%）+ 已有三笔空头重放为 2 倍规模**
