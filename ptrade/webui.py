@@ -57,6 +57,28 @@ main{min-height:0;display:grid;overflow:hidden;gap:12px;padding:0 16px 8px;
 main > .chart-col{min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px}
 main > .info-col{min-height:0;display:grid;gap:8px;align-content:start;
                  overflow-y:auto;scrollbar-width:thin;overscroll-behavior:contain}
+/* ★★ v17：交易记录浮层。
+   为什么必须**脱离右列的布局**：右列实测剩余余量 = **0px**
+   （INV-66b：4 档视口 infoColScrollH === clientH），而「持仓 0 行」只有 ~20px、
+   交易记录 9 行 ~216px ⇒ 原地切换**必然撑高右列、4 条判据全红** ✗
+
+   ★★★ 为什么用 `position:fixed` 而**不是** absolute：
+     absolute 的元素当 containing block 同时是**滚动容器**（`.info-col` 有 `overflow-y:auto`）时，
+     **溢出仍会计入该容器的 `scrollHeight`** ⇒ 实测 1920×1080 下点开浮层后
+     `infoColScrollH` 从 986 涨到 1116 ⇒ INV-66b 红 ✗（V17-12 判据抓到）
+     `fixed` 相对**视口**定位，不参与任何滚动容器的溢出计算 ⇒ 真正 0px ✓
+     位置由 `openTrades()` 按 `.info-col` 的 rect 算好再设（视觉上仍"在右列"）。
+
+   浮层用 <div>（**不是** .card/section/article）—— test_v4_l5 的 infoCards 判据取
+   ".card, section, article"，被当成卡片会触发「卡片重叠」断言 ✗ */
+.trades-pop{display:none;flex-direction:column;gap:6px;position:fixed;z-index:60;padding:10px;
+            background:var(--card);border:1px solid var(--line);border-radius:8px;
+            box-shadow:0 8px 28px rgba(0,0,0,.45);min-height:0;overflow:hidden}
+.trades-pop[data-open="1"]{display:flex}
+#trades-wrap{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;overscroll-behavior:contain}
+#trades-wrap th{position:sticky;top:0;background:var(--card);z-index:1}
+.tabbtn{cursor:pointer}
+.tabbtn.active{outline:2px solid #58a6ff}
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px;min-width:0}
 .card-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;
           background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px}
@@ -198,9 +220,19 @@ th,td{padding:2px 6px}
     </section>
 
     <section class="card">
-      <h2>持仓</h2>
+      <!-- ★ v17：标题行加「持仓 / 交易记录」切换 tab。
+           套用「自选池」卡已有的 row + h2{margin:0} 模式 ⇒ 比原来的 <h2>持仓</h2>
+           （默认 margin:0 0 6px）**更省高度**，所以 INV-66b 的 0px 余量不被吃掉 ✓ -->
+      <div class="row" style="justify-content:space-between">
+        <h2 style="margin:0">持仓</h2>
+        <span class="row">
+          <button id="tab-positions" class="tabbtn active" data-testid="tab-positions">持仓</button>
+          <button id="tab-trades" class="tabbtn" data-testid="tab-trades">交易记录</button>
+        </span>
+      </div>
       <div id="positions"><span class="empty">加载中…</span></div>
     </section>
+
 
     <section class="card">
       <h2>下单 / 平仓</h2>
@@ -246,6 +278,24 @@ th,td{padding:2px 6px}
   </section>
 </main>
 
+<!-- ★★ v17：交易记录浮层。**刻意放在 <body> 下、与 .info-col 平级**——
+     (a) 默认 data-open="0"（display:none）⇒ 对右列零影响；
+     (b) position:fixed 相对**视口**定位，但若它的祖先链上将来有人加 transform/filter/contain，
+         fixed 会**静默退化**成相对那个祖先 ⇒ 又变回「计入 .info-col 的 scrollHeight」
+         （实测过 1920×1080 撑到 1116 > 986）。放在 body 下 ⇒ 该风险**结构上不存在**。
+     (c) 刻意用 <div> 而**不是** .card/section/article —— test_v4_l5 的 infoCards 判据取
+         ".card, section, article"，被当成卡片会触发「卡片重叠」断言 ✗ -->
+  <div class="trades-pop" id="trades-pop" data-testid="trades-pop" data-open="0" aria-hidden="true">
+    <div class="row" style="justify-content:space-between">
+      <span class="small" id="trades-title">交易记录</span>
+      <span class="row">
+        <label class="small"><input type="checkbox" id="trades-include-rejected"> 显示已拒</label>
+        <button id="trades-close" data-testid="trades-close">关闭</button>
+      </span>
+    </div>
+    <div id="trades-wrap"><span class="empty">未加载</span></div>
+  </div>
+
 <!-- ★ V3-A5：ECharts **本地 vendored**（1,030,855 B），**只在本页加载一次**；零 CDN（INV-59 同族）。
      静态资源由服务端 `/vendor/echarts.min.js` 提供（白名单 + Cache-Control: public, max-age=86400）。 -->
 <script src="/vendor/echarts.min.js"></script>
@@ -268,6 +318,8 @@ var API = {
      前端账户卡改读这个 —— 否则用户看到的永远是「上一次成交时」的盈亏 ✗ */
   live_state: "/api/live_state",
   positions: "/api/positions",
+  /* ★ v17：交易记录（逐笔流水）。服务端只读 ledger.jsonl，不取锁、不用 ds。 */
+  ledger: "/api/ledger",
   risk: "/api/risk",
   search: "/api/search",
   watchlist: "/api/watchlist",
@@ -536,6 +588,181 @@ function renderPositions(data) {
   $("positions").innerHTML = table(
     ["代码/名称", "多头数量", "多头成本", "多头市值", "多头浮盈",
      "空头数量", "空头成本", "空头市值", "空头浮盈", "实时价"], html);
+}
+
+/* ========================================================================== *
+ * v17 · 交易记录（逐笔流水）
+ *   用户需求：「看我的交易记录，哪一天哪个价位买的，和哪一天哪个价位卖的」
+ *   用户裁决：持仓卡内 tab · **逐笔流水**（不是回合配对）· 被拒委托默认隐藏
+ *   ★ 技术约束：右列剩余余量 = **0px**（INV-66b 实测 4 档视口）⇒
+ *     内容放**绝对定位浮层**（不参与 .info-col 的 grid 布局），tab 只切换浮层显隐。
+ * ========================================================================== */
+var TRADES_STATE = {open: false, loading: false};
+
+/* 方向中文化（与 core.Side 的取值一一对应；未知值原样显示，不猜） */
+var SIDE_LABEL = {
+  buy: "买入", sell: "卖出", margin_buy: "融资买入",
+  short_sell: "融券卖出", buy_to_cover: "买券还券", repay_margin: "卖券还款"
+};
+
+function tradeSideText(side) {
+  var s = String(side || "");
+  return SIDE_LABEL[s] || s || "—";
+}
+
+function renderTrades(data) {
+  var wrap = $("trades-wrap");
+  if (!wrap) { return; }
+  var rows = asRows(data && (data.orders || data), ["orders", "results", "items", "rows"]);
+  var title = $("trades-title");
+  var total = (data && data.total_lines != null) ? data.total_lines : rows.length;
+  if (title) {
+    /* ★ code-review 建议4：台账超过 limit 时标题不能只说总笔数 —— 否则
+       「标题说 300 笔、表里只有 100 行」会让人以为数据丢了。明确写「显示 N / 共 M」。 */
+    var shown = rows.length;
+    var text = (shown < total)
+      ? ("交易记录（显示 " + shown + " / 共 " + total + " 笔")
+      : ("交易记录（" + total + " 笔");
+    if (data && data.include_rejected) { text += "，含已拒"; }
+    title.textContent = text + "）";
+  }
+  if (!rows.length) {
+    wrap.innerHTML = '<span class="empty">暂无交易记录</span>';
+    return;
+  }
+  var html = rows.map(function (r) {
+    var price = pick(r, ["price"]);
+    var qty = pick(r, ["qty"]);
+    var amt = (isNum(qty) && isNum(price)) ? qty * price : null;
+    var pnl = pick(r, ["realized_pnl"]);
+    var status = String(pick(r, ["status"]) || "");
+    var isRejected = status === "rejected";
+    var pnlCell = (isNum(pnl) && Math.abs(pnl) > 1e-9)
+      ? '<span class="' + (pnl >= 0 ? "up" : "down") + '">' + num(pnl) + "</span>"
+      : "—";
+    var statusCell = isRejected
+      ? '<span class="down">已拒</span>'
+      : '<span class="up">成交</span>';
+    var cells = [
+      esc(String(pick(r, ["trade_date"]) || "—")),
+      esc(String(pick(r, ["code"]) || "")) + " " + esc(String(pick(r, ["name"]) || "")),
+      esc(tradeSideText(pick(r, ["side"]))),
+      isNum(qty) ? esc(String(qty)) : "—",
+      /* ★ 成交价常有 4 位小数（如 4.4322）⇒ 用 toFixed(4)，不用 num()（只保留 2 位会失真） */
+      isNum(price) ? esc(Number(price).toFixed(4)) : "—",
+      isNum(amt) ? num(amt) : "—",
+      pnlCell,
+      statusCell
+    ];
+    return '<tr data-order-id="' + esc(String(pick(r, ["order_id"]) || "")) + '">'
+      + "<td>" + cells.join("</td><td>") + "</td></tr>";
+  });
+  wrap.innerHTML = table(
+    ["日期", "代码/名称", "方向", "数量", "价格", "金额", "盈亏", "状态"], html);
+}
+
+function loadTrades() {
+  /* ★ code-review 建议5：并发去重 —— 连点 tab / 快速勾选时不要并发打同一个端点。
+     ★★ F3（code-review 建议2 + ultraqa 独立命中）：**去重不能丢最后一次请求**。
+        旧写法 `if (loading) return;` 会把「加载飞行期间用户勾了『显示已拒』」那次重拉**直接丢掉**
+        ⇒ 慢网下 checkbox 已勾选、表格却仍是默认过滤数据（实测：checked=true 但标题无「，含已拒」、
+        100 行里没有被拒行），必须再点一次才纠正 ✗
+        ⇒ 改为 **pending 标志**：飞行中再来请求就记一笔，本次完成后**补拉一次**（合并并发）。 */
+  if (TRADES_STATE.loading) { TRADES_STATE.pending = true; return; }
+  TRADES_STATE.pending = false;
+  var wrap = $("trades-wrap");
+  var box = $("trades-include-rejected");
+  var incl = !!(box && box.checked);
+  TRADES_STATE.loading = true;
+  if (wrap) { wrap.innerHTML = '<span class="empty">加载中…</span>'; }
+
+  function done() {
+    TRADES_STATE.loading = false;
+    /* ★ 飞行期间又有人要拉 ⇒ 补一次（此时 loading 已复位，不会自我递归） */
+    if (TRADES_STATE.pending) { TRADES_STATE.pending = false; loadTrades(); }
+  }
+
+  api(API.ledger + "?limit=100&include_rejected=" + (incl ? "1" : "0"))
+    .then(function (b) {
+      var d = (b && b.data) || null;
+      if (!d) {
+        if (wrap) { wrap.innerHTML = '<span class="empty">加载失败：后端不可达</span>'; }
+        done();
+        return;
+      }
+      renderTrades(d);
+      done();
+    })
+    .catch(function (err) {
+      if (window.console && window.console.error) { window.console.error("[trades] load failed", err); }
+      if (wrap) { wrap.innerHTML = '<span class="empty">加载失败：后端不可达</span>'; }
+      done();
+    });
+}
+
+/* ★★★ v17：浮层是 `position:fixed` ⇒ 必须**自己算位置**（fixed 不跟随父容器）。
+   对齐 `.info-col`（右列）的 rect ⇒ 视觉上仍"在右列里"，但**不参与**它的滚动 overflow 计算
+   ⇒ INV-66b 的 0px 余量不被吃掉（absolute 会吃掉，实测 1920×1080 撑到 1116 > 986 ✗）。
+   ★ 抽成独立函数：`resize` 时也要重算（否则打开态改窗口大小会让浮层位置/尺寸漂移）。
+   ★ 浮层已移到 `<body>` 下（不与 `.info-col` 同祖先）⇒ 即使将来有人给右列加
+     transform/filter/contain（会让 fixed 静默退化为相对该祖先）也不影响它。 */
+function positionTrades() {
+  var pop = $("trades-pop");
+  if (!pop) { return; }
+  var col = document.querySelector(".info-col") || document.querySelector('[data-testid="info-col"]');
+  if (!col || !col.getBoundingClientRect) { return; }
+  var r = col.getBoundingClientRect();
+  var pad = 4;
+  pop.style.left = Math.round(r.left + pad) + "px";
+  pop.style.top = Math.round(r.top + pad) + "px";
+  pop.style.width = Math.max(200, Math.round(r.width - pad * 2)) + "px";
+  pop.style.height = Math.max(160, Math.round(r.height - pad * 2)) + "px";
+}
+
+function openTrades() {
+  var pop = $("trades-pop");
+  if (!pop) { return; }
+  positionTrades();
+  pop.setAttribute("data-open", "1");
+  pop.setAttribute("aria-hidden", "false");
+  TRADES_STATE.open = true;
+  var a = $("tab-positions"), b = $("tab-trades");
+  if (a) { a.className = "tabbtn"; }
+  if (b) { b.className = "tabbtn active"; }
+  loadTrades();
+}
+
+function closeTrades() {
+  var pop = $("trades-pop");
+  if (!pop) { return; }
+  pop.setAttribute("data-open", "0");
+  pop.setAttribute("aria-hidden", "true");
+  TRADES_STATE.open = false;
+  var a = $("tab-positions"), b = $("tab-trades");
+  if (a) { a.className = "tabbtn active"; }
+  if (b) { b.className = "tabbtn"; }
+}
+
+function bindTradesPanel() {
+  /* ★★ ultraqa F1：**幂等 guard**。
+     本函数在 `DOMContentLoaded` 与脚本顶层各被调用一次（历史结构），
+     而内部 `tp`/`checkbox` 用的是**匿名闭包** listener —— `addEventListener` 对匿名闭包
+     **不会去重** ⇒ 勾选「显示已拒」每次 change 触发 **2 次** `/api/ledger`、
+     点「持仓」tab 触发 2 次 `closeTrades()+refreshPositions()`（实测 loadTrades 1→3→5）✗
+     ⇒ 加标记，只绑一次。`tt`（同一个命名函数引用）本来就被 DOM 规范去重，不受影响。 */
+  if (TRADES_STATE.bound) { return; }
+  TRADES_STATE.bound = true;
+  var tp = $("tab-positions"), tt = $("tab-trades");
+  if (tp) { tp.addEventListener("click", function () { closeTrades(); refreshPositions(); }); }
+  if (tt) { tt.addEventListener("click", openTrades); }
+  var cl = $("trades-close");
+  if (cl) { cl.addEventListener("click", closeTrades); }
+  var box = $("trades-include-rejected");
+  if (box) { box.addEventListener("change", function () { if (TRADES_STATE.open) { loadTrades(); } }); }
+  /* ★ code-review 建议2：浮层是 fixed + 打开时**只算一次** rect ⇒ 打开状态下改窗口大小
+     会让它位置/尺寸漂移（太大时底部行要滚动，而浮层高度已超出视口）。
+     这里在 resize 时重算（只重定位，不重拉数据，避免多余请求）。 */
+  window.addEventListener("resize", function () { if (TRADES_STATE.open) { positionTrades(); } });
 }
 
 function renderRisk(data) {
@@ -1383,15 +1610,14 @@ setInterval(autoRefreshTick, POLL_TICK_MS);
 window.addEventListener("DOMContentLoaded", function () {
   refreshAll();
   initCollapse();
+  bindTradesPanel();            /* ★ v17：交易记录 tab 绑定 */
 });
 refreshAll();
 initCollapse();
+bindTradesPanel();              /* ★ v17：脚本已就位时立即绑定 */
 /* ★★ v11：**页面打开后自动把账户推进到当前交易日**。
-   ★★★ 必须用 setTimeout，**不能** 
-efreshAll().then(...) ——
-     
-efreshAll() **不返回 Promise**（它只是并发发起几个请求）✗
-     链 .then 会抛 TypeError: Cannot read properties of undefined，
+   ★★★ 必须用 setTimeout，**不能** refreshAll().then(...) ——
+      refreshAll() **不返回 Promise**（它只是并发发起几个请求）✗
      把整个初始化脚本打断（initCollapse() 都不执行 ⇒ 折叠默认值全错）。
      ★ 这是 poll_probe（node 跑真实前端脚本）抓到的真 runtime bug，不是测试问题。
    ★ 延迟 1.5s：让首屏几个请求先回来，避免自动结算和首屏抢网络。 */

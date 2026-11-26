@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import math
 import os
 from datetime import datetime
@@ -87,6 +88,49 @@ def state_path(cfg: AppConfig) -> str:
 
 def ledger_path(cfg: AppConfig) -> str:
     return os.path.join(cfg.root, STATE_DIR, LEDGER_FILE)
+
+
+def read_ledger_rows(cfg: AppConfig) -> list[dict[str, Any]]:
+    """读 ``data/ledger.jsonl`` 的**全部**行（**不排序**、跳过坏行）。
+
+    ★ v17：交易记录面板的数据源。设计取舍：
+      * **只读文件** —— 不取写锁、不构造 ``DataSource`` ⇒ 天然不触发 INV-42
+        （这正是 v13/v12 里 `close` 在锁内取价被拒的同类风险，本函数刻意绕开）；
+      * **不排序** —— 排序交给端点/调用方，便于同一份数据按不同视图复用；
+      * **坏行跳过** —— 一行脏数据不得让整个端点 500；
+      * **文件缺失 ⇒ ``[]``** —— 空台账是合法状态，不是错误。
+
+    ★ 被拒单**不做过滤**（端点按 ``include_rejected`` 决定），保留全部原始信息。
+    """
+    path = ledger_path(cfg)
+    rows: list[dict[str, Any]] = []
+    # ★★ 编码健壮性（code-review B2 / ultraqa F2 独立命中的同一缺陷）：
+    #   * `errors="replace"` —— ledger 是 append-only 且可能被**突然断电/杀进程**撕裂写入，
+    #     留下半个多字节字符（非法 UTF-8）。严格解码会在**行迭代器**里抛 `UnicodeDecodeError`
+    #     （它在下面行级 try 之外）⇒ 冒到路由层变成 400/500 ⇒ 整个交易记录面板「加载失败」✗
+    #     实测：`b'\xff\xfe'` 一行就让 `/api/ledger` 返回 400。
+    #   * `encoding="utf-8-sig"` —— 顺带吞掉文件头 BOM；否则首条**合法**记录会因
+    #     `\ufeff` 前缀让 `json.loads` 失败而被静默丢弃（ultraqa FL1 实测 count 少 1）。
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (TypeError, ValueError):
+                    continue  # 坏行跳过
+                if isinstance(obj, dict):
+                    rows.append(obj)
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeError) as exc:
+        # 权限/IO/残余编码问题都不该让端点崩：返回**已读到的部分**，并留一条可排查的日志
+        logging.warning("read_ledger_rows 读取中断（%s）：%r → 返回已读 %d 行",
+                        path, exc, len(rows))
+        return rows
+    return rows
 
 
 # --------------------------------------------------------------------------- #

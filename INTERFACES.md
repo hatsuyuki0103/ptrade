@@ -1348,3 +1348,13 @@ const DEFAULT_VISIBLE_BARS = { daily: 120, weekly: 260, monthly: 60 };  // 近�
 * ★ 两个 `dataZoom` 组件（`inside` / `slider`）**必须用同一对** ⇒ 天然同步；
 * ★ **`filterMode:"filter"` 必须显式写**（ECharts 5.5.1 的默认确实是 filter，但**显式才叫契约**）；
 * 新股不足默认窗口时 `startIndex = 0` ⇒ 全显示（不得出现负值/空图）。
+
+* `GET /api/ledger` —— **交易记录（逐笔流水）**（v17 新增）
+  * 参数：`limit`（默认 50，钳到 [1,500]）/ `include_rejected`（`1`/`true`/`yes`/`on`）
+    / `code`（精确匹配）
+  * 返回：`{orders, count, total_lines, include_rejected, limit}`
+  * ★ 只读 `data/ledger.jsonl`：**不取写锁、不构造 DataSource** ⇒ 不触发 INV-42
+  * ★ 默认过滤 `status == "rejected"` 的委托（UI 有「显示已拒」开关）
+  * ★ 排序：`trade_date` 降序，同日 `order_id` 降序（最新在上）
+  * ★ 健壮性：坏行跳过、非法 UTF-8 用 `errors="replace"`、BOM 用 `utf-8-sig`、
+    文件缺失 ⇒ `[]`（不是错误）

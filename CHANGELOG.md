@@ -2,6 +2,117 @@
 
 本文件记录 ptrade 的版本变更。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.22.0] — 2026-11-25
+
+**主题：v17 —— 新增「交易记录」面板（逐笔流水：哪天哪个价位买、哪天哪个价位卖）**
+
+### 用户需求（真源）
+```
+/autopilot 我还想要个面板 ，看我的交易记录，哪一天哪个价位买的，和哪一天哪个价位卖的之类的面板。
+看看该怎么加进去
+```
+用户裁决（访谈确认）：① 放**「持仓」面板内 tab** ② 粒度 = **逐笔流水** ③ **被拒委托默认隐藏 + 开关**
+
+### ★★★ 最硬的约束：右列剩余余量 = **0px**
+真实 Chrome 4 档视口实测（`tests/_cdp.py`）：
+```
+1600x900 : infoCol scrollH=848 == clientH=848   ⇒ 余量 0
+1920x945 : 893 == 893                           ⇒ 余量 0
+1920x1080: 1028 == 1028                         ⇒ 余量 0
+2560x1440: 1388 == 1388                         ⇒ 余量 0
+```
+判据 `test_ui_layout_v4.py`（INV-66b，28 条）⇒ **任何新增高度都会全红**。
+而「持仓 0 行」只有 ~20px、交易记录 9 行 ~216px ⇒ **原地切换内容必然撑高** ✗
+
+⇒ 设计成：**tab 按钮放标题行**（复用「自选池」卡的 `<h2 style="margin:0">` 模式，
+比原来的 `<h2>持仓</h2>`（默认 `margin:0 0 6px`）**更省高度**）+ **`position:fixed` 浮层**
+（脱离 `.info-col` 的布局）+ 默认 `display:none` + **浮层挂在 `<body>` 下**。
+
+★ 为什么是 `fixed` 而不是 `absolute`（实测发现）：
+absolute 的元素当 containing block **同时是滚动容器**（`.info-col` 有 `overflow-y:auto`）时，
+其溢出**仍会计入该容器的 `scrollHeight`** ⇒ 1920×1080 点开后 986 → **1116** ⇒ 破 INV-66b。
+`fixed` 相对视口定位，不参与任何滚动容器的溢出计算 ⇒ 真正 0px。
+
+### 改动
+**A. `ptrade/service.py`** — 新增 `read_ledger_rows(cfg)`
+* **只读** `data/ledger.jsonl`：不取写锁、不构造 `DataSource` ⇒ 天然不触发 INV-42
+* 逐行 `json.loads`，**坏行跳过**（一行脏数据不得让端点 500）；**不排序**（交给调用方复用）
+* 文件缺失 ⇒ `[]`（空台账合法，不是错误）
+* ★★ **编码健壮性**：`encoding="utf-8-sig", errors="replace"` + `except (OSError, UnicodeError)`
+  * `errors="replace"`：ledger 是 append-only，**突然断电/被杀进程**会在多字节字符中间撕裂写入，
+    留下非法 UTF-8 ⇒ 严格解码时 `UnicodeDecodeError` 在**行迭代器**里抛（在行级 try 之外）
+    ⇒ 冒到路由层变 400/500 ⇒ 整个面板「加载失败」✗（实测 `b"\xff\xfe"` 一行即触发）
+  * `utf-8-sig`：顺带吞 BOM，否则首条**合法**记录会因 `\ufeff` 前缀被静默丢弃
+  * 中断时 `logging.warning` + **返回已读部分**（不再静默伪装成「暂无交易记录」）
+
+**B. `ptrade/webapp.py`** — 新增 `api_ledger` + 路由 `GET /api/ledger`
+* 参数 `limit`（默认 50，**钳到 [1, 500]**）/ `include_rejected` / `code`
+* 默认过滤 **`status != "rejected"`**（不是 `== "filled"`：将来新增 partial/cancelled 不会被静默隐藏）
+* 排序**最新在上**（`trade_date` 降序，同日 `order_id` 降序）
+* 返回五要素 `{orders, count, total_lines, include_rejected, limit}`
+* ★★ **`parse_qs` 的值永远是 list** —— 必须解包（`_q1()`），否则 `str(["600594"])` → `"['600594']"`
+  ⇒ `code`/`include_rejected` **静默失效**（第一版就踩了，实测才发现）
+
+**C. `ptrade/webui.py`**
+* CSS：`.trades-pop{position:fixed;display:none;…}` + `.trades-pop[data-open="1"]{display:flex}`
+  + `#trades-wrap{flex:1;min-height:0;overflow-y:auto}` + sticky 表头
+* DOM：持仓卡标题行改 `row` + `<h2 style="margin:0">持仓</h2>` + 两个 tab；
+  浮层 `<div class="trades-pop" id="trades-pop">`（★ **不是** `.card`/`section`/`article` ——
+  `test_v4_l5` 的 `infoCards` 判据取这三个选择器，被当成卡片会触发「重叠」断言），
+  挂在 **`</main>` 之后 / `<body>` 下**（结构上消除「祖先加 transform 会让 fixed 退化」的风险）
+* JS：`renderTrades`（8 列：日期/代码名称/方向/数量/价格/金额/盈亏/状态）、`positionTrades`、
+  `openTrades`/`closeTrades`、`loadTrades`、`bindTradesPanel`
+  * 价格 `toFixed(4)`（成交价常有 4 位小数如 4.4322，用 2 位会失真）
+  * 方向中文化映射；空态「暂无交易记录」
+  * `bindTradesPanel` **幂等 guard**（它在 `DOMContentLoaded` 与顶层各被调一次，
+    而匿名闭包 listener 不会被 DOM 去重 ⇒ 否则勾选一次会**发 2 次请求**）
+  * `loadTrades` **并发去重 + pending 补拉**（去重不能丢最后一次：飞行中勾选要补拉，
+    否则慢网下 checkbox 已勾选但表格仍是默认过滤数据）
+  * `resize` 时 `positionTrades()` 重算 rect（fixed 不随窗口自适应）
+  * 标题显示「**显示 N / 共 M 笔**」（超过 limit 时截断可见）
+
+**D. 顺手修 v11 遗留的注释损坏**
+`webui.py` 里一段注释被早期 PowerShell heredoc 吃掉 `r`（`refreshAll` → `efreshAll`，9 处假阳性中
+真正坏的是 2 处）。纯注释、无行为影响，但会误导读者 ⇒ 修好。
+
+### 判据（`tests/test_v17_trade_log.py`，17 条）
+* **V17-1..7**：端点五要素 / 默认过滤被拒 / `include_rejected=1` 含已拒 / `limit` 钳制
+  （0→1、10000→500、abc→50、3→3）/ 排序 / `code` 过滤 / 文件缺失⇒`[]`
+* **V17-8**：坏行跳过（非 JSON / 非 dict / 空行）
+* **V17-8b**：★ **非法 UTF-8 字节** ⇒ 仍 200 且 5 笔好行全在（不再 400/500）
+* **V17-8c**：★ **BOM** ⇒ 首条合法记录不丢
+* **V17-9**：`/api/ledger` **只读**（`state.json` 字节 + mtime 双校验不变）
+* **V17-10**：页面结构契约（tab/浮层/`position:fixed` 正则/`data-open="0"`/浮层在 `</main>` 后/
+  幂等 guard/pending 补拉）—— ★ **永远跑**，不受 CDP 可用性影响
+* **V17-11**：`api_ledger` **不用 `_ds()`/`DataSource`**（源码断言）
+* **V17-12**：★★ **INV-66b 回归**（4 档视口）：
+  * 默认态 `infoColScrollH <= infoColClientH`
+  * ★ **原子单帧测量**：同一次 `Runtime.evaluate` 里 `折叠 analysis → 量 before → openTrades() → 量 after`，
+    断言 `after <= before + 1`（两次读之间**没有事件循环间隙** ⇒ analysis 轮询插不进来）
+  * 顺带验浮层几何：`position==="fixed"` / `display==="flex"` / 尺寸非 0 / 在视口内
+
+### 已知限制（诚实声明）
+1. **真实窗口拖拽 resize 的端到端像素验证未做**：CDP 驱动不支持同页 mid-session 改视口，
+   改用「`.info-col` 布局位移 + 派发 `resize` 事件」代理验证重定位路径（偏差 4.34px ✓）。
+2. **台账 10 万行（31.9MB）时每次请求 ~700ms**：端点每次全量读文件再排序后切片，无缓存。
+   当前台账 12 行无影响；将来真上万行需增量/缓存。
+
+### 双闸证据
+```
+code-review    APPROVE · 架构 CLEAR（两轮：首轮 APPROVE_WITH_CHANGES/WATCH → 修完升 CLEAR）
+ultraqa        PASS_WITH_FINDINGS（首轮 2 MEDIUM → 复测全部修好）
+tests/test_v17_trade_log.py        17 passed（0 skip）
+tests/test_ui_layout_v4.py         28 passed（INV-66b 4 档，浮层移 body 后复验）
+```
+
+### 双闸**独立命中**的同一批真缺陷（非测试问题）
+1. **`parse_qs` 值永远是 list** 未解包 ⇒ `code`/`include_rejected` 静默失效
+2. **`read_ledger_rows` 的 `UnicodeDecodeError` 逃逸** ⇒ `/api/ledger` 400/500（两道闸各自独立发现）
+3. **`bindTradesPanel` 双绑** ⇒ 勾选一次发 2 次请求
+4. **`loadTrades` 去重丢弃最后一次** ⇒ 慢网下「勾了但没生效」（两道闸独立发现）
+5. **`position:absolute` 的溢出仍计入滚动容器 `scrollHeight`** ⇒ 1920×1080 撑到 1116 > 986
+6. **`measure()` 有副作用** ⇒ 触发图表 → 分析轮询 → `analysis` 卡在两次测量之间自动展开（+308px）
+
 ## [1.21.0] — 2026-11-20
 
 **主题：v13 —— 修图表 tooltip 在「切换分时 / 加载图表」时的 TypeError 崩溃（含一个白屏阻塞缺陷）**

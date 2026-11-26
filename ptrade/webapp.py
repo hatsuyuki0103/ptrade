@@ -901,6 +901,61 @@ class WebApp:
             "state_path": _svc().state_path(self.cfg),
         }))
 
+    def api_ledger(self, query, body) -> Response:
+        """交易记录（逐笔流水）—— **只读** ``data/ledger.jsonl``。
+
+        v17 用户需求：「看我的交易记录，哪一天哪个价位买的，和哪一天哪个价位卖的」。
+
+        ★ 设计要点：
+          * **不构造 DataSource、不取写锁** ⇒ 天然避开 INV-42（锁内禁网）；
+          * 默认**过滤掉被拒委托**（台账里有 `price=0.0` 的失败单，混进来会误导）；
+          * `limit` 宽松解析：非法值回落 50、并钳到 [1, 500]（查询串来自浏览器，不可信）；
+          * 排序 **最新在上**（`trade_date` 降序，同日按 `order_id` 降序）——
+            交易记录天然按时间倒序阅读。
+        """
+        # ---- ★★ 查询参数必须**先解包 list** ----
+        # `urlparse` + `parse_qs` 返回的**永远是 list**：`?code=600594` ⇒ `{"code": ["600594"]}`。
+        # 不解包时 `str(["600594"])` 变成 `"['600594']"` ⇒ 与任何 code 都不相等 ⇒ 静默返回 0 条 ✗
+        # （本文件 L228 已有同类警告；第一次实现我就是漏了这一步，实测 `include_rejected`/`code` 都失效。）
+        def _q1(key: str) -> str:
+            v = query.get(key)
+            if isinstance(v, (list, tuple)):
+                v = v[0] if v else ""
+            return "" if v is None else str(v)
+
+        raw = _q1("limit")
+        try:
+            limit = int(raw) if raw else 50
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(500, limit))
+
+        include_rejected = _q1("include_rejected").strip().lower() in ("1", "true", "yes", "on")
+        code = _q1("code").strip()
+
+        rows = _svc().read_ledger_rows(self.cfg)
+        if not include_rejected:
+            # ★ code-review 建议3：语义是「**被拒委托**默认隐藏」⇒ 过滤 `!= "rejected"`，
+            #   而不是 `== "filled"`。今天两者等价（core 只有 filled/rejected 两种 status），
+            #   但将来若新增 partial/cancelled，`== "filled"` 会把它们**静默隐藏**。
+            rows = [r for r in rows if str(r.get("status") or "") != "rejected"]
+        if code:
+            rows = [r for r in rows if str(r.get("code") or "") == code]
+        total = len(rows)
+        rows.sort(
+            key=lambda r: (str(r.get("trade_date") or ""), str(r.get("order_id") or "")),
+            reverse=True,
+        )
+        return Response(200, _envelope("ledger", {
+            "orders": rows[:limit],
+            "count": min(total, limit),
+            "total_lines": total,
+            "include_rejected": include_rejected,
+            "limit": limit,
+            # ★ code-review 建议10：不再回显 `ledger_path`（绝对路径属信息暴露面；
+            #   本地面板虽风险低，但网关化部署后会变成隐患）。
+        }))
+
     def api_risk(self, query, body) -> Response:
         """与 ``risk --json`` 同构（engine.risk_report 优先，core 兜底）。"""
         state = self._read_state()
@@ -1656,6 +1711,9 @@ class WebApp:
             return self.api_live_state(query, body)
         if path == "/api/positions":
             return self.api_positions(query, body)
+        # ★ v17：交易记录（逐笔流水）。**只读文件、不用 ds、不取写锁** ⇒ 无 INV-42 风险。
+        if path == "/api/ledger":
+            return self.api_ledger(query, body)
         if path == "/api/risk":
             return self.api_risk(query, body)
         if path == "/api/search":
