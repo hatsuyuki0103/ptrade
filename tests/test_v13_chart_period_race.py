@@ -47,10 +47,10 @@ def _run_node(source: str) -> dict:
         (work_p / "chart_option.mjs").write_text(CHART_OPTION_JS.read_text(encoding="utf-8"), encoding="utf-8")
         entry = work_p / "entry.mjs"
         entry.write_text(source, encoding="utf-8")
-        p = subprocess.run([NODE, str(entry)], capture_output=True, text=True, timeout=120)
+        p = subprocess.run([NODE, str(entry)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         if p.returncode != 0:
             raise AssertionError(f"node 执行失败 rc={p.returncode}\nstdout={p.stdout[:800]}\nstderr={p.stderr[:2000]}")
-        return json.loads(p.stdout.strip().splitlines()[-1])
+        return json.loads((p.stdout or "").strip().splitlines()[-1])
 
 
 def _make_payload(period: str = "daily", n: int = 3) -> dict:
@@ -312,10 +312,10 @@ def _run_node_raw(script: str) -> dict:
     with __import__("tempfile").TemporaryDirectory(prefix="v13b1-", dir=r"D:\pytest-bt") as work:
         f = pathlib.Path(work) / "m.mjs"
         f.write_text(script, encoding="utf-8")
-        p = subprocess.run([NODE, str(f)], capture_output=True, text=True, timeout=120)
+        p = subprocess.run([NODE, str(f)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         if p.returncode != 0:
             raise AssertionError(f"node 失败：{(p.stderr or '')[:1500]}")
-        return json.loads(p.stdout.strip().splitlines()[-1])
+        return json.loads((p.stdout or "").strip().splitlines()[-1])
 
 
 def _run_chart_state_machine(body_js: str) -> dict:
@@ -405,5 +405,5 @@ def test_v13_9_chart_option_js_syntax_ok():
     with __import__("tempfile").TemporaryDirectory(prefix="v13syn-", dir=r"D:\pytest-bt") as work:
         f = pathlib.Path(work) / "x.mjs"
         f.write_text(CHART_OPTION_JS.read_text(encoding="utf-8"), encoding="utf-8")
-        p = subprocess.run([NODE, "--check", str(f)], capture_output=True, text=True, timeout=60)
+        p = subprocess.run([NODE, "--check", str(f)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
         assert p.returncode == 0, (p.stderr or "")[:1500]

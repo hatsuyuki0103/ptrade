@@ -1349,12 +1349,15 @@ const DEFAULT_VISIBLE_BARS = { daily: 120, weekly: 260, monthly: 60 };  // 近�
 * ★ **`filterMode:"filter"` 必须显式写**（ECharts 5.5.1 的默认确实是 filter，但**显式才叫契约**）；
 * 新股不足默认窗口时 `startIndex = 0` ⇒ 全显示（不得出现负值/空图）。
 
-* `GET /api/ledger` —— **交易记录（逐笔流水）**（v17 新增）
-  * 参数：`limit`（默认 50，钳到 [1,500]）/ `include_rejected`（`1`/`true`/`yes`/`on`）
-    / `code`（精确匹配）
-  * 返回：`{orders, count, total_lines, include_rejected, limit}`
-  * ★ 只读 `data/ledger.jsonl`：**不取写锁、不构造 DataSource** ⇒ 不触发 INV-42
-  * ★ 默认过滤 `status == "rejected"` 的委托（UI 有「显示已拒」开关）
-  * ★ 排序：`trade_date` 降序，同日 `order_id` 降序（最新在上）
-  * ★ 健壮性：坏行跳过、非法 UTF-8 用 `errors="replace"`、BOM 用 `utf-8-sig`、
-    文件缺失 ⇒ `[]`（不是错误）
+### 静态资源的缓存策略（v18 修订）
+
+* `/vendor/echarts.min.js`（1 MB，几乎不变）—— `Cache-Control: public, max-age=86400`（长缓存）
+* `/static/chart_option.js`（**代码**，随版本变）—— `Cache-Control: no-cache`（每次用前 revalidate）
+  * ★ 页面里的引用必须带**内容指纹**：`/static/chart_option.js?v=<version>-<sha256[:12]>`
+  * ★ 为什么：旧策略给该文件也设了 `max-age=86400` 且无 ETag ⇒ 浏览器 1 天内不发请求
+    ⇒ 发版后用户**普通刷新拿不到新版**（只有 Ctrl+F5 才行）。
+  * ★ 用**内容哈希**而不只是版本号：开发副本的 `pyproject.toml` 版本号长期是 `1.0.0`
+    （只有发布镜像才 bump）⇒ 单用版本号做 cache-bust 在开发副本里失效。
+* 动态 `/api/*` 响应 —— `Cache-Control: no-store`（账户数据绝不落缓存）
+* 实现：`Response.cache_control`（可选字段，加在末尾有默认值）由 HTTP 层优先采用，
+  否则回落到既有按 `content_type` 判断的逻辑。

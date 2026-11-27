@@ -2,6 +2,111 @@
 
 本文件记录 ptrade 的版本变更。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+
+
+## [1.23.0] — 2026-11-26
+
+**主题：v18 —— 修 K 线「滚轮缩放 + 左右平移 + 再缩放」后线条乱飞（`smooth` 样条过冲）**
+
+### 用户实测（真源）
+```
+/autopilot 滚轮缩放过后，再进行左右挪动，再缩放，k线有时候特别乱，你需要帮我修复这个bug
+```
+补充复现（决定性）：
+```
+能复现了，日线，我滚轮往下滑，缩放到一定程度，就会这样。
+```
+截图时间轴 **2022-08-17 → 2026-08-05（约 1000 根）**，面板 ① 的均线叠成一团。
+
+### 首要嫌疑（**已按用户裁决修复**，但严格说属「高置信度推断 + 结构性根除」，不是像素级复现取证）：
+### `smooth:true` 的样条控制点外推
+`chart_option.js` 里 `smooth:true` **恰好 4 处** = `MA12/24/48/96`，**全在面板 ①**
+（全文件 `type:"line"` 共 11 条，`VOL MA5/MA10` 本来就是直线 ⇒ 这解释了「为什么只炸面板 ①」）。
+
+ECharts 的 `smooth:true` = Catmull-Rom / cardinal **样条插值**，控制点由相邻点**外推**求得。
+**用户场景**：缩到很远时（~1000 根压进 ~950 px），相邻数据点的像素间距 ≈ 1 px。
+样条过冲幅度与该间距成正比 ⇒ 表现为**密集折返 / 锯齿状乱线**
+⇒ 4 条均线叠起来看起来像「无数条线」⇒ 乱成一团 ✗
+数据平坦 / 放大时样条也看不出异常 ⇒ 这就是用户说的**「有时候」**。
+
+★ **诚实边界（评审要求）**：本轮**没有**做「修复前 vs 修复后」的像素级/截图对比
+（用户截图那次用的还是旧 JS，无法作为修复后证据）。所以措辞是：
+`smooth:true` 是全仓**唯一**可疑的样条配置、且用户裁决的方向（改直线段）**结构上不可能过冲** ⇒
+按「首要嫌疑 + 结构性根除」记录，**保留「用户在新 URL 上确认」为最终验收项**。
+（反证部分是可复现的：CDP 读内部 model 证明缩放序列的 window/extent/series count 全程同步、零累积，
+且 `animation:false` ⇒ 排除了 series 叠加 / min-max 冲突 / 轮询重绘 / 动画抖动四个候选。）
+
+### ★★ 顺带修掉「修复看不到」的严重问题：静态资源缓存
+`/static/chart_option.js` 原以 `Cache-Control: public, max-age=86400` **且无 ETag** 返回
+⇒ 浏览器**1 天内根本不发请求** ⇒ 普通刷新**永远拿旧 JS**，只有 Ctrl+F5 硬刷新才看得到改版
+（实测：用户截图里线条依旧乱，而磁盘文件已是新版）。
+**两层修**：
+* **URL 加内容指纹**（🔑 唯一能**立即**绕过用户已缓存副本的办法）：
+  `from "/static/chart_option.js?v=<version>-<sha256(chart_option.js)[:12]>"`。
+  ★ 用**内容哈希**而不只是版本号：本仓库**开发副本**的 `pyproject.toml` 版本号长期停在 `1.0.0`
+  （只有发布镜像才 bump）⇒ 单用版本号在开发副本里 cache-bust **失效** ✗；
+  内容哈希则「只要文件字节变了 URL 就变」，开发/发布两种场景都正确 ✓。
+* **响应头改 `no-cache`**（长期正确）：`chart_option.js` 是**代码**，随版本变，不该长缓存。
+  `no-cache` ≠ 不缓存，而是「每次用前 revalidate」；本服务无 ETag ⇒ 会 200 重下 18 KB（可接受）。
+  ★ `echarts.min.js`（1 MB 且几乎不变）**保持** `max-age=86400`，性能不受影响。
+
+### 改动
+**A. `ptrade/webui_assets/chart_option.js`**
+* **R1**：删掉 4 条均线的 `smooth:true` ⇒ **直线段**。三条理由（已写进注释，防未来有人「优化」回去）：
+  ① 均线本质是**折线**，直线段是行业标准（同花顺/东方财富均如此）；
+  ② 直线段**几何上不可能**超出相邻数据点的取值范围 ⇒ 过冲**结构上根除**，不靠调参；
+  ③ 判据 V18-1 钉住「所有 line series 不得有 truthy `smooth`」。
+  ★ 注释里也写明：若将来真要「美化」成曲线，请用 `smooth:0.2` 这类小幅值并**补一条过冲判据**。
+* **R2**：`series.forEach` 兜底给**所有** series 显式 `clip:true`（+ 迷你 K 线工厂 `clip:true`）。
+  不依赖 ECharts 默认值 ⇒ 本图 6 个 panel 上下紧贴，一条失控的线**不会串到隔壁**。
+* **R3**：两个 `dataZoom`（inside + slider）都加 `minValueSpan:5`
+  ⇒ 防「缩到 1~2 根」时蜡烛被拉到整屏宽、均线退化成单段直线的极端渲染。
+
+**B. `ptrade/webui.py`** —— cache-busting
+* ESM import 改 `?v=__PTRADE_VER__`；模块末用 `sha256(chart_option.js)[:12]` + `__version__` 替换。
+* ★ 判据安全性：`test_webui.py::test_u1_no_external_refs` 用**子串**匹配
+  （`any(a in r for a in allowed)` + `"/static/chart_option.js" in APP_HTML`）⇒ 加 `?v=` 后仍通过 ✓
+
+**C. `ptrade/webapp.py`** —— 逐响应缓存策略
+* `Response` 新增可选字段 `cache_control: str | None = None`（加在**末尾且有默认值** ⇒ 不影响既有位置参数构造）。
+* HTTP 层**优先采用**该字段，否则回落到既有逻辑（JS ⇒ 长缓存 / 其它 ⇒ `no-store`）。
+* `vendor_asset(name, *, revalidate=False)`；`/static/chart_option.js` 传 `revalidate=True` ⇒ `no-cache`。
+
+**D. 判据 `tests/test_v18_chart_zoom.py`（7 条）**
+* **V18-1** ★★ 用 **1200 根剧烈锯齿**数据（= 用户真实场景的密度）**真调 `buildOption`**，
+  断言所有 `type:"line"` 无 truthy `smooth`；并反向确认 MA 四条**仍在**（不许用删 series 消灭过冲）、
+  数据真的灌满 1200 根（防「空数组」式假修复）
+* **V18-2** 所有绘制型 series **显式** `clip === true`
+* **V18-3** 两个 dataZoom 都有数字 `minValueSpan >= 2`
+* **V18-4** ★★ 真 Chrome 跑「缩放→平移→缩放→平移→缩放」序列，读 **ECharts 内部 model**：
+  6 个 grid rect 有效、6 个 xAxis extent 彼此一致、所有 series 点数 == 窗口根数、
+  **渲染态** line series 无 `smooth`
+  ★ 如实声明：用 `dispatchAction` 模拟而非真鼠标手势（CDP `measure` 不提供滚轮输入）
+* **V18-5** `node --check` 语法
+* **V18-6** ★ 页面 URL 必须带**内容指纹**、占位符不得残留、
+  且指纹**真的等于**当前 `chart_option.js` 的 sha256 前缀（防硬编码一个常量糊过去）
+* **V18-7** ★ `chart_option.js` 的 `cache_control` 必须是 `no-cache`；
+  `echarts.min.js` **不得**被覆盖（1 MB 大文件要保持长缓存）
+
+### 排查过程中被**证伪**的假设（可复现，记录备查）
+CDP 读 ECharts 内部 model 实测「缩放→平移→缩放→平移→缩放」：
+`dataZoom` 窗口 120→40→40→25→26→15 根，而 6 个轴 extent、18 条 series 点数**全程同步、零累积**
+⇒ 排除：
+* ✗ `xAxis.min:"dataMin"/max:"dataMax"` 与 dataZoom 冲突（实测无冲突）
+* ✗ series 重复叠加（`setOption(option, true)` 全项目仅一处；series 恒 18 条）
+* ✗ 轮询重绘图表（`refreshAll()` **不含**图表，5s 轮询只刷账户/风险/自选/持仓）
+* ✗ ResizeObserver 重绘（`CHRO_CT` 只做 `CHART.resize()`）
+
+### 测试
+```
+tests/test_v18_chart_zoom.py              7 passed
+图表相关面（chart_v2/v6/v8/v13/webui/dom）  126 passed / 1 skipped / 1 failed
+★ 唯一失败 `test_chart_v2::test_m1_today_bar_reason_three_states` 是 **pre-existing 日期敏感**：
+  `assert '2026-10-09' == '2026-11-26'` —— `data/fixture` 快照 asof 固定 2026-10-09，
+  而测试要求「今天」（2026-11-26）。已用 `git stash` 回到 v1.21.0 基线**逐字复现同样的失败**
+  ⇒ 与 v18 零关系。（同类共 7 条，见 v1.22.0 的说明。）
+```
+
 ## [1.22.0] — 2026-11-25
 
 **主题：v17 —— 新增「交易记录」面板（逐笔流水：哪天哪个价位买、哪天哪个价位卖）**

@@ -303,7 +303,7 @@ th,td{padding:2px 6px}
 /* ★ V3-W1（task-36）：K 线 option 的**唯一真源**是 `chart_option.js`（ESM，服务端原样返回）。
    本模块只把它挂到 `window` 上供经典脚本调用 —— **绝不在这里写第二份 option 构建器**
    （INV-65 / `T-V3-19` 会扫全仓断言「只有一份」）。 */
-import { buildOption, buildIntradayOption, miniCandlestick } from "/static/chart_option.js";
+import { buildOption, buildIntradayOption, miniCandlestick } from "/static/chart_option.js?v=__PTRADE_VER__";
 window.buildOption = buildOption;
 window.buildIntradayOption = buildIntradayOption;
 window.miniCandlestick = miniCandlestick;
@@ -1626,3 +1626,30 @@ setTimeout(autoSettleOnLoad, 1500);
 </body>
 </html>
 """
+
+from ptrade import __version__
+
+
+# ★★★ v18：cache-busting —— 给 `/static/chart_option.js` 的 URL 加**内容指纹**。
+#
+# 为什么必须修：该资源原以 `Cache-Control: public, max-age=86400` 返回且**无 ETag**
+# ⇒ 浏览器 1 天内**根本不发请求** ⇒ 普通刷新永远拿旧 JS。
+# 用户实测「修复没生效」就是这么来的（只能 Ctrl+F5 硬刷新才看得到）。
+#
+# ★ 为什么用**内容哈希**而不只是版本号：本仓库的**开发副本** `pyproject.toml` 版本号
+#   长期停在 1.0.0（只有发布镜像才 bump）⇒ 单用版本号做 cache-bust **在开发副本里失效** ✗
+#   内容哈希则**只要文件字节变了 URL 就变** ⇒ 开发/发布两种场景都正确 ✓
+#
+# ★ 判据安全性：`test_webui.py::test_u1_no_external_refs` 用**子串**匹配
+#   （`any(a in r for a in allowed)` 与 `/static/chart_option.js in APP_HTML`），
+#   加 `?v=` 后仍然通过 ✓
+import hashlib as _hashlib
+import pathlib as _pathlib
+
+_CHART_JS_FILE = _pathlib.Path(__file__).with_name("webui_assets") / "chart_option.js"
+try:
+    _CHART_JS_DIGEST = _hashlib.sha256(_CHART_JS_FILE.read_bytes()).hexdigest()[:12]
+except OSError:                      # 文件缺失不该让整个页面导不进来
+    _CHART_JS_DIGEST = "0"
+_APP_VERSION_TAG = "{}-{}".format(__version__, _CHART_JS_DIGEST)
+APP_HTML = APP_HTML.replace("__PTRADE_VER__", _APP_VERSION_TAG)

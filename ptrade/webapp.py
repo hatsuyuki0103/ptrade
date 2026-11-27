@@ -200,6 +200,11 @@ class Response:
     payload: dict | None = None
     body: bytes | None = None
     content_type: str = "application/json; charset=utf-8"
+    # ★★ v18：**逐响应**覆盖 Cache-Control。``None`` = 沿用 HTTP 层的既有默认
+    #   （application/javascript ⇒ 长缓存；其它 ⇒ no-store）。
+    #   为什么要这个字段：`chart_option.js` 是**代码**、随版本变，不能跟 1 MB 的 echarts
+    #   共用 86400 长缓存 —— 那会让用户在发版后**普通刷新拿不到修复**（本 bug 实测踩过）。
+    cache_control: str | None = None
 
     def json_bytes(self) -> bytes:
         assert self.payload is not None
@@ -638,7 +643,7 @@ def start_startup_maintenance(cfg, offline: bool) -> threading.Thread:
     return thread
 
 
-def vendor_asset(name: str) -> Response:
+def vendor_asset(name: str, *, revalidate: bool = False) -> Response:
     """V3-A5：**本地** vendored 静态资源 —— 零 CDN（`INV-59` 同族；`T-V3-10c` 的落点）。
 
     ★ **白名单**（防路径穿越）：只允许下表的文件名，任何 `..`/绝对路径一律 404。
@@ -653,8 +658,23 @@ def vendor_asset(name: str) -> Response:
     target = allowed.get(name)
     if target is None or not target.is_file():
         return Response(404, _envelope("vendor", None, error=f"未知静态资源 {name!r}"))
-    return Response(200, body=target.read_bytes(),
-                    content_type="application/javascript; charset=utf-8")
+    # ★★ v18（code-review 建议1）：**堵住长缓存后门**。
+    #   `chart_option.js` 同时可从 `/vendor/chart_option.js` 与 `/static/chart_option.js` 取到
+    #   （`allowed` 白名单里两个路由共用它）。旧代码里 `/vendor/` 那条走默认 `revalidate=False`
+    #   ⇒ 同一份**代码**资源有**两条路径、两种缓存策略** ⇒ 任何旧代码/收藏访问 `/vendor/...`
+    #   仍会拿到 1 天前的旧 JS，修复"又看不到"。
+    #   ⇒ 在这里**强制**：只要 name 是代码资源就 revalidate，不管调用方传什么。
+    #   ★ 单一真相：以后即使新增路由忘了传参数，也不会漏。
+    if name == "chart_option.js":
+        revalidate = True
+    return Response(
+        200, body=target.read_bytes(),
+        content_type="application/javascript; charset=utf-8",
+        # ★ v18：`revalidate=True` ⇒ `no-cache`（每次用前 revalidate，**不是**不缓存）。
+        #   本服务无 ETag ⇒ 会 200 重下（`chart_option.js` 仅 18 KB，正确性优先）。
+        #   `echarts.min.js` 不传 ⇒ 沿用 `public, max-age=86400` 长缓存，性能不受影响。
+        cache_control=("no-cache" if revalidate else None),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1745,7 +1765,8 @@ class WebApp:
         if path.startswith("/vendor/") and method == "GET":
             return vendor_asset(path[len("/vendor/"):])
         if path == "/static/chart_option.js" and method == "GET":
-            return vendor_asset("chart_option.js")
+            # ★★ v18：**代码资源** ⇒ 不得长缓存（见 vendor_asset 的 revalidate 说明）
+            return vendor_asset("chart_option.js", revalidate=True)
         return Response(404, _envelope(_command_of(path), None, error=f"未知端点 {method} {path}"))
 
 
@@ -1837,7 +1858,11 @@ def _make_handler(app: WebApp):
                 self.send_header("Vary", "Accept-Encoding")
             # ★ 静态 JS（1 MB 的 ECharts）允许浏览器**跨页面**缓存 ⇒ 「pin 一次加载」才成立；
             #   动态响应继续 no-store（账户数据绝不落缓存）。
-            if response.content_type.startswith("application/javascript"):
+            # ★★ v18：**逐响应覆盖优先**（见 Response.cache_control）。`chart_option.js`
+            #   传 `no-cache` ⇒ 每次用前 revalidate ⇒ 发版后普通刷新就能拿到新代码 ✓
+            if response.cache_control is not None:
+                self.send_header("Cache-Control", response.cache_control)
+            elif response.content_type.startswith("application/javascript"):
                 self.send_header("Cache-Control", "public, max-age=86400")
             else:
                 self.send_header("Cache-Control", "no-store")

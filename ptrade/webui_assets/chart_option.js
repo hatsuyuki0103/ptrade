@@ -36,6 +36,8 @@ export function miniCandlestick(axisIndex) {
     name: "微型K线", type: "candlestick",
     xAxisIndex: idx, yAxisIndex: idx,
     barWidth: "62%", silent: true, legendHoverLink: false,
+    /* ★ v18 R2：显式 clip —— 迷你 K 线是背景层，越界会直接盖到相邻面板上 */
+    clip: true,
     itemStyle: {
       color: "rgba(239,35,42,0.45)", color0: "rgba(20,177,67,0.45)",
       borderColor: "rgba(239,35,42,0.6)", borderColor0: "rgba(20,177,67,0.6)",
@@ -74,6 +76,11 @@ export function buildOption(payload, period, opts) {
      ★ `filterMode:"filter"` 显式写：ECharts 5.5.1 的默认确实是 filter，但**显式才叫契约**。 */
   const DEFAULT_VISIBLE_BARS = { daily: 120, weekly: 260, monthly: 240 };
   const visible = DEFAULT_VISIBLE_BARS[period] || d0;
+  /* ★★ v18（code-review 建议4）：`minValueSpan` 不能超过数据量。
+     新股/次新股的**月线可能只有 2~3 根**，若写死 5 就会大于数据长度 ⇒
+     ECharts 的 dataZoom 会拿到矛盾区间（窗口下限 > 数据长度）⇒ 行为不确定。
+     ⇒ 钳到 `[1, d0-1]`：d0=0 ⇒ 1；d0=2 ⇒ 1；d0=3 ⇒ 2；d0>=6 ⇒ 5。 */
+  const MIN_SPAN = Math.max(1, Math.min(5, d0 - 1));
   const startIndex = Math.max(0, d0 - visible);
   const endIndex = Math.max(0, d0 - 1);
   /* 图例项（分组 → 扁平）：分组真源在 Python 的 `legend_groups()`，这里只展平 */
@@ -132,16 +139,29 @@ export function buildOption(payload, period, opts) {
     {scale:true, gridIndex:5, splitNumber:2, axisLabel:{show:false}, splitLine:{show:false}}
   ];
   const series = [
-    /* ① K线面板：只放 K线 + MA12/24/48/96（BOLL 已移到独立面板） */
+    /* ① K线面板：只放 K线 + MA12/24/48/96（BOLL 已移到独立面板）
+       ★★★ v18（用户实测缺陷修复）：这 4 条均线**不得**再开 `smooth:true` ✗✗✗
+       用户原话：「滚轮缩放过后，再进行左右挪动，再缩放，k线有时候特别乱」。
+       根因：ECharts 的 `smooth:true` = Catmull-Rom / cardinal **样条插值**，
+       控制点由相邻点**外推**求得；当缩放窗口内局部数据**波动剧烈**（暴涨/暴跌）时，
+       控制点会被拉到数据范围**之外** ⇒ 曲线**甩出面板边界**、甚至绕成圈 ⇒ 视觉「特别乱」。
+       为什么是「有时候」：数据平坦时样条也看不出异常，**剧烈波动时才炸**。
+       为什么只炸 panel ①：全文件 `smooth:true` 恰好只有这 4 处（VOL MA5/MA10 本来就是直线）。
+       ⇒ 改**直线段**，理由三条：
+         ① 均线本质就是**折线**，直线段是行业标准（同花顺/东方财富等均如此）；
+         ② 直线段在**几何上不可能**超出相邻数据点的取值范围 ⇒ 过冲**结构上根除**，不靠调参；
+         ③ 判据 V18-1（`tests/test_v18_chart_zoom.py`）钉住「所有 line series 不得有 truthy smooth」。
+       ★ 若将来有人想「美化」成平滑曲线：请改用 `smooth:0.2` 这类**小幅**取值并**补一条
+         过冲判据**（在真实缩放序列下断言像素不越出 grid），否则这个 bug 会原样回归。 */
     {name:"K线", type:"candlestick", data:d.ohlc, xAxisIndex:0, yAxisIndex:0,
      itemStyle:{color:UP, color0:DOWN, borderColor:UP, borderColor0:DOWN}},
-    {name:"MA12", type:"line", data:d.ma["12"], xAxisIndex:0, yAxisIndex:0, smooth:true,
+    {name:"MA12", type:"line", data:d.ma["12"], xAxisIndex:0, yAxisIndex:0,
      showSymbol:false, lineStyle:{width:1.2, color:"#1f2329"}},
-    {name:"MA24", type:"line", data:d.ma["24"], xAxisIndex:0, yAxisIndex:0, smooth:true,
+    {name:"MA24", type:"line", data:d.ma["24"], xAxisIndex:0, yAxisIndex:0,
      showSymbol:false, lineStyle:{width:1.2, color:"#f2c200"}},
-    {name:"MA48", type:"line", data:d.ma["48"], xAxisIndex:0, yAxisIndex:0, smooth:true,
+    {name:"MA48", type:"line", data:d.ma["48"], xAxisIndex:0, yAxisIndex:0,
      showSymbol:false, lineStyle:{width:1.2, color:"#ff7ac6"}},
-    {name:"MA96", type:"line", data:d.ma["96"], xAxisIndex:0, yAxisIndex:0, smooth:true,
+    {name:"MA96", type:"line", data:d.ma["96"], xAxisIndex:0, yAxisIndex:0,
      showSymbol:false, lineStyle:{width:1.2, color:"#14b143"}},
     /* ② BOLL(20,2) 独立面板（背景铺一层迷你 K 线，与 SAR 面板共用同一工厂） */
     miniSeries(mini.boll),
@@ -177,6 +197,15 @@ export function buildOption(payload, period, opts) {
        return {value:v, itemStyle:{color: d.sar.trend[i] > 0 ? UP : DOWN}};
      }), xAxisIndex:5, yAxisIndex:5, symbolSize:4}
   ].filter(Boolean);
+  /* ★★ v18 R2：所有绘制型 series **显式** `clip:true`（裁剪到各自 grid 内）。
+     为什么不用 ECharts 默认值：不依赖第三方默认 = **契约**。
+     ECharts 5 对直角坐标系 series 默认已是 true，但那是「默认」不是「约定」——
+     升级/改配置/换图表库都可能变。显式写死后，**即使将来又有越界绘制，
+     也不会污染相邻面板**（本图 6 个 panel 上下紧贴，一条失控的线会串到隔壁）。
+     ★ 用 map 一次性覆盖而不是逐条加字段：将来新增 series 自动被覆盖，不会漏。 */
+  series.forEach(function (s) {
+    if (s && s.clip === undefined) { s.clip = true; }
+  });
   return {
     animation:false,
     backgroundColor:"#fff",
@@ -251,11 +280,14 @@ export function buildOption(payload, period, opts) {
     axisPointer:{link:[{xAxisIndex:"all"}], label:{backgroundColor:"#1f6feb"}},
     grid:grids, xAxis:xAxis, yAxis:yAxis, series:series,
     dataZoom:[
-      /* ★ v6：**索引** + 显式 filterMode；两个组件同一对 startValue/endValue ⇒ 天然同步 */
-      {type:"inside", filterMode:"filter", xAxisIndex:[0,1,2,3,4,5],
+      /* ★ v6：**索引** + 显式 filterMode；两个组件同一对 startValue/endValue ⇒ 天然同步
+         ★★ v18 R3：加 `minValueSpan:5` —— 否则可以缩到 **1~2 根**，
+            此时蜡烛被拉到整屏宽、均线退化成单段直线 ⇒ 同样是「乱」的观感。
+            5 根是「能看出趋势」的最小可读窗口。两个组件都要写（否则拖 slider 仍能缩到 1 根）。 */
+      {type:"inside", filterMode:"filter", xAxisIndex:[0,1,2,3,4,5], minValueSpan:MIN_SPAN,
        startValue:startIndex, endValue:endIndex},
       {type:"slider", filterMode:"filter", xAxisIndex:[0,1,2,3,4,5], bottom:2, height:16,
-       startValue:startIndex, endValue:endIndex}
+       minValueSpan:MIN_SPAN, startValue:startIndex, endValue:endIndex}
     ]
   };
 }
